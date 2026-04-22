@@ -1,0 +1,40 @@
+/* 移动端编辑器优化 */
+@media (max-width: 768px) {
+  #editor-root {
+    padding: 0 !important;
+    gap: 0 !important;
+  }
+
+  /* 编辑区无边框圆角 */
+  #editor-root > div:last-child > div:last-child {
+    border-radius: 0 !important;
+    border-left: none !important;
+    border-right: none !important;
+    border-bottom: none !important;
+  }
+
+  /* ProseMirror */
+  #editor-root .ProseMirror {
+    padding: 12px 14px !important;
+    font-size: 16px !important;
+    line-height: 1.7 !important;
+  }
+
+  /* 工具栏 */
+  #editor-root [style*="flexWrap"] {
+    padding: 4px 8px !important;
+    gap: 2px !important;
+  }
+
+  /* 标签栏 */
+  [style*="height: 36"] {
+    height: 32px !important;
+  }
+}
+
+@media (max-width: 480px) {
+  #editor-root .ProseMirror {
+    padding: 10px 12px !important;
+    font-size: 15px !important;
+  }
+}
