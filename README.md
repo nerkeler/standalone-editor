@@ -1,6 +1,6 @@
 # 📝 独立在线编辑器
 
-基于 Stock Report 交易心得编辑器的独立版本，支持任意本地目录作为工作空间。
+基于 TipTap 的轻量级 Markdown 富文本编辑器，支持任意本地目录作为工作空间，通过浏览器随时随地编辑本地文件。
 
 ## 技术栈
 
@@ -8,7 +8,7 @@
 |---|---|
 | 后端 | Node.js + Express |
 | 前端 | Vite + React + TipTap |
-| 文件格式 | Markdown（支持图片、代码高亮、表格） |
+| 文件格式 | Markdown |
 | 自动保存 | 3 秒防抖自动保存 |
 
 ## 快速启动
@@ -37,11 +37,7 @@ npm run dev
 ### 3. 一键启动（前后端）
 
 ```bash
-# 终端1：后端
-cd backend && node src/index.js --workspace /tmp/my-notes
-
-# 终端2：前端
-cd frontend && npm run dev
+bash start.sh /path/to/your/notes
 ```
 
 ## 项目结构
@@ -52,20 +48,21 @@ standalone-editor/
 │   ├── package.json
 │   └── src/
 │       ├── index.js         # Express 服务入口
-│       └── fileService.js   # 文件 CRUD 核心逻辑
+│       └── fileService.js    # 文件 CRUD 核心逻辑
 ├── frontend/
 │   ├── package.json
 │   ├── vite.config.js
 │   ├── index.html
 │   └── src/
 │       ├── main.jsx
-│       ├── App.jsx          # 工作空间选择 + 编辑器切换
+│       ├── App.jsx           # 工作空间选择 + 编辑器切换
 │       ├── pages/
-│       │   ├── Welcome.jsx  # 目录选择/创建页
-│       │   ├── Editor.jsx   # TipTap 编辑器（核心）
-│       │   └── Editor.css   # 移动端样式
+│       │   ├── Welcome.jsx   # 目录选择页
+│       │   ├── Editor.jsx    # TipTap 编辑器
+│       │   └── Editor.css    # 移动端样式
 │       └── styles/
-│           └── global.css   # 全局主题变量
+│           └── global.css    # 全局主题变量
+├── start.sh                  # 一键启动脚本
 └── README.md
 ```
 
@@ -106,13 +103,3 @@ standalone-editor/
 | DELETE | `/api/workspace?path=...` | 删除文件或目录 |
 | POST | `/api/workspace/move` | 移动/重命名 |
 | POST | `/api/workspace/upload` | 上传文件 |
-
-## 与 Stock Report 的区别
-
-| 功能 | Stock Report | 独立编辑器 |
-|---|---|---|
-| 工作空间 | 固定目录 | 启动时指定 |
-| 股票搜索 | ✅ | ❌ |
-| K线图 | ✅ | ❌ |
-| 用户认证 | ✅ | ❌ |
-| 编辑器 | 交易心得专用 | 通用 Markdown |
