@@ -1,3 +1,9 @@
+/* JetBrains Mono font */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+/* highlight.js Atom One Dark theme */
+@import url('https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/atom-one-dark.min.css');
+
 :root {
   --color-bg: #f0f2f5;
   --color-bg-card: #ffffff;

@@ -17,19 +17,6 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// 从命令行参数读取工作空间目录
-const args = process.argv.slice(2)
-let workspaceIndex = args.indexOf('--workspace')
-let workspace = workspaceIndex !== -1 && args[workspaceIndex + 1]
-  ? path.resolve(args[workspaceIndex + 1])
-  : null
-
-// workspace 优先级：命令行 > 保存的配置 > /tmp/my-notes
-if (!workspace) {
-  const saved = await loadConfig()
-  workspace = saved || '/tmp/my-notes'
-}
-
 const app = express()
 const PORT = 5557
 const CONFIG_FILE = path.join(__dirname, '../../workspace.json')
@@ -52,7 +39,29 @@ async function saveConfig(ws) {
   await fs.writeFile(CONFIG_FILE, JSON.stringify({ workspace: ws }), 'utf-8')
 }
 
+// 从命令行参数读取工作空间目录
+const args = process.argv.slice(2)
+const workspaceArg = args.indexOf('--workspace') !== -1 && args[args.indexOf('--workspace') + 1]
+  ? path.resolve(args[args.indexOf('--workspace') + 1])
+  : null
+
+// workspace 优先级：命令行 > 保存的配置 > /tmp/my-notes
+let workspace = workspaceArg
+if (!workspace) {
+  const saved = await loadConfig()
+  workspace = saved || '/tmp/my-notes'
+}
+
 app.use(cors())
+// 禁止静态资源缓存
+app.use((req, res, next) => {
+  if (req.path.startsWith('/assets/') || req.path === '/') {
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Expires', '0')
+  }
+  next()
+})
 app.use(express.json({ limit: '10mb' }))
 
 // 解析 multipart（上传文件）
@@ -158,10 +167,14 @@ app.post('/api/workspace', async (req, res) => {
 app.put('/api/workspace', async (req, res) => {
   try {
     const { path: reqPath, content } = req.body
+    console.log('[PUT /api/workspace] reqPath:', reqPath, 'content len:', content ? content.length : 0, 'workspace:', workspace)
     if (!reqPath) return res.status(400).json({ error: '缺少 path 参数' })
     await writeFile(workspace, reqPath, content)
+    const fullPath = path.resolve(workspace, reqPath)
+    console.log('[PUT /api/workspace] writeFile done, full path:', fullPath)
     res.json({ success: true })
   } catch (err) {
+    console.error('[PUT /api/workspace] ERROR:', err.message)
     res.status(400).json({ error: err.message })
   }
 })

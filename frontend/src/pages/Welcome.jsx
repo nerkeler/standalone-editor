@@ -1,9 +1,8 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import { Button, message, Modal, Breadcrumb, Spin } from 'antd'
 import { FolderOpenOutlined, EditOutlined, HomeOutlined, ArrowLeftOutlined, LoadingOutlined } from '@ant-design/icons'
 import axios from 'axios'
 
-const API = '/api'
 const DIRS_API = '/api/dirs'
 const WS_API = '/api/workspace'
 
@@ -14,82 +13,92 @@ export default function Welcome({ onEnter }) {
   const [pickerPath, setPickerPath] = useState('/home')
   const [pickerEntries, setPickerEntries] = useState([])
   const [pickerLoading, setPickerLoading] = useState(false)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    // 加载当前工作空间
+    // 先尝试从 localStorage 恢复上次的工作目录
+    const saved = localStorage.getItem('editor_workspace')
+    if (saved) {
+      setCurrentWorkspace(saved)
+      setLoading(false)
+      return
+    }
+    // 没有缓存再请求后端
     axios.get(`${WS_API}/check`)
       .then(res => {
-        setCurrentWorkspace(res.data.workspace)
+        const ws = res.data.workspace
+        setCurrentWorkspace(ws)
+        localStorage.setItem('editor_workspace', ws)
         setLoading(false)
       })
       .catch(() => setLoading(false))
   }, [])
 
-  // 打开目录选择器
-  const openPicker = () => {
-    setPickerPath('/home')
-    setPickerEntries([])
-    setPickerVisible(true)
-    // loadPickerDir is called by afterOpenChange
-  }
-
-  // 加载目录内容
-  const loadPickerDir = (dir) => {
+  const loadPickerDir = useCallback((dir) => {
+    console.log('[DEBUG loadPickerDir] dir =', dir)
+    setError('')
     setPickerLoading(true)
     setPickerPath(dir)
     axios.get(`${DIRS_API}?path=${encodeURIComponent(dir)}`)
       .then(res => {
+        console.log('[DEBUG loadPickerDir] got entries:', res.data.entries?.length, res.data.entries?.map(e => e.name))
         setPickerEntries(res.data.entries || [])
         setPickerLoading(false)
       })
       .catch(err => {
-        message.error(err.response?.data?.error || '无法读取目录')
+        console.error('[DEBUG loadPickerDir] error:', err)
+        setError(String(err.response?.data?.error || err.message || 'unknown error'))
+        setPickerEntries([])
         setPickerLoading(false)
       })
+  }, [])
+
+  const openPicker = () => {
+    console.log('[DEBUG openPicker]')
+    setPickerPath('/home')
+    setPickerEntries([])
+    setPickerVisible(true)
+    loadPickerDir('/home')
   }
 
-  // 进入目录
   const enterDir = (entry) => {
-    if (entry.type !== 'dir') return
-    // 构造完整路径
-    const base = entry.path === '/' ? '' : entry.path
-    const fullPath = base ? `${base}/${entry.name}` : `/${entry.name}`
-    setPickerLoading(true)
-    axios.get(`${DIRS_API}?path=${encodeURIComponent(fullPath)}`)
-      .then(res => {
-        setPickerEntries(res.data.entries || [])
-        setPickerPath(fullPath)
-        setPickerLoading(false)
-      })
-      .catch(err => {
-        message.error(err.response?.data?.error || '无法打开目录')
-        setPickerLoading(false)
-      })
+    console.log('[DEBUG enterDir] entry =', entry)
+    if (entry.type !== 'dir') {
+      console.log('[DEBUG enterDir] not a dir, skipping')
+      return
+    }
+    const fullPath = `${entry.path}/${entry.name}`
+    console.log('[DEBUG enterDir] fullPath =', fullPath)
+    loadPickerDir(fullPath)
   }
 
-  // 确认选择
+  const goUp = () => {
+    const parts = pickerPath.split('/').filter(Boolean)
+    const parent = parts.slice(0, -1).join('/')
+    const newPath = parent ? `/${parent}` : '/'
+    loadPickerDir(newPath)
+  }
+
   const confirmSelection = () => {
+    console.log('[DEBUG confirmSelection] pickerPath =', pickerPath)
     setPickerLoading(true)
     axios.post(`${WS_API}/set`, { path: pickerPath })
       .then(res => {
-        setCurrentWorkspace(res.data.workspace)
+        console.log('[DEBUG confirmSelection] success:', res.data)
+        const ws = res.data.workspace
+        setCurrentWorkspace(ws)
+        localStorage.setItem('editor_workspace', ws)
         setPickerVisible(false)
-        message.success(`已切换到：${res.data.workspace}`)
-        onEnter(res.data.workspace)
+        message.success(`已切换到：${ws}`)
+        onEnter(ws)
       })
       .catch(err => {
+        console.error('[DEBUG confirmSelection] error:', err)
         message.error(err.response?.data?.error || '切换目录失败')
         setPickerLoading(false)
       })
   }
 
-  // 返回上级
-  const goUp = () => {
-    const parent = pickerPath.split('/').filter(Boolean).slice(0, -1).join('/')
-    loadPickerDir(parent ? `/${parent}` : '/')
-  }
-
-  // 路径切片
   const pathParts = pickerPath.split('/').filter(Boolean)
 
   return (
@@ -108,22 +117,20 @@ export default function Welcome({ onEnter }) {
           <Spin indicator={<LoadingOutlined spin />} />
         ) : (
           <>
-            {/* 当前工作目录 */}
             <div style={{
               background: 'rgba(0,0,0,0.04)', borderRadius: 10,
               padding: '12px 16px', fontSize: 13,
               color: 'var(--color-text-secondary)',
               wordBreak: 'break-all',
             }}>
-              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4, color: 'var(--color-text-secondary)' }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
                 当前工作目录
               </div>
-              <div style={{ fontWeight: 600, color: 'var(--color-text)', fontFamily: 'monospace' }}>
+              <div style={{ fontWeight: 600, fontFamily: 'monospace' }}>
                 {currentWorkspace || '/tmp/my-notes'}
               </div>
             </div>
 
-            {/* 操作按钮 */}
             <Button
               size="large"
               icon={<FolderOpenOutlined />}
@@ -137,7 +144,7 @@ export default function Welcome({ onEnter }) {
             <Button
               size="large"
               icon={<EditOutlined />}
-              onClick={() => { onEnter(currentWorkspace) }}
+              onClick={() => onEnter(currentWorkspace)}
               block
               style={{ height: 52, borderRadius: 10, fontSize: 15 }}
             >
@@ -156,34 +163,29 @@ export default function Welcome({ onEnter }) {
         okText="确认选择"
         cancelText="取消"
         width={560}
-        bodyStyle={{ padding: '8px 12px' }}
-        afterOpenChange={open => { if (open) { setPickerPath('/home'); setPickerEntries([]); loadPickerDir('/home') } }}
       >
-        {/* 面包屑导航 */}
-        <div style={{
-          display: 'flex', alignItems: 'center', gap: 6,
-          padding: '8px 0', fontSize: 13, flexWrap: 'wrap', marginBottom: 8,
-          borderBottom: '1px solid var(--color-border)',
-        }}>
-          {pathParts.length > 0 && (
-            <ArrowLeftOutlined
-              onClick={goUp}
-              style={{ cursor: 'pointer', marginRight: 4 }}
-            />
-          )}
+        {/* 调试信息 */}
+        <div style={{ padding: '6px 8px', fontSize: 11, color: '#f5222d', background: '#fffbe6', borderRadius: 4, marginBottom: 8, fontFamily: 'monospace' }}>
+          🔍 path={pickerPath} | entries={pickerEntries.length} | loading={String(pickerLoading)}
+          {error && <div style={{ color: '#f5222d', marginTop: 4 }}>❌ error: {error}</div>}
+        </div>
+
+        {/* 面包屑 + 返回按钮 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+          <Button size="small" icon={<ArrowLeftOutlined />} onClick={goUp} disabled={pickerPath === '/'}>返回</Button>
           <Breadcrumb
             separator="/"
             items={[
-              { key: '/', title: <HomeOutlined onClick={() => loadPickerDir('/')} style={{ cursor: 'pointer' }} /> },
+              { key: '/', title: <a onClick={() => loadPickerDir('/')}><HomeOutlined /> 根目录</a> },
               ...pathParts.map((part, i) => ({
-                key: '/' + pathParts.slice(0, i + 1).join('/'),
+                key: i,
                 title: (
-                  <span
-                    style={{ cursor: 'pointer', fontWeight: i === pathParts.length - 1 ? 600 : 400 }}
+                  <a
+                    style={{ fontWeight: i === pathParts.length - 1 ? 700 : 400 }}
                     onClick={() => loadPickerDir('/' + pathParts.slice(0, i + 1).join('/'))}
                   >
                     {part}
-                  </span>
+                  </a>
                 ),
               })),
             ]}
@@ -191,11 +193,11 @@ export default function Welcome({ onEnter }) {
         </div>
 
         {/* 目录列表 */}
-        <div style={{ maxHeight: 340, overflowY: 'auto' }}>
+        <div style={{ maxHeight: 360, overflowY: 'auto', border: '1px solid #f0f0f0', borderRadius: 8, padding: '4px 0' }}>
           {pickerLoading ? (
-            <div style={{ textAlign: 'center', padding: 32 }}>
-              <Spin />
-            </div>
+            <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
+          ) : pickerEntries.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: 32, color: '#999' }}>空目录</div>
           ) : (
             pickerEntries.map(entry => (
               <div
@@ -203,23 +205,17 @@ export default function Welcome({ onEnter }) {
                 onClick={() => enterDir(entry)}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '9px 8px', borderRadius: 6, cursor: 'pointer',
+                  padding: '10px 12px', cursor: 'pointer',
                   fontSize: 14,
-                  background: entry.type === 'dir' ? 'rgba(0,0,0,0.03)' : 'transparent',
                 }}
-                onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,0,0,0.07)'}
-                onMouseLeave={e => e.currentTarget.style.background = entry.type === 'dir' ? 'rgba(0,0,0,0.03)' : 'transparent'}
+                onMouseEnter={e => e.currentTarget.style.background = '#f5f5f5'}
+                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
               >
-                <FolderOpenOutlined style={{ color: entry.type === 'dir' ? '#faad14' : '#999', fontSize: 16 }} />
-                <span style={{ color: 'var(--color-text)' }}>{entry.name}</span>
-                {entry.type === 'file' && (
-                  <span style={{ fontSize: 11, color: '#ccc', marginLeft: 4 }}>文件</span>
-                )}
+                <FolderOpenOutlined style={{ color: entry.type === 'dir' ? '#faad14' : '#999', fontSize: 18 }} />
+                <span style={{ flex: 1, color: 'var(--color-text)' }}>{entry.name}</span>
+                {entry.type === 'file' && <span style={{ fontSize: 11, color: '#ccc' }}>文件</span>}
               </div>
             ))
-          )}
-          {!pickerLoading && pickerEntries.length === 0 && (
-            <div style={{ textAlign: 'center', padding: 32, color: '#999' }}>空目录</div>
           )}
         </div>
       </Modal>

@@ -15,14 +15,16 @@ function safePath(workspace, requestPath) {
 export async function listDir(workspace, reqPath = '') {
   const dir = safePath(workspace, reqPath)
   const entries = await fs.readdir(dir, { withFileTypes: true })
-  const result = entries.map(entry => {
+  const result = []
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue  // 过滤隐藏文件
     const relativePath = reqPath ? `${reqPath}/${entry.name}` : entry.name
-    return {
+    result.push({
       name: entry.name,
       type: entry.isDirectory() ? 'dir' : 'file',
       path: relativePath,
-    }
-  })
+    })
+  }
   // 文件夹排前面
   result.sort((a, b) => {
     if (a.type !== b.type) return a.type === 'dir' ? -1 : 1

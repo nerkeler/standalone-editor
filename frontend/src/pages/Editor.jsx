@@ -57,6 +57,19 @@ function findNode(nodes, path) {
   return null
 }
 
+function addChildrenToTree(nodes, parentPath, children) {
+  return nodes.map(n => {
+    if (n.path === parentPath) {
+      const childNodes = children.map(c => ({ ...c, children: [] }))
+      return { ...n, children: childNodes }
+    }
+    if (n.children) {
+      return { ...n, children: addChildrenToTree(n.children, parentPath, children) }
+    }
+    return n
+  })
+}
+
 function collectFolders(nodes, excludePath) {
   return nodes.filter(n => n.type === 'dir' && n.path !== excludePath).map(n => ({
     ...n,
@@ -85,9 +98,28 @@ export default function Editor({ workspace }) {
   const [isMobile, setIsMobile] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
   const [showToolbar, setShowToolbar] = useState(true)
+  const [sidebarView, setSidebarView] = useState('tree')
   const [isDirty, setIsDirty] = useState({})
   const [expandedKeys, setExpandedKeys] = useState([])
   const [isAllExpanded, setIsAllExpanded] = useState(false)
+  const [outlineItems, setOutlineItems] = useState([])
+
+  // 生成大纲
+  useEffect(() => {
+    const content = savedContents[activeFile] || ''
+    if (!content) { setOutlineItems([]); return }
+    const items = []
+    const lines = content.split('\n')
+    lines.forEach(line => {
+      const h1 = line.match(/^# (.+)/)
+      const h2 = line.match(/^## (.+)/)
+      const h3 = line.match(/^### (.+)/)
+      if (h1) items.push({ level: 1, text: h1[1] })
+      else if (h2) items.push({ level: 2, text: h2[1] })
+      else if (h3) items.push({ level: 3, text: h3[1] })
+    })
+    setOutlineItems(items)
+  }, [activeFile, savedContents[activeFile]])
   const [saveStatus, setSaveStatus] = useState('idle')
   const autoSaveTimerRef = useRef(null)
   const cleanContentsRef = useRef({})
@@ -147,6 +179,36 @@ export default function Editor({ workspace }) {
       setTree(buildTree(res.data || []))
     } catch {}
   }, [])
+
+  // 懒加载子目录
+  const loadChildren = useCallback(async (dirPath) => {
+    try {
+      const res = await axios.get(API, { params: { path: dirPath } })
+      const children = res.data || []
+      if (children.length > 0) {
+        setTree(prev => addChildrenToTree(prev, dirPath, children))
+      }
+    } catch {}
+  }, [])
+
+  // 展开目录时懒加载
+  const handleExpand = useCallback((keys) => {
+    const prevExpanded = expandedKeys
+    // 找出新增展开的 key（原来没有，新请求里有）
+    const newKey = keys.find(k => !prevExpanded.includes(k))
+    if (newKey) {
+      const node = findNode(tree, newKey)
+      if (node && node.type === 'dir') {
+        // 先立即展开，避免无效点击
+        setExpandedKeys(prev => prev.includes(newKey) ? prev : [...prev, newKey])
+        // 加载子目录
+        loadChildren(newKey)
+        return
+      }
+    }
+    // 折叠操作或未知 key，直接更新
+    setExpandedKeys(keys)
+  }, [expandedKeys, tree, loadChildren])
 
   useEffect(() => { loadTree() }, [loadTree])
 
@@ -227,6 +289,7 @@ export default function Editor({ workspace }) {
   }
 
   const doSave = async (path) => {
+    console.log('[doSave] path:', path, 'workspace:', workspace)
     if (!editor) return
     try {
       const td = new Turndown({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
@@ -240,13 +303,16 @@ export default function Editor({ workspace }) {
           md = md.replace(new RegExp(pattern), `$&<!-- zoom:${zoom} -->`)
         }
       })
-      await axios.put(API, { path, content: md })
+      console.log('[doSave] PUT payload:', { path, contentLen: md.length })
+      const res = await axios.put(API, { path, content: md })
+      console.log('[doSave] response:', res.data)
       setSavedContents(p => ({ ...p, [path]: md }))
       cleanContentsRef.current[path] = md
       setIsDirty(p => { const n = { ...p }; delete n[path]; return n })
       setSaveStatus('saved')
       setTimeout(() => setSaveStatus('idle'), 2000)
-    } catch {
+    } catch (err) {
+      console.error('[doSave] ERROR:', err?.response?.data || err.message || err)
       setSaveStatus('modified')
     }
   }
@@ -450,42 +516,79 @@ export default function Editor({ workspace }) {
         padding: '0 4px',
       }}
     >
-      {/* 左侧文件树 */}
+      {/* 左侧面板 - PC */}
       {!editorFullscreen && !isMobile && showSidebar && (
         <div style={{
-          width: 280, flexShrink: 0, display: 'flex', flexDirection: 'column',
+          width: 360, flexShrink: 0, display: 'flex', flexDirection: 'column',
           background: 'var(--color-bg-card)', borderRadius: 12,
           border: '1px solid var(--color-border)', overflow: 'hidden',
           boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
         }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px' }}>
-            <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
-            <div style={{ display: 'flex', gap: 4 }}>
-              <Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} />
-              <Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} />
-              <Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" />
-              <Button size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" />
-            </div>
-          </div>
-          <div style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
-            <Tree
-              treeData={renderTreeNodes(tree)}
-              selectedKeys={[selectedKey]}
-              expandedKeys={expandedKeys}
-              onExpand={keys => setExpandedKeys(keys)}
-              expandAction="click"
-              draggable
-              onDrop={info => {
-                const target = info.node
-                const draggedKey = info.dragNodesKeys[0]
-                const draggedNode = findNode(tree, draggedKey)
-                const targetNode = findNode(tree, target.key)
-                if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
-                if (draggedNode.path.startsWith(target.key + '/')) { message.warning('不能移动到自己的子目录'); return }
-                if (draggedNode.path !== target.key) handleMove(draggedNode, target.key)
-              }}
-            />
-          </div>
+          {sidebarView === 'tree' && (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px' }}>
+                <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
+                <div style={{ display: 'flex', gap: 4 }}>
+                  <Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} />
+                  <Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} />
+                  <Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" />
+                  <Button size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" />
+                </div>
+              </div>
+              <div style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
+                <Tree
+                  treeData={renderTreeNodes(tree)}
+                  selectedKeys={[selectedKey]}
+                  expandedKeys={expandedKeys}
+                  onExpand={handleExpand}
+                  expandAction="click"
+                  draggable
+                  onDrop={info => {
+                    const target = info.node
+                    const draggedKey = info.dragNodesKeys[0]
+                    const draggedNode = findNode(tree, draggedKey)
+                    const targetNode = findNode(tree, target.key)
+                    if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
+                    if (draggedNode.path.startsWith(target.key + '/')) { message.warning('不能移动到自己的子目录'); return }
+                    if (draggedNode.path !== target.key) handleMove(draggedNode, target.key)
+                  }}
+                />
+              </div>
+            </>
+          )}
+
+          {sidebarView === 'outline' && (
+            <>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
+                <Button size="small" icon={<ArrowLeftOutlined />} onClick={() => setSidebarView('tree')} title="返回目录" />
+                <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>大纲</span>
+                {activeFile && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginLeft: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>— {activeFile.split('/').pop()}</span>}
+              </div>
+              <div style={{ flex: 1, overflow: 'auto', padding: '8px' }}>
+                {outlineItems.length === 0 && (
+                  <div style={{ padding: '24px', textAlign: 'center', color: 'var(--color-text-secondary)', fontSize: 13 }}>当前文档无标题</div>
+                )}
+                {outlineItems.map((item, i) => (
+                  <div
+                    key={i}
+                    onClick={() => editor?.commands.focus('start')}
+                    style={{
+                      padding: '6px 8px', fontSize: 13, cursor: 'pointer',
+                      paddingLeft: 8 + (item.level - 1) * 14,
+                      color: 'var(--color-text)',
+                      borderRadius: 6, marginBottom: 2,
+                      display: 'flex', alignItems: 'center', gap: 6,
+                    }}
+                    onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,0,0,0.05)'}
+                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+                  >
+                    <span style={{ fontSize: 10, color: 'var(--color-text-secondary)', fontWeight: 700, minWidth: 14 }}>H{item.level}</span>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.text}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </div>
       )}
 
@@ -507,7 +610,7 @@ export default function Editor({ workspace }) {
             treeData={renderTreeNodes(tree)}
             selectedKeys={[selectedKey]}
             expandedKeys={expandedKeys}
-            onExpand={keys => setExpandedKeys(keys)}
+            onExpand={handleExpand}
             expandAction="click"
             onDrop={info => {
               const target = info.node
@@ -610,10 +713,38 @@ export default function Editor({ workspace }) {
                 <Tooltip title="插入表格"><Button {...tbBtn(false)} onClick={() => editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()} icon={<TableOutlined />} /></Tooltip>
                 <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
                 <Tooltip title="上传图片"><label><Button {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} /></label></Tooltip>
+
                 <div style={{ flex: 1 }} />
+
+                <Tooltip title="源文本" mouseEnterDelay={0.5}><Button {...tbBtn(showSource, 'rgba(0,0,0,0.75)')} onClick={async () => {
+                    if (!showSource && activeFile) {
+                      setSourceContent(savedContents[activeFile] || '')
+                    }
+                    if (showSource && sourceContent && activeFile) {
+                      const zoomMap = {}
+                      sourceContent.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
+                        zoomMap[src.replace(/^\//, '')] = zoom
+                        return ''
+                      })
+                      zoomMapRef.current = zoomMap
+                      const html = marked.parse(sourceContent)
+                      editor?.commands.setContent(html)
+                      let attempts = 0
+                      const poll = setInterval(() => {
+                        const hasImg = document.querySelector('.ProseMirror img')
+                        attempts++
+                        if (hasImg || attempts > 40) { clearInterval(poll); applyZoom() }
+                      }, 50)
+                      setSavedContents(prev => ({ ...prev, [activeFile]: sourceContent }))
+                      try {
+                        await axios.put(API, { path: activeFile, content: sourceContent })
+                      } catch { message.error('源码模式保存失败') }
+                    }
+                    setShowSource(v => !v)
+                  }} icon={<CodeOutlined />} /></Tooltip>
+                <Tooltip title={sidebarView === 'outline' ? '返回目录' : '大纲'} mouseEnterDelay={0.5}><Button {...tbBtn(sidebarView === 'outline', 'rgba(0,0,0,0.75)')} onClick={() => setSidebarView(v => v === 'outline' ? 'tree' : 'outline')} icon={<MenuOutlined />} /></Tooltip>
                 {!editorFullscreen && <Tooltip title="全屏"><Button {...tbBtn(false)} onClick={() => setEditorFullscreen(true)} icon={<ExpandOutlined />} /></Tooltip>}
                 {editorFullscreen && <Tooltip title="退出全屏"><Button {...tbBtn(true)} onClick={() => setEditorFullscreen(false)} icon={<ShrinkOutlined />} /></Tooltip>}
-                <Tooltip title="清空"><Button {...tbBtn(false, 'rgba(255,100,100,0.8)')} onClick={handleClear} icon={<DeleteOutlined />} /></Tooltip>
                 <div style={{ width: 1, height: 16, background: 'rgba(255,255,255,0.12)', margin: '0 4px' }} />
                 {saveStatus === 'modified' && <span style={{ fontSize: 11, color: '#f39c12', marginRight: 6 }}>● 已修改</span>}
                 {saveStatus === 'saving' && <span style={{ fontSize: 11, color: '#999', marginRight: 6 }}>保存中...</span>}
@@ -637,15 +768,69 @@ export default function Editor({ workspace }) {
                     .ProseMirror h2 { font-size: 1.4em; font-weight: 600; margin: 1em 0 0.5em; }
                     .ProseMirror h3 { font-size: 1.2em; font-weight: 600; margin: 0.8em 0 0.4em; }
                     .ProseMirror p { margin: 0.4em 0; }
-                    .ProseMirror code { background: rgba(0,0,0,0.08); padding: 2px 6px; border-radius: 4px; font-size: 0.88em; font-family: monospace; }
-                    .ProseMirror pre { background: rgba(0,0,0,0.08); padding: 12px 16px; border-radius: 6px; overflow: auto; margin: 0.5em 0; }
-                    .ProseMirror pre code { background: none; padding: 0; }
+                    .ProseMirror code { background: rgba(0,0,0,0.08); padding: 2px 6px; border-radius: 4px; font-size: 0.88em; font-family: 'JetBrains Mono', monospace; }
+                    .ProseMirror pre {
+                      background: #282c34 !important;
+                      border-radius: 10px;
+                      padding: 16px 20px;
+                      margin: 0.8em 0;
+                      overflow: auto;
+                      border: 1px solid #3a3f4b;
+                      box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+                      max-width: 760px;
+                      display: block;
+                    }
+                    .ProseMirror pre code {
+                      background: none !important;
+                      padding: 0;
+                      font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+                      font-size: 13.5px;
+                      line-height: 1.7;
+                      color: #abb2bf;
+                    }
                     .ProseMirror blockquote { border-left: 3px solid var(--color-border); padding-left: 12px; margin: 0.5em 0; color: var(--color-text-secondary); }
                     .ProseMirror img { max-width: 100%; border-radius: 4px; }
                     .ProseMirror ul, .ProseMirror ol { padding-left: 1.5em; margin: 0.4em 0; }
                     .ProseMirror li { margin: 0.2em 0; }
                     .ant-tree-treenode:hover .tree-node-more { opacity: 1 !important; }
                     .tree-node-more { transition: opacity 0.15s; }
+                    /* ===== 表格样式 ===== */
+                    .ProseMirror table {
+                      width: 100%;
+                      max-width: 760px;
+                      border-collapse: collapse;
+                      margin: 0.8em 0;
+                      border-radius: 8px;
+                      overflow: hidden;
+                      border: 1px solid #d0d7de;
+                      box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+                    }
+                    .ProseMirror table th {
+                      background: #f1f3f5;
+                      font-weight: 600;
+                      text-align: left;
+                      padding: 10px 14px;
+                      border: 1px solid #d0d7de;
+                      color: #1a1a1a;
+                    }
+                    .ProseMirror table td {
+                      padding: 8px 14px;
+                      border: 1px solid #e2e8f0;
+                      vertical-align: top;
+                    }
+                    .ProseMirror table tr:nth-child(even) td {
+                      background: #fafbfc;
+                    }
+                    .ProseMirror table tr:hover td {
+                      background: #eef2ff !important;
+                    }
+                    .ProseMirror table td.selectedCell {
+                      background: #dbeafe !important;
+                    }
+                    .ProseMirror .column-resize-handle {
+                      background-color: #1a73e8;
+                      width: 3px;
+                    }
                   `}</style>
                   <div onPaste={e => {
                     const items = Array.from(e.clipboardData.items)
