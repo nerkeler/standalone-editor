@@ -97,7 +97,7 @@ export default function Editor({ workspace }) {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
-  const [showToolbar, setShowToolbar] = useState(true)
+  const [showToolbar, setShowToolbar] = useState(false)
   const [sidebarView, setSidebarView] = useState('tree')
   const [isDirty, setIsDirty] = useState({})
   const [expandedKeys, setExpandedKeys] = useState([])
@@ -253,9 +253,9 @@ export default function Editor({ workspace }) {
         attempts++
         if (hasImg || attempts > 40) { clearInterval(poll); applyZoom() }
       }, 50)
-      editor?.commands.focus('start')
       setSavedContents(p => ({ ...p, [path]: res.data.content || '' }))
       cleanContentsRef.current[path] = res.data.content || ''
+      if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
     } catch {}
   }
 
@@ -613,6 +613,9 @@ export default function Editor({ workspace }) {
             expandedKeys={expandedKeys}
             onExpand={handleExpand}
             expandAction="click"
+            onSelect={(keys) => {
+              if (keys.length > 0) setMobileSidebarOpen(false)
+            }}
             onDrop={info => {
               const target = info.node
               const draggedKey = info.dragNodesKeys[0]
@@ -645,7 +648,7 @@ export default function Editor({ workspace }) {
               const name = f.split('/').pop() || f
               const active = f === activeFile
               return (
-                <div key={f} onClick={() => { setActiveFile(f); loadFile(f) }}
+                <div key={f} onClick={() => { setActiveFile(f); loadFile(f); setMobileSidebarOpen(false) }}
                   style={{
                     position: 'relative', display: 'flex', alignItems: 'center',
                     padding: '0 14px', height: 36, fontSize: 13, cursor: 'pointer',
