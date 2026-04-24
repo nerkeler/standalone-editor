@@ -84,6 +84,7 @@ export default function Editor({ workspace }) {
   const [selectedKey, setSelectedKey] = useState('')
   const [openFiles, setOpenFiles] = useState([])
   const [activeFile, setActiveFile] = useState('')
+  const [tabMenu, setTabMenu] = useState({ visible: false, x: 0, y: 0, target: '' })
   const [savedContents, setSavedContents] = useState({})
   const [createModal, setCreateModal] = useState({ open: false, parent: '', type: 'file' })
   const [createName, setCreateName] = useState('')
@@ -649,6 +650,7 @@ export default function Editor({ workspace }) {
               const active = f === activeFile
               return (
                 <div key={f} onClick={() => { setActiveFile(f); loadFile(f); setMobileSidebarOpen(false) }}
+                  onContextMenu={e => { e.preventDefault(); setTabMenu({ visible: true, x: e.clientX, y: e.clientY, target: f }) }}
                   style={{
                     position: 'relative', display: 'flex', alignItems: 'center',
                     padding: '0 14px', height: 36, fontSize: 13, cursor: 'pointer',
@@ -902,6 +904,23 @@ export default function Editor({ workspace }) {
           </div>
         </div>
       )}
+      {tabMenu.visible && (
+        <div style={{ position: 'fixed', left: tabMenu.x, top: tabMenu.y, zIndex: 9999, background: 'var(--color-bg-card)', border: '1px solid var(--color-border)', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', padding: '4px 0', minWidth: 160 }} onContextMenu={(e) => { e.preventDefault() }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { handleClose(tabMenu.target); setTabMenu(p => ({ ...p, visible: false })) }}>
+            <CloseOutlined />关闭当前
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { const idx = openFiles.indexOf(tabMenu.target); setOpenFiles(openFiles.filter((_, i) => i !== idx)); if (activeFile === tabMenu.target) setActiveFile(openFiles[0] || ''); setTabMenu(p => ({ ...p, visible: false })) }}>
+            <FileOutlined />关闭其他
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { const idx = openFiles.indexOf(tabMenu.target); setOpenFiles(openFiles.slice(0, idx)); if (!openFiles.slice(0, idx).includes(activeFile)) setActiveFile(tabMenu.target); setTabMenu(p => ({ ...p, visible: false })) }}>
+            <SwapOutlined />关闭左侧
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { const idx = openFiles.indexOf(tabMenu.target); setOpenFiles(openFiles.slice(idx + 1)); if (!openFiles.slice(idx + 1).includes(activeFile)) setActiveFile(tabMenu.target); setTabMenu(p => ({ ...p, visible: false })) }}>
+            <EditOutlined />关闭右侧
+          </div>
+        </div>
+      )}
+      {tabMenu.visible && <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} onClick={() => setTabMenu(p => ({ ...p, visible: false }))} />}
     </div>
   )
 }
