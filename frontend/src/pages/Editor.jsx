@@ -509,11 +509,12 @@ export default function Editor({ workspace }) {
       id="editor-root"
       style={{
         display: 'flex',
-        height: 'calc(100vh - 64px)',
-        gap: 12,
-        overflow: editorFullscreen ? 'hidden' : 'visible',
+        ...(isMobile
+          ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }
+          : { height: 'calc(100vh - 64px)', padding: '0 4px' }),
+        gap: isMobile ? 0 : 12,
+        overflow: 'hidden',
         background: 'var(--color-bg)',
-        padding: '0 4px',
       }}
     >
       {/* 左侧面板 - PC */}
@@ -634,8 +635,10 @@ export default function Editor({ workspace }) {
             overflow: 'auto', flexShrink: 0,
           }}>
             {isMobile && (
-              <div style={{ display: 'flex', alignItems: 'center', padding: '0 8px', height: 36, flexShrink: 0, borderRight: '1px solid var(--color-border)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px', height: 36, flexShrink: 0, borderRight: '1px solid var(--color-border)', gap: 2 }}>
                 <Button size="small" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)} />
+                <Tooltip title={showSidebar ? '隐藏文件栏' : '显示文件栏'}><Button size="small" {...tbBtn(!showSidebar)} onClick={() => setShowSidebar(v => !v)} icon={showSidebar ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />} /></Tooltip>
+                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button size="small" {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
               </div>
             )}
             {openFiles.map(f => {
@@ -658,10 +661,6 @@ export default function Editor({ workspace }) {
                 </div>
               )
             })}
-            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', padding: '0 8px', gap: 2, flexShrink: 0 }}>
-              <Tooltip title={showSidebar ? '隐藏文件栏' : '显示文件栏'}><Button {...tbBtn(!showSidebar)} onClick={() => setShowSidebar(v => !v)} icon={showSidebar ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />} /></Tooltip>
-              <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
-            </div>
           </div>
         )}
 
@@ -702,6 +701,9 @@ export default function Editor({ workspace }) {
                 <Tooltip title="标题1"><Button {...tbBtn(editor?.isActive('heading', { level: 1 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()} style={{ fontWeight: 700 }}>H1</Button></Tooltip>
                 <Tooltip title="标题2"><Button {...tbBtn(editor?.isActive('heading', { level: 2 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()} style={{ fontWeight: 700, fontSize: 12 }}>H2</Button></Tooltip>
                 <Tooltip title="标题3"><Button {...tbBtn(editor?.isActive('heading', { level: 3 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()} style={{ fontWeight: 700, fontSize: 11 }}>H3</Button></Tooltip>
+                <Tooltip title="标题4"><Button {...tbBtn(editor?.isActive('heading', { level: 4 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 4 }).run()} style={{ fontWeight: 700, fontSize: 10 }}>H4</Button></Tooltip>
+                <Tooltip title="标题5"><Button {...tbBtn(editor?.isActive('heading', { level: 5 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 5 }).run()} style={{ fontWeight: 700, fontSize: 9 }}>H5</Button></Tooltip>
+                <Tooltip title="标题6"><Button {...tbBtn(editor?.isActive('heading', { level: 6 }) || false, 'rgba(0,0,0,0.65)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 6 }).run()} style={{ fontWeight: 700, fontSize: 8 }}>H6</Button></Tooltip>
                 <div style={{ width: 1, height: 16, background: 'rgba(255,255,255,0.12)', margin: '0 4px' }} />
                 <Tooltip title="无序列表"><Button {...tbBtn(editor?.isActive('bulletList') || false)} onClick={() => editor?.chain().focus().toggleBulletList().run()} icon={<UnorderedListOutlined />} /></Tooltip>
                 <Tooltip title="有序列表"><Button {...tbBtn(editor?.isActive('orderedList') || false)} onClick={() => editor?.chain().focus().toggleOrderedList().run()} icon={<OrderedListOutlined />} /></Tooltip>

@@ -3,6 +3,8 @@
   #editor-root {
     padding: 0 !important;
     gap: 0 !important;
+    height: 100dvh !important;
+    overflow: hidden !important;
   }
 
   /* 编辑区无边框圆角 */
