@@ -382,21 +382,16 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   const handleImageUpload = async (file) => {
     if (!activeFile) { message.error('请先打开一个文件'); return }
     if (!editor) return
-    const parts = activeFile.split('/'); parts.pop()
-    const uploadPath = parts.join('/') || 'assets'
     const formData = new FormData()
     formData.append('file', file)
     setUploading(true)
     try {
-      // 1. 先上传到服务器备份
-      const res = await axios.post(`${API}/upload${uploadPath ? '/' + uploadPath : ''}`, formData)
-      // 2. 用 FileReader 把本地文件转 base64 直接插入编辑器
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        editor?.chain().focus().setImage({ src: e.target.result }).run()
-      }
-      reader.readAsDataURL(file)
-      message.success('图片已插入（已上传到 ' + uploadPath + '）')
+      // 上传到 {workspace}/assets/ 目录（与 Notes 行为一致）
+      const res = await axios.post(`${API}/upload/assets`, formData)
+      // 插入编辑器，src 格式与 Notes 一致：/api/workspace/assets/{filename}
+      const src = `/api/workspace/assets/${res.data.filename}`
+      editor?.chain().focus().setImage({ src }).run()
+      message.success('图片已插入')
     } catch (e) { message.error('上传失败：' + (e.response?.data?.error || e.message)) }
     finally { setUploading(false) }
   }

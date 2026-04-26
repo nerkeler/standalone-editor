@@ -228,6 +228,18 @@ app.post('/api/workspace/upload', upload.single('file'), async (req, res) => {
   }
 })
 
+// GET /api/workspace/assets/:filename — 读取已上传的图片（供编辑器 img 标签 src 使用）
+app.get('/api/workspace/assets/:filename', async (req, res) => {
+  try {
+    const safeName = path.basename(req.params.filename)
+    const filePath = path.join(workspace, 'assets', safeName)
+    if (!filePath.startsWith(workspace)) return res.status(403).send('Forbidden')
+    res.sendFile(filePath)
+  } catch (err) {
+    res.status(404).send('Not found')
+  }
+})
+
 // ---------- 静态资源（前端构建产物）----------
 app.use(express.static(path.join(__dirname, '../../frontend/dist')))
 
