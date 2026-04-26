@@ -104,6 +104,11 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   const [expandedKeys, setExpandedKeys] = useState([])
   const [isAllExpanded, setIsAllExpanded] = useState(false)
   const [outlineItems, setOutlineItems] = useState([])
+  const [imageViewer, setImageViewer] = useState(null)   // { path, url, name }
+  const [imageZoom, setImageZoom] = useState(100)
+
+  const IMAGE_EXTS = ['jpg','jpeg','png','gif','webp','bmp','svg','ico','tiff','tif']
+  const isImageFile = (name) => IMAGE_EXTS.includes(name.split('.').pop()?.toLowerCase() || '')
 
   // 生成大纲
   useEffect(() => {
@@ -261,6 +266,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   }
 
   const handleFileOpen = async (node) => {
+    // 保存当前编辑器内容
     if (editor && activeFile && activeFile !== node.path) {
       const td = new Turndown({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
       const currentMd = td.turndown(editor.getHTML()).replace(/\\([!\[\]\(\)_*#`\-])/g, '$1')
@@ -270,6 +276,21 @@ export default function Editor({ workspace, onWorkspaceChange }) {
     setSelectedKey(node.path)
     if (!openFiles.includes(node.path)) setOpenFiles(p => [...p, node.path])
     setActiveFile(node.path)
+
+    // 图片文件 → 加载为图片
+    if (isImageFile(node.name)) {
+      setImageViewer(null)
+      try {
+        const res = await axios.get(`${API}/image`, { params: { path: node.path } })
+        const { mime, data } = res.data
+        setImageViewer({ path: node.path, url: `data:${mime};base64,${data}`, name: node.name })
+        setImageZoom(100)
+      } catch { setImageViewer(null) }
+      return
+    }
+
+    // 普通文件 → markdown 编辑器
+    setImageViewer(null)
     await loadFile(node.path)
   }
 
@@ -286,6 +307,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
     if (activeFile === path) {
       setActiveFile(newOpen[newOpen.length - 1] || '')
       setSaveStatus('idle')
+      setImageViewer(null)
     }
   }
 
@@ -649,7 +671,22 @@ export default function Editor({ workspace, onWorkspaceChange }) {
               const name = f.split('/').pop() || f
               const active = f === activeFile
               return (
-                <div key={f} onClick={() => { setActiveFile(f); loadFile(f); setMobileSidebarOpen(false) }}
+                <div key={f} onClick={async () => {
+                    if (isImageFile(name)) {
+                      setActiveFile(f)
+                      setImageViewer(null)
+                      try {
+                        const res = await axios.get(`${API}/image`, { params: { path: f } })
+                        setImageViewer({ path: f, url: `data:${res.data.mime};base64,${res.data.data}`, name })
+                        setImageZoom(100)
+                      } catch { setImageViewer(null) }
+                    } else {
+                      setActiveFile(f)
+                      setImageViewer(null)
+                      await loadFile(f)
+                    }
+                    setMobileSidebarOpen(false)
+                  }}
                   onContextMenu={e => { e.preventDefault(); setTabMenu({ visible: true, x: e.clientX, y: e.clientY, target: f }) }}
                   style={{
                     position: 'relative', display: 'flex', alignItems: 'center',
@@ -695,6 +732,32 @@ export default function Editor({ workspace, onWorkspaceChange }) {
                 </>
               )}
             </div>
+          ) : imageViewer ? (
+            <>
+              {/* 图片查看器 */}
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+                {/* 工具栏 */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
+                  <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', flex: 1 }}>{imageViewer.name}</span>
+                  <Button size="small" onClick={() => setImageZoom(z => Math.min(z + 25, 400))}>🔍+</Button>
+                  <span style={{ fontSize: 12, minWidth: 44, textAlign: 'center' }}>{imageZoom}%</span>
+                  <Button size="small" onClick={() => setImageZoom(100)}>重置</Button>
+                  <Button size="small" onClick={() => setImageZoom(z => Math.max(z - 25, 25))}>🔍-</Button>
+                  <Button size="small" danger onClick={() => {
+                    const path = imageViewer.path
+                    setImageViewer(null)
+                    setActiveFile('')
+                    setOpenFiles(o => o.filter(f => f !== path))
+                  }}>×</Button>
+                </div>
+                {/* 图片显示区：点击切换 100% ↔ 200% */}
+                <div style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, cursor: 'zoom-in' }}
+                  onClick={() => setImageZoom(z => z >= 200 ? 100 : 200)}>
+                  <img src={imageViewer.url} alt={imageViewer.name}
+                    style={{ maxWidth: '100%', maxHeight: '100%', transform: `scale(${imageZoom / 100})`, transformOrigin: 'center center', transition: 'transform 0.2s', borderRadius: 8, boxShadow: '0 4px 24px rgba(0,0,0,0.15)' }} />
+                </div>
+              </div>
+            </>
           ) : (
             <>
               {showToolbar && (

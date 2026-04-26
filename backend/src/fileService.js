@@ -42,6 +42,21 @@ export async function readFile(workspace, reqPath) {
   return { content }
 }
 
+export async function readFileBase64(workspace, reqPath) {
+  const file = safePath(workspace, reqPath)
+  const stat = await fs.stat(file)
+  if (stat.isDirectory()) throw new Error('是目录不是文件')
+  const ext = path.extname(reqPath).toLowerCase().slice(1)
+  const mimeMap = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+    gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+    ico: 'image/x-icon', tiff: 'image/tiff',tif: 'image/tiff',
+  }
+  const mime = mimeMap[ext] || 'application/octet-stream'
+  const buffer = await fs.readFile(file)
+  return { mime, data: buffer.toString('base64'), name: path.basename(reqPath) }
+}
+
 // 创建文件或目录
 export async function createItem(workspace, reqPath, type, name) {
   const targetDir = safePath(workspace, reqPath)

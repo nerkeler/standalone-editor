@@ -7,6 +7,7 @@ import fs from 'fs/promises'
 import {
   listDir,
   readFile,
+  readFileBase64,
   createItem,
   deleteItem,
   moveItem,
@@ -145,6 +146,18 @@ app.get('/api/workspace/file', async (req, res) => {
     const { path: reqPath } = req.query
     if (!reqPath) return res.status(400).json({ error: '缺少 path 参数' })
     const result = await readFile(workspace, reqPath)
+    res.json(result)
+  } catch (err) {
+    res.status(400).json({ error: err.message })
+  }
+})
+
+// GET /api/workspace/image — 读取图片文件（base64）
+app.get('/api/workspace/image', async (req, res) => {
+  try {
+    const { path: reqPath } = req.query
+    if (!reqPath) return res.status(400).json({ error: '缺少 path 参数' })
+    const result = await readFileBase64(workspace, reqPath)
     res.json(result)
   } catch (err) {
     res.status(400).json({ error: err.message })
