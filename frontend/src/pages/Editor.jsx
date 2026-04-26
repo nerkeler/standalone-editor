@@ -170,6 +170,23 @@ export default function Editor({ workspace, onWorkspaceChange }) {
     })
   }, [])
 
+  // TipTap editor paste handler — catches image paste at ProseMirror DOM level
+  useEffect(() => {
+    if (!editor) return
+    const handlePaste = (event) => {
+      const e = event
+      const items = Array.from(e.clipboardData?.items || [])
+      const imageItem = items.find(i => i.type.startsWith('image/'))
+      if (!imageItem) return
+      e.preventDefault()
+      const file = imageItem.getAsFile()
+      if (file) handleImageUpload(file)
+    }
+    const dom = editor.view.dom
+    dom.addEventListener('paste', handlePaste)
+    return () => dom.removeEventListener('paste', handlePaste)
+  }, [editor])
+
   useEffect(() => {
     if (!editor) return
     const observer = new MutationObserver(() => applyZoom())
@@ -363,18 +380,19 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   }
 
   const handleImageUpload = async (file) => {
-    if (!activeFile || !editor) return
+    if (!activeFile) { message.error('请先打开一个文件'); return }
+    if (!editor) return
     const parts = activeFile.split('/'); parts.pop()
-    const uploadPath = parts.join('/')
+    const uploadPath = parts.join('/') || 'assets'
     const formData = new FormData()
     formData.append('file', file)
     setUploading(true)
     try {
       const res = await axios.post(`${API}/upload${uploadPath ? '/' + uploadPath : ''}`, formData)
-      const md = `![](${res.data.path.startsWith('/') ? '' : '/' + res.data.path})`
-      editor?.chain().focus().setImage({ src: '/' + res.data.path }).run()
+      const src = '/' + res.data.path
+      editor?.chain().focus().setImage({ src }).run()
       message.success('图片已插入')
-    } catch { message.error('上传失败') }
+    } catch (e) { message.error('上传失败：' + (e.response?.data?.error || e.message)) }
     finally { setUploading(false) }
   }
 
@@ -909,14 +927,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
                       width: 3px;
                     }
                   `}</style>
-                  <div onPaste={e => {
-                    const items = Array.from(e.clipboardData.items)
-                    const imageItem = items.find(i => i.type.startsWith('image/'))
-                    if (!imageItem) return
-                    e.preventDefault()
-                    const file = imageItem.getAsFile()
-                    if (file) handleImageUpload(file)
-                  }}>
+                  <div>
                     <EditorContent editor={editor} style={{ height: '100%' }} />
                   </div>
                 </div>
