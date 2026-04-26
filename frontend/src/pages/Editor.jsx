@@ -388,10 +388,15 @@ export default function Editor({ workspace, onWorkspaceChange }) {
     formData.append('file', file)
     setUploading(true)
     try {
+      // 1. 先上传到服务器备份
       const res = await axios.post(`${API}/upload${uploadPath ? '/' + uploadPath : ''}`, formData)
-      const src = '/' + res.data.path
-      editor?.chain().focus().setImage({ src }).run()
-      message.success('图片已插入')
+      // 2. 用 FileReader 把本地文件转 base64 直接插入编辑器
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        editor?.chain().focus().setImage({ src: e.target.result }).run()
+      }
+      reader.readAsDataURL(file)
+      message.success('图片已插入（已上传到 ' + uploadPath + '）')
     } catch (e) { message.error('上传失败：' + (e.response?.data?.error || e.message)) }
     finally { setUploading(false) }
   }
