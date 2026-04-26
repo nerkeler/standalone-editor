@@ -98,7 +98,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
   const [showSidebar, setShowSidebar] = useState(true)
-  const [showToolbar, setShowToolbar] = useState(false)
+  const [showToolbar, setShowToolbar] = useState(true)
   const [sidebarView, setSidebarView] = useState('tree')
   const [isDirty, setIsDirty] = useState({})
   const [expandedKeys, setExpandedKeys] = useState([])
@@ -760,7 +760,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
             </>
           ) : (
             <>
-              {showToolbar && (
+              {showToolbar && !isMobile && (
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 2, padding: '6px 12px',
                 borderBottom: '1px solid var(--color-border)', flexShrink: 0, flexWrap: 'wrap',
@@ -790,6 +790,9 @@ export default function Editor({ workspace, onWorkspaceChange }) {
 
                 <div style={{ flex: 1 }} />
 
+                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}>
+                  <Button {...tbBtn(showToolbar, 'rgba(0,0,0,0.75)')} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} />
+                </Tooltip>
                 <Tooltip title="源文本" mouseEnterDelay={0.5}><Button {...tbBtn(showSource, 'rgba(0,0,0,0.75)')} onClick={async () => {
                     if (!showSource && activeFile) {
                       setSourceContent(savedContents[activeFile] || '')
