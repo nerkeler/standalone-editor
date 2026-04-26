@@ -79,7 +79,7 @@ function collectFolders(nodes, excludePath) {
 
 // ========== 主组件 ==========
 
-export default function Editor({ workspace }) {
+export default function Editor({ workspace, onWorkspaceChange }) {
   const [tree, setTree] = useState([])
   const [selectedKey, setSelectedKey] = useState('')
   const [openFiles, setOpenFiles] = useState([])
@@ -512,7 +512,7 @@ export default function Editor({ workspace }) {
         display: 'flex',
         ...(isMobile
           ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }
-          : { height: 'calc(100vh - 64px)', padding: '0 4px' }),
+          : { height: 'calc(100vh - 0px)', padding: 0 }),
         gap: isMobile ? 0 : 12,
         overflow: 'hidden',
         background: 'var(--color-bg)',
@@ -686,9 +686,13 @@ export default function Editor({ workspace }) {
                 <>
                   <FileOutlined style={{ fontSize: 48, opacity: 0.4 }} />
                   <Button type="primary" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)}>📂 打开目录</Button>
+                  <Button size="small" onClick={() => { localStorage.removeItem('editor_workspace'); onWorkspaceChange?.('') }} style={{ marginTop: 8 }}>📁 切换目录</Button>
                 </>
               ) : (
-                <span>从左侧选择文件</span>
+                <>
+                  <span>从左侧选择文件</span>
+                  <Button size="small" onClick={() => { localStorage.removeItem('editor_workspace'); onWorkspaceChange?.('') }} style={{ marginTop: 8 }}>📁 切换目录</Button>
+                </>
               )}
             </div>
           ) : (
