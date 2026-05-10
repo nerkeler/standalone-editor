@@ -46,6 +46,34 @@ function buildTree(flat) {
       map[parent]?.children?.push(map[n.path])
     }
   })
+
+  // 排序：文件夹在前；同类型内：ASCII英文 > 中文
+  const sortKey = (name) => {
+    const hasNonAscii = /[^\x00-\x7F]/.test(name)
+    const isAscii = !hasNonAscii
+    return [isAscii ? 0 : 1, name]
+  }
+
+  roots.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+    const [pa, sa] = sortKey(a.name)
+    const [pb, sb] = sortKey(b.name)
+    if (pa !== pb) return pa - pb
+    return sa.localeCompare(sb)
+  })
+
+  const sortChildren = (nodes) => {
+    nodes.sort((a, b) => {
+      if (a.type !== b.type) return a.type === 'dir' ? -1 : 1
+      const [pa, sa] = sortKey(a.name)
+      const [pb, sb] = sortKey(b.name)
+      if (pa !== pb) return pa - pb
+      return sa.localeCompare(sb)
+    })
+    nodes.forEach(n => n.children && sortChildren(n.children))
+  }
+  sortChildren(roots)
+
   return roots
 }
 
@@ -100,12 +128,20 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   const [showSidebar, setShowSidebar] = useState(true)
   const [showToolbar, setShowToolbar] = useState(true)
   const [sidebarView, setSidebarView] = useState('tree')
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    return parseInt(localStorage.getItem('sidebarWidth') || '420', 10)
+  })
+  const sidebarWidthRef = useRef(sidebarWidth)
+  const isDraggingRef = useRef(false)
   const [isDirty, setIsDirty] = useState({})
   const [expandedKeys, setExpandedKeys] = useState([])
   const [isAllExpanded, setIsAllExpanded] = useState(false)
   const [outlineItems, setOutlineItems] = useState([])
   const [imageViewer, setImageViewer] = useState(null)   // { path, url, name }
   const [imageZoom, setImageZoom] = useState(100)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState([])
+  const [importModal, setImportModal] = useState(false)
 
   const IMAGE_EXTS = ['jpg','jpeg','png','gif','webp','bmp','svg','ico','tiff','tif']
   const isImageFile = (name) => IMAGE_EXTS.includes(name.split('.').pop()?.toLowerCase() || '')
@@ -159,6 +195,20 @@ export default function Editor({ workspace, onWorkspaceChange }) {
     ],
   }, [])
 
+  // 键盘快捷键
+  useEffect(() => {
+    if (!editor) return
+    const handler = (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key === 's') { e.preventDefault(); handleSave(); return }
+        if (e.key === 'b') { e.preventDefault(); editor.chain().focus().toggleBold().run(); return }
+        if (e.key === 'i') { e.preventDefault(); editor.chain().focus().toggleItalic().run(); return }
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [editor, activeFile])
+
   const applyZoom = useCallback(() => {
     const zoomMap = zoomMapRef.current
     document.querySelectorAll('.ProseMirror img').forEach(img => {
@@ -201,6 +251,16 @@ export default function Editor({ workspace, onWorkspaceChange }) {
       const res = await axios.get(API, { params: { path: '' } })
       setTree(buildTree(res.data || []))
     } catch {}
+  }, [])
+
+  // 搜索文件
+  const handleSearch = useCallback(async (q) => {
+    setSearchQuery(q)
+    if (!q.trim()) { setSearchResults([]); return }
+    try {
+      const res = await axios.get(`${API}/search`, { params: { q } })
+      setSearchResults(res.data || [])
+    } catch { setSearchResults([]) }
   }, [])
 
   // 懒加载子目录
@@ -329,7 +389,6 @@ export default function Editor({ workspace, onWorkspaceChange }) {
   }
 
   const doSave = async (path) => {
-    console.log('[doSave] path:', path, 'workspace:', workspace)
     if (!editor) return
     try {
       const td = new Turndown({ headingStyle: 'atx', codeBlockStyle: 'fenced' })
@@ -343,16 +402,13 @@ export default function Editor({ workspace, onWorkspaceChange }) {
           md = md.replace(new RegExp(pattern), `$&<!-- zoom:${zoom} -->`)
         }
       })
-      console.log('[doSave] PUT payload:', { path, contentLen: md.length })
-      const res = await axios.put(API, { path, content: md })
-      console.log('[doSave] response:', res.data)
+      await axios.put(API, { path, content: md })
       setSavedContents(p => ({ ...p, [path]: md }))
       cleanContentsRef.current[path] = md
       setIsDirty(p => { const n = { ...p }; delete n[path]; return n })
       setSaveStatus('saved')
       setTimeout(() => setSaveStatus('idle'), 2000)
     } catch (err) {
-      console.error('[doSave] ERROR:', err?.response?.data || err.message || err)
       setSaveStatus('modified')
     }
   }
@@ -364,6 +420,29 @@ export default function Editor({ workspace, onWorkspaceChange }) {
       await doSave(activeFile)
       message.success('保存成功')
     } catch { message.error('保存失败') }
+  }
+
+  // 导出当前文件
+  const handleExport = () => {
+    if (!activeFile) return
+    const url = `${API}/export?path=${encodeURIComponent(activeFile)}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = activeFile.split('/').pop() || 'export.md'
+    a.click()
+  }
+
+  // 导入弹窗处理
+  const handleImport = async (file) => {
+    if (!file) return
+    const formData = new FormData()
+    formData.append('file', file)
+    try {
+      const res = await axios.post(`${API}/import`, formData, { headers: { 'Content-Type': 'multipart/form-data' } })
+      message.success(res.data.message || '导入成功')
+      setImportModal(false)
+      await loadTree()
+    } catch (e) { message.error('导入失败：' + (e.response?.data?.error || e.message)) }
   }
 
   const handleCreate = async () => {
@@ -553,7 +632,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
         ...(isMobile
           ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }
           : { height: 'calc(100vh - 0px)', padding: 0 }),
-        gap: isMobile ? 0 : 12,
+        gap: isMobile ? 0 : 0,
         overflow: 'hidden',
         background: 'var(--color-bg)',
       }}
@@ -561,8 +640,8 @@ export default function Editor({ workspace, onWorkspaceChange }) {
       {/* 左侧面板 - PC */}
       {!editorFullscreen && !isMobile && showSidebar && (
         <div style={{
-          width: 360, flexShrink: 0, display: 'flex', flexDirection: 'column',
-          background: 'var(--color-bg-card)', borderRadius: 12,
+          width: sidebarWidth, flexShrink: 0, display: 'flex', flexDirection: 'column',
+          background: 'var(--color-bg-card)', borderRadius: 0,
           border: '1px solid var(--color-border)', overflow: 'hidden',
           boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
         }}>
@@ -575,8 +654,33 @@ export default function Editor({ workspace, onWorkspaceChange }) {
                   <Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} />
                   <Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" />
                   <Button size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" />
+                  <Button size="small" icon={<UploadOutlined />} onClick={() => setImportModal(true)} title="导入文件" />
+                  <Button size="small" icon={<ApiOutlined />} onClick={handleExport} title="导出当前文件" disabled={!activeFile} />
                 </div>
               </div>
+              {/* 搜索框 */}
+              <div style={{ padding: '0 8px 8px' }}>
+                <Input size="small" placeholder="搜索文件..." allowClear
+                  value={searchQuery} onChange={e => handleSearch(e.target.value)} />
+              </div>
+              {/* 搜索结果 */}
+              {searchQuery && (
+                <div style={{ padding: '0 8px 8px', maxHeight: 200, overflow: 'auto' }}>
+                  {searchResults.length === 0 && (
+                    <div style={{ padding: '8px 4px', fontSize: 12, color: 'var(--color-text-secondary)' }}>无结果</div>
+                  )}
+                  {searchResults.map(r => (
+                    <div key={r.path} onClick={() => handleFileOpen({ path: r.path, name: r.name, type: 'file' })}
+                      style={{ padding: '6px 8px', cursor: 'pointer', borderRadius: 6, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      onMouseEnter={e => e.currentTarget.style.background = 'rgba(0,0,0,0.06)'}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      <FileOutlined style={{ color: '#74b9ff', marginRight: 6 }} />
+                      <span style={{ fontWeight: 500 }}>{r.name}</span>
+                      {r.preview && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginLeft: 20 }}>{r.preview}</div>}
+                    </div>
+                  ))}
+                </div>
+              )}
               <div style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
                 <Tree
                   treeData={renderTreeNodes(tree)}
@@ -634,6 +738,57 @@ export default function Editor({ workspace, onWorkspaceChange }) {
         </div>
       )}
 
+      {/* 拖拽分隔条：window级监听，2px视觉线+8px热区 */}
+      {!editorFullscreen && !isMobile && showSidebar && (() => {
+        const handleMouseDown = (e) => {
+          e.preventDefault()
+          isDraggingRef.current = true
+          document.body.style.cursor = 'col-resize'
+          document.body.style.userSelect = 'none'
+
+          const handleMouseMove = (ev) => {
+            if (!isDraggingRef.current) return
+            window.requestAnimationFrame(() => {
+              const newWidth = Math.max(200, Math.min(800, ev.clientX))
+              sidebarWidthRef.current = newWidth
+              setSidebarWidth(newWidth)
+            })
+          }
+
+          const handleMouseUp = () => {
+            if (!isDraggingRef.current) return
+            isDraggingRef.current = false
+            document.body.style.cursor = ''
+            document.body.style.userSelect = ''
+            localStorage.setItem('sidebarWidth', String(sidebarWidthRef.current))
+            window.removeEventListener('mousemove', handleMouseMove)
+            window.removeEventListener('mouseup', handleMouseUp)
+          }
+
+          window.addEventListener('mousemove', handleMouseMove)
+          window.addEventListener('mouseup', handleMouseUp)
+        }
+
+        return (
+          <div
+            onMouseDown={handleMouseDown}
+            style={{
+              width: 2, cursor: 'col-resize', flexShrink: 0,
+              background: 'var(--color-border)', position: 'relative', zIndex: 10,
+              transition: 'background 0.15s',
+            }}
+            onMouseEnter={e => e.currentTarget.style.background = 'var(--color-primary)'}
+            onMouseLeave={e => e.currentTarget.style.background = 'var(--color-border)'}
+          >
+            {/* 透明热区：左右各4px，不影响2px视觉线 */}
+            <div style={{
+              position: 'absolute', left: -4, right: -4, top: 0, bottom: 0,
+              background: 'transparent', zIndex: 11,
+            }} />
+          </div>
+        )
+      })()}
+
       {/* 移动端抽屉侧边栏 */}
       <Modal
         title="📂 笔记目录" open={mobileSidebarOpen}
@@ -675,7 +830,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
         {openFiles.length > 0 && (
           <div style={{
             display: 'flex', background: 'var(--color-bg-card)',
-            borderRadius: '8px 8px 0 0', border: '1px solid var(--color-border)', borderBottom: 'none',
+            borderRadius: 0, border: '1px solid var(--color-border)', borderBottom: 'none',
             overflow: 'auto', flexShrink: 0,
           }}>
             {isMobile && (
@@ -717,7 +872,10 @@ export default function Editor({ workspace, onWorkspaceChange }) {
                   {active && <div style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', width: 6, height: 6, borderRadius: '50%', background: '#1890ff' }} />}
                   <FileOutlined style={{ color: '#74b9ff', marginLeft: 10 }} />
                   <span style={{ marginLeft: 6 }}>{name}</span>
-                  <CloseOutlined style={{ fontSize: 10, marginLeft: 4, opacity: 0.6 }} onClick={e => handleClose(f, e)} />
+                  <CloseOutlined style={{ fontSize: 10, marginLeft: 4, opacity: 0.6, cursor: 'pointer' }}
+                    onClick={e => handleClose(f, e)}
+                    onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                    onMouseLeave={e => e.currentTarget.style.opacity = '0.6'} />
                 </div>
               )
             })}
@@ -728,7 +886,7 @@ export default function Editor({ workspace, onWorkspaceChange }) {
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column',
           background: 'var(--color-bg-card)',
-          borderRadius: openFiles.length === 0 ? 12 : '0 0 12px 12px',
+          borderRadius: openFiles.length === 0 ? 0 : 0,
           border: '1px solid var(--color-border)', overflow: 'hidden',
           boxShadow: '0 2px 12px rgba(0,0,0,0.08)',
         }}>
@@ -943,6 +1101,26 @@ export default function Editor({ workspace, onWorkspaceChange }) {
         onCancel={() => { setCreateModal({ open: false, parent: '', type: 'file' }); setCreateName('') }}
         okText="创建" cancelText="取消">
         <Input placeholder="名称" value={createName} onChange={e => setCreateName(e.target.value)} onPressEnter={handleCreate} autoFocus />
+      </Modal>
+
+      {/* 导入 */}
+      <Modal title="导入文件（支持 .zip）" open={importModal}
+        onCancel={() => setImportModal(false)} footer={null} okText="导入" cancelText="取消">
+        <div style={{ padding: '16px 0', display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <input
+            type="file"
+            accept=".zip"
+            id="import-zip-input"
+            style={{ display: 'none' }}
+            onChange={e => { const f = e.target.files?.[0]; if (f) handleImport(f); e.target.value = '' }}
+          />
+          <label htmlFor="import-zip-input" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', border: '1px dashed var(--color-border)', borderRadius: 8, color: 'var(--color-text-secondary)', fontSize: 13 }}>
+            <UploadOutlined />点击选择 .zip 文件
+          </label>
+          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
+            仅允许导入 <b>.md</b> 和 <b>图片</b>（.jpg/.png/.gif/.webp/.bmp/.svg）文件。
+          </div>
+        </div>
       </Modal>
 
       {/* 移动 */}
