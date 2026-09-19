@@ -76,7 +76,7 @@ body {
 
 .theme-toggle {
   position: fixed;
-  bottom: 112px;
+  bottom: 40px;
   left: 14px;
   z-index: 10001;
   width: 36px;
