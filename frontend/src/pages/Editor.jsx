@@ -780,6 +780,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     } catch { message.error('保存失败，已保留未保存状态') }
   }, [captureCurrentDraft, doSave])
 
+  const handleChangeWorkspace = useCallback(async () => {
+    try {
+      await flushPaths(openFilesRef.current)
+    } catch {
+      message.error('保存失败，暂不能更改目录')
+      return
+    }
+    openRequestRef.current += 1
+    onWorkspaceChange?.('')
+  }, [flushPaths, onWorkspaceChange])
+
   // Give the browser a last chance to transmit drafts when a tab/window is
   // closed. The confirmation keeps the page alive long enough for keepalive
   // requests to be queued; clean documents leave unload completely silent.
@@ -1162,8 +1173,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }}>
           {sidebarView === 'tree' && (
             <>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px' }}>
-                <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
+              <div style={{ padding: '10px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 600, marginBottom: 2 }}>当前读取目录</div>
+                    <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
+                  </div>
+                  <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>更改目录</Button>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+                  <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
+                </div>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
                   <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
@@ -1315,6 +1335,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         width={300}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div style={{ padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
+            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>当前读取目录</div>
+            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
+            <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} block>更改目录</Button>
+          </div>
           <div style={{ display: 'flex', gap: 4 }}>
             <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
             <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
@@ -1405,12 +1430,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 <>
                   <FileOutlined style={{ fontSize: 48, opacity: 0.4 }} />
                   <Button type="primary" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)}>📂 打开目录</Button>
-                  <Button size="small" onClick={() => { localStorage.removeItem('editor_workspace'); onWorkspaceChange?.('') }} style={{ marginTop: 8 }}>📁 切换目录</Button>
+                  <Button type="primary" size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} style={{ marginTop: 8 }}>更改目录</Button>
                 </>
               ) : (
                 <>
                   <span>从左侧选择文件</span>
-                  <Button size="small" onClick={() => { localStorage.removeItem('editor_workspace'); onWorkspaceChange?.('') }} style={{ marginTop: 8 }}>📁 切换目录</Button>
+                  <Button type="primary" size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} style={{ marginTop: 8 }}>更改目录</Button>
                 </>
               )}
             </div>

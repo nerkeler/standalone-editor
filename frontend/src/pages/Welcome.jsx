@@ -141,6 +141,9 @@ export default function Welcome({ onEnter }) {
               <div style={{ fontWeight: 600, fontFamily: 'monospace' }}>
                 {currentWorkspace || '未选择工作目录'}
               </div>
+              <div style={{ fontSize: 11, marginTop: 6, color: 'var(--color-success)' }}>
+                已保存在此浏览器，下次打开会自动进入
+              </div>
             </div>
 
             <Button
