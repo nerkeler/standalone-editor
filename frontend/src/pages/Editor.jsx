@@ -1265,8 +1265,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               </div>
             </>
           )}
-          <div style={{ flexShrink: 0, padding: '10px 12px 12px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
-            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
+          <div style={{ flexShrink: 0, padding: '4px 12px 6px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
+            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, lineHeight: '16px', color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
       )}
@@ -1355,8 +1355,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               handleMove(draggedNode, target.key)
             }}
           />
-          <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
-            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
+          <div style={{ marginTop: 4, padding: '4px 10px 6px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
+            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, lineHeight: '16px', color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
       </Modal>
