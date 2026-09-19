@@ -1173,17 +1173,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }}>
           {sidebarView === 'tree' && (
             <>
-              <div style={{ padding: '10px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 600, marginBottom: 2 }}>当前读取目录</div>
-                    <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
-                  </div>
-                  <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>更改目录</Button>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
-                  <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
-                </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
+                <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
                 <div style={{ display: 'flex', gap: 4 }}>
                   <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
                   <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
@@ -1273,6 +1264,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               </div>
             </>
           )}
+          <div style={{ flexShrink: 0, padding: '10px 12px 12px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
+            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 600, marginBottom: 3 }}>当前读取目录</div>
+            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
+            <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} style={{ width: 'calc(100% - 44px)', marginLeft: 44 }}>更改目录</Button>
+          </div>
         </div>
       )}
 
@@ -1335,11 +1331,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         width={300}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>当前读取目录</div>
-            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
-            <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} block>更改目录</Button>
-          </div>
           <div style={{ display: 'flex', gap: 4 }}>
             <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
             <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
@@ -1364,6 +1355,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               handleMove(draggedNode, target.key)
             }}
           />
+          <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
+            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>当前读取目录</div>
+            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
+            <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} block>更改目录</Button>
+          </div>
         </div>
       </Modal>
 
