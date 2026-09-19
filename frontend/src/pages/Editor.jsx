@@ -1266,8 +1266,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             </>
           )}
           <div style={{ flexShrink: 0, padding: '10px 12px 12px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 600, marginBottom: 3 }}>当前读取目录</div>
-            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
+            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
       )}
@@ -1357,8 +1356,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             }}
           />
           <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>当前读取目录</div>
-            <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
+            <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
       </Modal>
