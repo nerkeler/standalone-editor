@@ -1176,7 +1176,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
                 <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
                 <div style={{ display: 'flex', gap: 4 }}>
-                  <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>更改目录</Button>
+                  <Tooltip title="更改目录"><Button size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} aria-label="更改目录" title="更改目录" /></Tooltip>
                   <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
                   <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
                   <Tooltip title="新建文件夹"><Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
@@ -1268,7 +1268,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           <div style={{ flexShrink: 0, padding: '10px 12px 12px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', fontWeight: 600, marginBottom: 3 }}>当前读取目录</div>
             <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>目录已保存到浏览器，下次打开会自动进入</div>
           </div>
         </div>
       )}
@@ -1333,7 +1332,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', gap: 4 }}>
-            <Button type="primary" size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>更改目录</Button>
+            <Tooltip title="更改目录"><Button size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} aria-label="更改目录" title="更改目录" /></Tooltip>
             <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
             <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
             <Tooltip title="新建文件夹"><Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
@@ -1360,7 +1359,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
             <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginBottom: 3 }}>当前读取目录</div>
             <div title={workspace} style={{ fontSize: 12, color: 'var(--color-text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginBottom: 8 }}>{workspace}</div>
-            <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>目录已保存到浏览器，下次打开会自动进入</div>
           </div>
         </div>
       </Modal>
