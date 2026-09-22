@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Tree, Button, Modal, Input, message, Tooltip } from 'antd'
+import { Tree, Button, Modal, Input, message, Tooltip, Dropdown } from 'antd'
 import {
   FileOutlined, FolderOpenOutlined, PlusOutlined, UploadOutlined, SaveOutlined,
   CloseOutlined, CheckSquareOutlined, TableOutlined, MoreOutlined, DeleteOutlined,
@@ -7,7 +7,10 @@ import {
   UnorderedListOutlined, OrderedListOutlined, LinkOutlined, ExpandOutlined,
   ShrinkOutlined, HolderOutlined, ArrowLeftOutlined, EditOutlined, MenuOutlined,
   NodeIndexOutlined, CodeOutlined, ApiOutlined, AppstoreOutlined,
-  MenuFoldOutlined, MenuUnfoldOutlined, AlignLeftOutlined
+  AlignLeftOutlined, DownOutlined,
+  CheckOutlined, LoadingOutlined, CloseCircleOutlined, ReloadOutlined,
+  ReadOutlined, FileAddOutlined, FolderAddOutlined, SearchOutlined,
+  ZoomInOutlined, ZoomOutOutlined
 } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -31,6 +34,32 @@ import './Editor.css'
 const lowlight = createLowlight(common)
 
 const API = '/api/workspace'
+
+function SaveStatus({ status, onRetry }) {
+  const states = {
+    modified: { icon: <span className="save-status-dot" />, label: '修改待保存', className: 'is-modified' },
+    saving: { icon: <LoadingOutlined spin />, label: '保存中', className: 'is-saving' },
+    saved: { icon: <CheckOutlined />, label: '已保存', className: 'is-saved' },
+    error: { icon: <CloseCircleOutlined />, label: '保存失败', className: 'is-error' },
+  }
+  const current = states[status] || states.saved
+  return (
+    <div className={`save-status ${current.className}`} role="status" aria-live="polite">
+      <span className="save-status-icon" aria-hidden="true">{current.icon}</span>
+      <span>{current.label}</span>
+      {status === 'error' && (
+        <Button
+          type="link"
+          size="small"
+          className="save-retry"
+          icon={<ReloadOutlined />}
+          onClick={onRetry}
+          aria-label="重试保存"
+        >重试</Button>
+      )}
+    </div>
+  )
+}
 
 function imageSrcWithWorkspaceIdentity(src, info) {
   if (!src || !src.startsWith('/api/workspace/assets/') || !info?.workspaceId) return src
@@ -215,11 +244,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [editorFullscreen, setEditorFullscreen] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
-  const [showSidebar, setShowSidebar] = useState(true)
+  const [showSidebar] = useState(true)
   const [showToolbar, setShowToolbar] = useState(true)
   const [sidebarView, setSidebarView] = useState('tree')
+  const [showOutline, setShowOutline] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => {
-    return parseInt(localStorage.getItem('sidebarWidth') || '420', 10)
+    const stored = parseInt(localStorage.getItem('sidebarWidth') || '280', 10)
+    return Math.max(220, Math.min(520, Number.isFinite(stored) ? stored : 280))
   })
   const sidebarWidthRef = useRef(sidebarWidth)
   const isDraggingRef = useRef(false)
@@ -233,6 +264,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [searchResults, setSearchResults] = useState([])
   const [importModal, setImportModal] = useState(false)
   const [saveStatus, setSaveStatus] = useState('idle')
+  const [saveErrors, setSaveErrors] = useState({})
   const [fileLoading, setFileLoading] = useState(false)
 
   // The editor renders one document at a time, but every open tab keeps its
@@ -248,6 +280,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const saveTimersRef = useRef(new Map())
   const saveQueuesRef = useRef(new Map())
   const saveStatusRef = useRef('idle')
+  const saveErrorsRef = useRef({})
   const cleanContentsRef = useRef({})
   // renderedFileRef identifies the document currently represented by the
   // ProseMirror instance. While a file request is pending the editor still
@@ -265,6 +298,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   useEffect(() => { showSourceRef.current = showSource }, [showSource])
   useEffect(() => { sourceContentRef.current = sourceContent }, [sourceContent])
   useEffect(() => { saveStatusRef.current = saveStatus }, [saveStatus])
+  useEffect(() => { saveErrorsRef.current = saveErrors }, [saveErrors])
 
   useEffect(() => {
     if (workspaceInfo?.workspaceId) {
@@ -479,8 +513,15 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }, [])
 
   const setDraft = (path, content, dirty = content !== cleanContentsRef.current[path]) => {
+    const previousContent = draftContentsRef.current[path]
     draftContentsRef.current[path] = content
     dirtyRef.current[path] = Boolean(dirty)
+    if (dirty && saveErrorsRef.current[path] && previousContent !== content) {
+      const nextErrors = { ...saveErrorsRef.current }
+      delete nextErrors[path]
+      saveErrorsRef.current = nextErrors
+      setSaveErrors(nextErrors)
+    }
     setSavedContents(prev => ({ ...prev, [path]: content }))
     setIsDirty(prev => {
       const next = { ...prev }
@@ -531,6 +572,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     clearSaveTimer(path)
     const previous = saveQueuesRef.current.get(path) || Promise.resolve()
     const operation = previous.catch(() => {}).then(async () => {
+      if (activeFileRef.current === path) setSaveStatus('saving')
       try {
         await axios.put(API, { path, content })
         // A request may have been in flight while the user typed again. Only
@@ -539,20 +581,24 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           cleanContentsRef.current[path] = content
           dirtyRef.current[path] = false
           clearPendingDraft(path, content)
+          const nextErrors = { ...saveErrorsRef.current }
+          delete nextErrors[path]
+          saveErrorsRef.current = nextErrors
+          setSaveErrors(nextErrors)
           setSavedContents(prev => ({ ...prev, [path]: content }))
           setIsDirty(prev => { const next = { ...prev }; delete next[path]; return next })
           if (activeFileRef.current === path) {
             setSaveStatus('saved')
-            setTimeout(() => {
-              if (activeFileRef.current === path && !dirtyRef.current[path]) setSaveStatus('idle')
-            }, 2000)
           }
         } else if (activeFileRef.current === path) {
           setSaveStatus('modified')
         }
         return true
       } catch (error) {
-        if (activeFileRef.current === path) setSaveStatus('modified')
+        const nextErrors = { ...saveErrorsRef.current, [path]: error?.message || '保存失败' }
+        saveErrorsRef.current = nextErrors
+        setSaveErrors(nextErrors)
+        if (activeFileRef.current === path) setSaveStatus('error')
         throw error
       }
     })
@@ -623,7 +669,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setFileLoading(false)
       setEditorMarkdown(withoutZoom)
       setSourceContent(visible)
-      setSaveStatus(dirtyRef.current[path] ? 'modified' : 'idle')
+      setSaveStatus(saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved'))
       if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
       setTimeout(applyZoom, 0)
     } catch (error) {
@@ -679,7 +725,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         setFileLoading(false)
         setImageViewer({ path, url: `data:${res.data.mime};base64,${res.data.data}`, name: node.name || path.split('/').pop() })
         setImageZoom(100)
-        setSaveStatus('idle')
+        setSaveStatus('saved')
       } catch (error) {
         if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
         loadingRef.current = false
@@ -706,7 +752,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setFileLoading(false)
       setEditorMarkdown(withoutZoom)
       setSourceContent(visible)
-      setSaveStatus(dirtyRef.current[path] ? 'modified' : 'idle')
+      setSaveStatus(saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved'))
       setTimeout(applyZoom, 0)
     } else {
       await loadFile(path, requestId)
@@ -716,6 +762,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const removeTabState = useCallback(path => {
     clearSaveTimer(path)
     saveQueuesRef.current.delete(path)
+    const nextErrors = { ...saveErrorsRef.current }
+    delete nextErrors[path]
+    saveErrorsRef.current = nextErrors
+    setSaveErrors(nextErrors)
     delete draftContentsRef.current[path]
     delete dirtyRef.current[path]
     delete cleanContentsRef.current[path]
@@ -779,6 +829,41 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       message.success('保存成功')
     } catch { message.error('保存失败，已保留未保存状态') }
   }, [captureCurrentDraft, doSave])
+
+  const handleRetrySave = useCallback(() => {
+    const path = activeFileRef.current
+    if (!path || isImageFile(path)) return
+    const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
+    if (content === undefined) return
+    setSaveStatus('saving')
+    doSave(path, content).catch(() => {})
+  }, [captureCurrentDraft, doSave])
+
+  const handleToggleSource = useCallback(() => {
+    const path = activeFileRef.current
+    if (!path || loadingRef.current || renderedFileRef.current !== path) return
+    if (!showSourceRef.current) {
+      const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
+      sourceContentRef.current = content
+      setSourceContent(content)
+      showSourceRef.current = true
+      setShowSource(true)
+      return
+    }
+    const content = sourceContentRef.current
+    const zoomMap = {}
+    content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
+      zoomMap[src.replace(/^\//, '')] = zoom
+      return ''
+    })
+    zoomMapRef.current = zoomMap
+    setEditorMarkdown(content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)'))
+    setDraft(path, content, content !== cleanContentsRef.current[path])
+    if (content !== cleanContentsRef.current[path]) setSaveStatus('modified')
+    showSourceRef.current = false
+    setShowSource(false)
+    setTimeout(applyZoom, 0)
+  }, [applyZoom, captureCurrentDraft, setEditorMarkdown])
 
   const handleChangeWorkspace = useCallback(async () => {
     try {
@@ -990,6 +1075,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       draftContentsRef.current = migrate(draftContentsRef.current)
       dirtyRef.current = migrate(dirtyRef.current)
       cleanContentsRef.current = migrate(cleanContentsRef.current)
+      const migratedErrors = migrate(saveErrorsRef.current)
+      saveErrorsRef.current = migratedErrors
+      setSaveErrors(migratedErrors)
       setSavedContents(migrate)
       setIsDirty(migrate)
       setOpenFiles(prev => prev.map(file => remapPath(file, node.path, newPath)))
@@ -1055,6 +1143,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       draftContentsRef.current = migrate(draftContentsRef.current)
       dirtyRef.current = migrate(dirtyRef.current)
       cleanContentsRef.current = migrate(cleanContentsRef.current)
+      const migratedErrors = migrate(saveErrorsRef.current)
+      saveErrorsRef.current = migratedErrors
+      setSaveErrors(migratedErrors)
       setSavedContents(migrate)
       setIsDirty(migrate)
       setOpenFiles(prev => prev.map(file => remapPath(file, renamingPath, newPath)))
@@ -1118,7 +1209,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       ) : (
         <div
           style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, paddingLeft: node.type === 'file' ? 20 : 0 }}
-          onClick={node.type === 'file' ? e => { e.stopPropagation(); handleFileOpen(node) } : undefined}
+          onClick={node.type === 'file' ? e => { e.stopPropagation(); handleFileOpen(node); if (isMobile) setMobileSidebarOpen(false) } : undefined}
           onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
         >
           {isDirty[node.path] && <span style={{ color: 'var(--color-warning)', marginRight: 2 }}>●</span>}
@@ -1149,10 +1240,25 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   })
 
   const moveFolderTree = moveModal.node ? collectFolders(tree, moveModal.node.path) : []
+  const activeSaveStatus = activeFile
+    ? (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus))
+    : 'idle'
+  const headingItems = [
+    { key: 'paragraph', label: '正文' },
+    { key: 'heading-1', label: '标题 1' },
+    { key: 'heading-2', label: '标题 2' },
+    { key: 'heading-3', label: '标题 3' },
+    { key: 'heading-4', label: '标题 4' },
+    { key: 'heading-5', label: '标题 5' },
+    { key: 'heading-6', label: '标题 6' },
+  ]
+  const activeHeading = [1, 2, 3, 4, 5, 6].find(level => editor?.isActive('heading', { level }))
+  const activeHeadingLabel = activeHeading ? `标题 ${activeHeading}` : '正文'
 
   return (
     <div
       id="editor-root"
+      className="editor-shell"
       style={{
         display: 'flex',
         ...(isMobile
@@ -1165,7 +1271,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     >
       {/* 左侧面板 - PC */}
       {!editorFullscreen && !isMobile && showSidebar && (
-        <div style={{
+        <div className="workspace-sidebar" style={{
           width: sidebarWidth, flexShrink: 0, display: 'flex', flexDirection: 'column',
           background: 'var(--color-bg-card)', borderRadius: 0,
           border: '1px solid var(--color-border)', overflow: 'hidden',
@@ -1173,21 +1279,40 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }}>
           {sidebarView === 'tree' && (
             <>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
-                <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>目录</span>
-                <div style={{ display: 'flex', gap: 4 }}>
+              <div className="sidebar-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px 12px 8px', borderBottom: '1px solid var(--color-border)' }}>
+                <div className="sidebar-heading">
+                  <span className="sidebar-title">目录</span>
+                </div>
+                <div className="sidebar-actions" style={{ display: 'flex', gap: 4 }}>
                   <Tooltip title="更改目录"><Button size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} aria-label="更改目录" title="更改目录" /></Tooltip>
-                  <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
-                  <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
-                  <Tooltip title="新建文件夹"><Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
-                  <Tooltip title="新建文件"><Button size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" /></Tooltip>
-                  <Tooltip title="导入文件"><Button size="small" icon={<UploadOutlined />} onClick={() => setImportModal(true)} title="导入文件" /></Tooltip>
-                  <Tooltip title="导出当前文件"><Button size="small" icon={<ApiOutlined />} onClick={handleExport} title="导出当前文件" disabled={!activeFile} /></Tooltip>
+                  <Tooltip title="新建文件"><Button size="small" icon={<FileAddOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} aria-label="新建文件" title="新建文件" /></Tooltip>
+                  <Dropdown
+                    trigger={['click']}
+                    menu={{
+                      items: [
+                        { key: 'expand', label: isAllExpanded ? '全部折叠' : '全部展开', icon: <MenuOutlined /> },
+                        { key: 'locate', label: '定位当前文件', icon: <NodeIndexOutlined />, disabled: !activeFile },
+                        { type: 'divider' },
+                        { key: 'folder', label: '新建文件夹', icon: <FolderAddOutlined /> },
+                        { key: 'import', label: '导入文件', icon: <UploadOutlined /> },
+                        { key: 'export', label: '导出当前文件', icon: <ApiOutlined />, disabled: !activeFile },
+                      ],
+                      onClick: ({ key }) => {
+                        if (key === 'expand') handleToggleExpandAll()
+                        if (key === 'locate') handleLocateCurrentFile()
+                        if (key === 'folder') setCreateModal({ open: true, parent: '', type: 'dir' })
+                        if (key === 'import') setImportModal(true)
+                        if (key === 'export') handleExport()
+                      },
+                    }}
+                  >
+                    <Tooltip title="更多目录操作"><Button size="small" icon={<MoreOutlined />} aria-label="更多目录操作" /></Tooltip>
+                  </Dropdown>
                 </div>
               </div>
               {/* 搜索框 */}
-              <div style={{ padding: '0 8px 8px' }}>
-                <Input size="small" placeholder="搜索文件..." allowClear
+              <div className="sidebar-search" style={{ padding: '0 8px 8px' }}>
+                <Input size="small" prefix={<SearchOutlined />} placeholder="搜索文件..." allowClear
                   value={searchQuery} onChange={e => handleSearch(e.target.value)} />
               </div>
               {/* 搜索结果 */}
@@ -1208,7 +1333,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   ))}
                 </div>
               )}
-              <div style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
+              <div className="tree-scroll" style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
                 <Tree
                   treeData={renderTreeNodes(tree)}
                   selectedKeys={[selectedKey]}
@@ -1265,7 +1390,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               </div>
             </>
           )}
-          <div style={{ flexShrink: 0, padding: '4px 12px 6px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
+          <div className="workspace-status" style={{ flexShrink: 0, padding: '4px 12px 6px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
             <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, lineHeight: '16px', color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
@@ -1304,6 +1429,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
         return (
           <div
+            className="sidebar-resizer"
             onMouseDown={handleMouseDown}
             style={{
               width: 2, cursor: 'col-resize', flexShrink: 0,
@@ -1324,7 +1450,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
       {/* 移动端抽屉侧边栏 */}
       <Modal
-        title="📂 笔记目录" open={mobileSidebarOpen}
+        className="mobile-workspace-modal"
+        title="笔记目录" open={mobileSidebarOpen}
         onCancel={() => setMobileSidebarOpen(false)}
         footer={null}
         width={300}
@@ -1332,29 +1459,53 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
           <div style={{ display: 'flex', gap: 4 }}>
             <Tooltip title="更改目录"><Button size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} aria-label="更改目录" title="更改目录" /></Tooltip>
-            <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
-            <Tooltip title="定位当前文件"><Button size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
-            <Tooltip title="新建文件夹"><Button size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
-            <Tooltip title="新建文件"><Button size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" /></Tooltip>
+            <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button aria-label={isAllExpanded ? '全部折叠' : '全部展开'} size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
+            <Tooltip title="定位当前文件"><Button aria-label="定位当前文件" size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
+            <Tooltip title={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'}><Button aria-label={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'} size="small" icon={<ReadOutlined />} onClick={() => setSidebarView(v => v === 'outline' ? 'tree' : 'outline')} title={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'} /></Tooltip>
+            <Tooltip title="新建文件夹"><Button aria-label="新建文件夹" size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
+            <Tooltip title="新建文件"><Button aria-label="新建文件" size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" /></Tooltip>
           </div>
-          <Tree
-            treeData={renderTreeNodes(tree)}
-            selectedKeys={[selectedKey]}
-            expandedKeys={expandedKeys}
-            onExpand={handleExpand}
-            expandAction="click"
-            onSelect={(keys) => {
-              if (keys.length > 0) setMobileSidebarOpen(false)
-            }}
-            onDrop={info => {
-              const target = info.node
-              const draggedKey = info.dragNodesKeys[0]
-              const draggedNode = findNode(tree, draggedKey)
-              const targetNode = findNode(tree, target.key)
-              if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
-              handleMove(draggedNode, target.key)
-            }}
-          />
+          {sidebarView === 'outline' ? (
+            <div className="mobile-outline-list" aria-label="文档大纲">
+              {outlineItems.length === 0 && <div className="outline-empty">当前文档还没有标题</div>}
+              {outlineItems.map((item, i) => (
+                <button
+                  type="button"
+                  className="outline-item"
+                  key={`${item.pos}-${i}`}
+                  style={{ paddingLeft: 10 + (item.level - 1) * 14 }}
+                  onClick={() => {
+                    if (!editor || item.pos == null) return
+                    editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
+                    setMobileSidebarOpen(false)
+                  }}
+                  title={item.text}
+                >
+                  <span className="outline-level">H{item.level}</span>
+                  <span>{item.text || '无标题'}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <Tree
+              treeData={renderTreeNodes(tree)}
+              selectedKeys={[selectedKey]}
+              expandedKeys={expandedKeys}
+              onExpand={handleExpand}
+              expandAction="click"
+              onSelect={(keys) => {
+                if (keys.length > 0) setMobileSidebarOpen(false)
+              }}
+              onDrop={info => {
+                const target = info.node
+                const draggedKey = info.dragNodesKeys[0]
+                const draggedNode = findNode(tree, draggedKey)
+                const targetNode = findNode(tree, target.key)
+                if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
+                handleMove(draggedNode, target.key)
+              }}
+            />
+          )}
           <div style={{ marginTop: 4, padding: '4px 10px 6px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
             <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, lineHeight: '16px', color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
@@ -1362,19 +1513,19 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       </Modal>
 
       {/* 主区域 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: editorFullscreen ? 'hidden' : 'visible' }}>
+      <div className="editor-main" style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: editorFullscreen ? 'hidden' : 'visible' }}>
         {/* 标签页 */}
         {openFiles.length > 0 && (
-          <div style={{
+          <div className="document-tabs" style={{
             display: 'flex', background: 'var(--color-bg-card)',
             borderRadius: 0, border: '1px solid var(--color-border)', borderBottom: 'none',
             overflow: 'auto', flexShrink: 0,
           }}>
             {isMobile && (
               <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px', height: 36, flexShrink: 0, borderRight: '1px solid var(--color-border)', gap: 2 }}>
-                <Tooltip title="打开目录"><Button size="small" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)} /></Tooltip>
-                <Tooltip title={showSidebar ? '隐藏文件栏' : '显示文件栏'}><Button size="small" {...tbBtn(!showSidebar)} onClick={() => setShowSidebar(v => !v)} icon={showSidebar ? <MenuFoldOutlined /> : <MenuUnfoldOutlined />} /></Tooltip>
-                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button size="small" {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
+                <Tooltip title="打开目录"><Button aria-label="打开目录" size="small" icon={<AppstoreOutlined />} onClick={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }} /></Tooltip>
+                <Tooltip title="查看大纲"><Button aria-label="查看大纲" size="small" icon={<ReadOutlined />} onClick={() => { setSidebarView('outline'); setMobileSidebarOpen(true) }} /></Tooltip>
+                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button aria-label={showToolbar ? '隐藏工具栏' : '显示工具栏'} size="small" {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
               </div>
             )}
             {openFiles.map(f => {
@@ -1408,7 +1559,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         )}
 
         {/* 编辑区 */}
-        <div style={{
+        <div className="editor-surface" style={{
           flex: 1, display: 'flex', flexDirection: 'column',
           background: 'var(--color-bg-card)',
           borderRadius: openFiles.length === 0 ? 0 : 0,
@@ -1416,20 +1567,26 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           boxShadow: 'var(--shadow-lg)',
         }}>
           {!activeFile ? (
-            <div style={{
+            <div className="empty-editor" style={{
               display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
               height: '100%', gap: 16, padding: 24, color: 'var(--color-text-secondary)',
             }}>
               {isMobile ? (
                 <>
-                  <FileOutlined style={{ fontSize: 48, opacity: 0.4 }} />
-                  <Button type="primary" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)}>📂 打开目录</Button>
-                  <Button type="primary" size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} style={{ marginTop: 8 }}>更改目录</Button>
+                  <FileOutlined className="empty-editor-icon" />
+                  <span className="empty-editor-title">打开一篇笔记开始编辑</span>
+                  <span className="empty-editor-copy">从左侧目录选择文件，或先切换到其他工作区。</span>
+                  <Button type="primary" icon={<FileAddOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })}>新建笔记</Button>
+                  <Button aria-label="打开目录" size="middle" icon={<AppstoreOutlined />} onClick={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }}>打开目录</Button>
+                  <Button size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>更改目录</Button>
                 </>
               ) : (
                 <>
-                  <span>从左侧选择文件</span>
-                  <Button type="primary" size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} style={{ marginTop: 8 }}>更改目录</Button>
+                  <FileOutlined className="empty-editor-icon" />
+                  <span className="empty-editor-title">打开一篇笔记开始编辑</span>
+                  <span className="empty-editor-copy">从左侧目录选择文件，或先切换到其他工作区。</span>
+                  <Button type="primary" size="middle" icon={<FileAddOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })}>新建笔记</Button>
+                  <Button aria-label="打开目录" size="middle" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace}>打开目录</Button>
                 </>
               )}
             </div>
@@ -1440,11 +1597,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 {/* 工具栏 */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 16px', borderBottom: '1px solid var(--color-border)', flexShrink: 0 }}>
                   <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', flex: 1 }}>{imageViewer.name}</span>
-                  <Button size="small" onClick={() => setImageZoom(z => Math.min(z + 25, 400))}>🔍+</Button>
+                  <Tooltip title="放大"><Button aria-label="放大" size="small" icon={<ZoomInOutlined />} onClick={() => setImageZoom(z => Math.min(z + 25, 400))} /></Tooltip>
                   <span style={{ fontSize: 12, minWidth: 44, textAlign: 'center' }}>{imageZoom}%</span>
                   <Button size="small" onClick={() => setImageZoom(100)}>重置</Button>
-                  <Button size="small" onClick={() => setImageZoom(z => Math.max(z - 25, 25))}>🔍-</Button>
-                  <Button size="small" danger onClick={() => handleClose(imageViewer.path)}>×</Button>
+                  <Tooltip title="缩小"><Button aria-label="缩小" size="small" icon={<ZoomOutOutlined />} onClick={() => setImageZoom(z => Math.max(z - 25, 25))} /></Tooltip>
+                  <Button aria-label="关闭图片" size="small" danger icon={<CloseOutlined />} onClick={() => handleClose(imageViewer.path)} />
                 </div>
                 {/* 图片显示区：点击切换 100% ↔ 200% */}
                 <div style={{ flex: 1, overflow: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16, cursor: 'zoom-in' }}
@@ -1457,72 +1614,89 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           ) : (
             <>
               {showToolbar && !isMobile && (
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 2, padding: '6px 12px',
-                borderBottom: '1px solid var(--color-border)', flexShrink: 0, flexWrap: 'wrap',
-              }}>
-                {isMobile && <Tooltip title="打开目录"><Button size="small" icon={<AppstoreOutlined />} onClick={() => setMobileSidebarOpen(true)} /></Tooltip>}
-                <Tooltip title="加粗 (Ctrl+B)"><Button {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
-                <Tooltip title="斜体 (Ctrl+I)"><Button {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
-                <Tooltip title="删除线"><Button {...tbBtn(editor?.isActive('strike') || false)} onClick={() => editor?.chain().focus().toggleStrike().run()} icon={<StrikethroughOutlined />} /></Tooltip>
-                <div style={{ width: 1, height: 16, background: 'var(--color-border)', margin: '0 4px' }} />
-                <Tooltip title="标题1"><Button {...tbBtn(editor?.isActive('heading', { level: 1 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()} style={{ fontWeight: 700 }}>H1</Button></Tooltip>
-                <Tooltip title="标题2"><Button {...tbBtn(editor?.isActive('heading', { level: 2 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()} style={{ fontWeight: 700, fontSize: 12 }}>H2</Button></Tooltip>
-                <Tooltip title="标题3"><Button {...tbBtn(editor?.isActive('heading', { level: 3 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()} style={{ fontWeight: 700, fontSize: 11 }}>H3</Button></Tooltip>
-                <Tooltip title="标题4"><Button {...tbBtn(editor?.isActive('heading', { level: 4 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 4 }).run()} style={{ fontWeight: 700, fontSize: 10 }}>H4</Button></Tooltip>
-                <Tooltip title="标题5"><Button {...tbBtn(editor?.isActive('heading', { level: 5 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 5 }).run()} style={{ fontWeight: 700, fontSize: 9 }}>H5</Button></Tooltip>
-                <Tooltip title="标题6"><Button {...tbBtn(editor?.isActive('heading', { level: 6 }) || false, 'var(--color-text-secondary)')} onClick={() => editor?.chain().focus().toggleHeading({ level: 6 }).run()} style={{ fontWeight: 700, fontSize: 8 }}>H6</Button></Tooltip>
-                <div style={{ width: 1, height: 16, background: 'var(--color-border)', margin: '0 4px' }} />
-                <Tooltip title="无序列表"><Button {...tbBtn(editor?.isActive('bulletList') || false)} onClick={() => editor?.chain().focus().toggleBulletList().run()} icon={<UnorderedListOutlined />} /></Tooltip>
-                <Tooltip title="有序列表"><Button {...tbBtn(editor?.isActive('orderedList') || false)} onClick={() => editor?.chain().focus().toggleOrderedList().run()} icon={<OrderedListOutlined />} /></Tooltip>
-                <Tooltip title="任务列表"><Button {...tbBtn(editor?.isActive('taskList') || false)} onClick={() => editor?.chain().focus().toggleTaskList().run()} icon={<CheckSquareOutlined />} /></Tooltip>
-                <div style={{ width: 1, height: 16, background: 'var(--color-border)', margin: '0 4px' }} />
-                <Tooltip title="引用"><Button {...tbBtn(editor?.isActive('blockquote') || false)} onClick={() => editor?.chain().focus().toggleBlockquote().run()} icon={<HolderOutlined />} /></Tooltip>
-                <Tooltip title="代码块"><Button {...tbBtn(editor?.isActive('codeBlock') || false)} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<ApiOutlined />} /></Tooltip>
-                <Tooltip title="插入链接"><Button {...tbBtn(editor?.isActive('link') || false)} onClick={handleInsertLink} icon={<LinkOutlined />} /></Tooltip>
-                <Tooltip title="插入表格"><Button {...tbBtn(false)} onClick={() => editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()} icon={<TableOutlined />} /></Tooltip>
-                <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
-                <Tooltip title="上传图片"><label><Button {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} /></label></Tooltip>
+                <div className="editor-toolbar" role="toolbar" aria-label="编辑工具栏">
+                  <div className="toolbar-group toolbar-format-group">
+                    <Tooltip title="加粗 (⌘/Ctrl+B)"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
+                    <Tooltip title="斜体 (⌘/Ctrl+I)"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
+                    <Tooltip title="删除线"><Button aria-label="删除线" {...tbBtn(editor?.isActive('strike') || false)} onClick={() => editor?.chain().focus().toggleStrike().run()} icon={<StrikethroughOutlined />} /></Tooltip>
+                    <Dropdown
+                      trigger={['click']}
+                      menu={{
+                        items: headingItems,
+                        selectable: false,
+                        onClick: ({ key }) => {
+                          const chain = editor?.chain().focus()
+                          if (!chain) return
+                          if (key === 'paragraph') chain.setParagraph().run()
+                          else chain.toggleHeading({ level: Number(key.split('-')[1]) }).run()
+                        },
+                      }}
+                    >
+                      <Button className="heading-picker" aria-label={`当前段落样式：${activeHeadingLabel}`} {...tbBtn(Boolean(activeHeading), 'var(--color-text)')}>
+                        <span>{activeHeadingLabel}</span><DownOutlined />
+                      </Button>
+                    </Dropdown>
+                  </div>
+                  <span className="toolbar-divider" aria-hidden="true" />
+                  <div className="toolbar-group">
+                    <Tooltip title="无序列表"><Button aria-label="无序列表" {...tbBtn(editor?.isActive('bulletList') || false)} onClick={() => editor?.chain().focus().toggleBulletList().run()} icon={<UnorderedListOutlined />} /></Tooltip>
+                    <Tooltip title="有序列表"><Button aria-label="有序列表" {...tbBtn(editor?.isActive('orderedList') || false)} onClick={() => editor?.chain().focus().toggleOrderedList().run()} icon={<OrderedListOutlined />} /></Tooltip>
+                    <Tooltip title="任务列表"><Button aria-label="任务列表" {...tbBtn(editor?.isActive('taskList') || false)} onClick={() => editor?.chain().focus().toggleTaskList().run()} icon={<CheckSquareOutlined />} /></Tooltip>
+                  </div>
+                  <span className="toolbar-divider" aria-hidden="true" />
+                  <div className="toolbar-group">
+                    <Tooltip title="引用"><Button aria-label="引用" {...tbBtn(editor?.isActive('blockquote') || false)} onClick={() => editor?.chain().focus().toggleBlockquote().run()} icon={<HolderOutlined />} /></Tooltip>
+                    <Tooltip title="代码块"><Button aria-label="代码块" {...tbBtn(editor?.isActive('codeBlock') || false)} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<ApiOutlined />} /></Tooltip>
+                    <Tooltip title="插入链接"><Button aria-label="插入链接" {...tbBtn(editor?.isActive('link') || false)} onClick={handleInsertLink} icon={<LinkOutlined />} /></Tooltip>
+                    <Tooltip title="插入表格"><Button aria-label="插入表格" {...tbBtn(false)} onClick={() => editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()} icon={<TableOutlined />} /></Tooltip>
+                    <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
+                    <Tooltip title="上传图片"><label><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} /></label></Tooltip>
+                  </div>
+                  <span className="toolbar-spacer" />
+                  <div className="toolbar-group toolbar-view-group">
+                    <Tooltip title={showSource ? '编辑' : '源码'}>
+                      <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
+                        <span className="mode-button-label">{showSource ? '编辑' : '源码'}</span>
+                      </Button>
+                    </Tooltip>
+                    {!isMobile && <Tooltip title={showOutline ? '隐藏右侧大纲' : '显示右侧大纲'}>
+                      <Button aria-label={showOutline ? '隐藏右侧大纲' : '显示右侧大纲'} {...tbBtn(showOutline, 'var(--color-text-secondary)')} onClick={() => setShowOutline(v => !v)} icon={<ReadOutlined />} />
+                    </Tooltip>}
+                    <Tooltip title={editorFullscreen ? '退出专注模式' : '专注模式'}><Button aria-label={editorFullscreen ? '退出专注模式' : '进入专注模式'} {...tbBtn(editorFullscreen, 'var(--color-text-secondary)')} onClick={() => setEditorFullscreen(v => !v)} icon={editorFullscreen ? <ShrinkOutlined /> : <ExpandOutlined />} /></Tooltip>
+                    <Tooltip title="隐藏工具栏"><Button aria-label="隐藏工具栏" {...tbBtn(false, 'var(--color-text-secondary)')} onClick={() => setShowToolbar(false)} icon={<AlignLeftOutlined />} /></Tooltip>
+                  </div>
+                </div>
+              )}
 
-                <div style={{ flex: 1 }} />
-
-                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}>
-                  <Button {...tbBtn(showToolbar, 'var(--color-text-secondary)')} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} />
-                </Tooltip>
-                <Tooltip title="源文本" mouseEnterDelay={0.5}><Button disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={() => {
-                    const path = activeFileRef.current
-                    if (!path || loadingRef.current || renderedFileRef.current !== path) return
-                    if (!showSourceRef.current) {
-                      const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
-                      sourceContentRef.current = content
-                      setSourceContent(content)
-                      showSourceRef.current = true
-                      setShowSource(true)
-                      return
-                    }
-                    const content = sourceContentRef.current
-                    const zoomMap = {}
-                    content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
-                      zoomMap[src.replace(/^\//, '')] = zoom
-                      return ''
-                    })
-                    zoomMapRef.current = zoomMap
-                    setEditorMarkdown(content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)'))
-                    setDraft(path, content, content !== cleanContentsRef.current[path])
-                    if (content !== cleanContentsRef.current[path]) setSaveStatus('modified')
-                    showSourceRef.current = false
-                    setShowSource(false)
-                    setTimeout(applyZoom, 0)
-                  }} icon={<CodeOutlined />} /></Tooltip>
-                <Tooltip title={sidebarView === 'outline' ? '返回目录' : '大纲'} mouseEnterDelay={0.5}><Button {...tbBtn(sidebarView === 'outline', 'var(--color-text-secondary)')} onClick={() => setSidebarView(v => v === 'outline' ? 'tree' : 'outline')} icon={<MenuOutlined />} /></Tooltip>
-                {!editorFullscreen && <Tooltip title="全屏"><Button {...tbBtn(false)} onClick={() => setEditorFullscreen(true)} icon={<ExpandOutlined />} /></Tooltip>}
-                {editorFullscreen && <Tooltip title="退出全屏"><Button {...tbBtn(true)} onClick={() => setEditorFullscreen(false)} icon={<ShrinkOutlined />} /></Tooltip>}
-                <div style={{ width: 1, height: 16, background: 'var(--color-border)', margin: '0 4px' }} />
-                {saveStatus === 'modified' && <span style={{ fontSize: 11, color: 'var(--color-warning)', marginRight: 6 }}>● 已修改</span>}
-                {saveStatus === 'saving' && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginRight: 6 }}>保存中...</span>}
-                {saveStatus === 'saved' && <span style={{ fontSize: 11, color: 'var(--color-success)', marginRight: 6 }}>✓ 已保存</span>}
-                <Button size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} style={{ borderRadius: 6, height: 34 }}>保存</Button>
-              </div>
+              {showToolbar && isMobile && (
+                <div className="mobile-toolbar" role="toolbar" aria-label="移动端编辑工具栏">
+                  <Tooltip title="加粗"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
+                  <Tooltip title="斜体"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
+                  <Dropdown
+                    trigger={['click']}
+                    menu={{
+                      items: headingItems,
+                      selectable: false,
+                      onClick: ({ key }) => {
+                        const chain = editor?.chain().focus()
+                        if (!chain) return
+                        if (key === 'paragraph') chain.setParagraph().run()
+                        else chain.toggleHeading({ level: Number(key.split('-')[1]) }).run()
+                      },
+                    }}
+                  >
+                    <Button className="heading-picker" aria-label={`当前段落样式：${activeHeadingLabel}`} {...tbBtn(Boolean(activeHeading), 'var(--color-text)')}>
+                      <span>{activeHeadingLabel}</span><DownOutlined />
+                    </Button>
+                  </Dropdown>
+                  <span className="toolbar-spacer" />
+                  <Tooltip title={showSource ? '编辑' : '源码'}>
+                    <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
+                      <span className="mode-button-label">{showSource ? '编辑' : '源码'}</span>
+                    </Button>
+                  </Tooltip>
+                  <Tooltip title="隐藏工具栏"><Button aria-label="隐藏工具栏" {...tbBtn(false, 'var(--color-text-secondary)')} onClick={() => setShowToolbar(false)} icon={<AlignLeftOutlined />} /></Tooltip>
+                </div>
               )}
 
               {!showToolbar && !isMobile && (
@@ -1560,10 +1734,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                       scheduleSave(path, value)
                     }
                   }}
+                  className="source-editor"
+                  aria-label="Markdown 源文本"
                   style={{ flex: 1, width: '100%', border: 'none', outline: 'none', background: 'var(--color-bg-card)', color: 'var(--color-text)', fontFamily: 'monospace', fontSize: 14, lineHeight: 1.8, padding: '20px 32px', resize: 'none' }}
                 />
               ) : (
-                <div style={{ flex: 1, overflow: 'auto', padding: '20px 32px', background: 'var(--color-bg-card)' }}>
+                <div className="editor-scroll" style={{ flex: 1, overflow: 'auto', padding: '20px 32px', background: 'var(--color-bg-card)' }}>
                   <style>{`
                     .ProseMirror { outline: none; min-height: 100%; font-size: 17px; line-height: 1.8; color: var(--color-text); }
                     .ProseMirror h1 { font-size: 1.8em; font-weight: 700; border-bottom: 1px solid var(--color-border); padding-bottom: 8px; margin: 1em 0 0.5em; }
@@ -1634,15 +1810,66 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                       width: 3px;
                     }
                   `}</style>
-                  <div>
+                  <div className="prose-column">
                     <EditorContent editor={editor} style={{ height: '100%' }} />
                   </div>
                 </div>
               )}
             </>
           )}
+          <div className="editor-statusbar" aria-label="文档状态栏">
+            <div className="editor-file-location" title={activeFile || '尚未选择文件'}>
+              <FileOutlined aria-hidden="true" />
+              <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>
+            </div>
+            <div className="editor-status-actions">
+              {activeFile && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
+              {activeFile && !imageViewer && (
+                <Button aria-label="保存当前文件" size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
+              )}
+            </div>
+          </div>
         </div>
       </div>
+
+      {!isMobile && !editorFullscreen && showOutline && activeFile && (
+        <aside className="outline-panel" aria-label="文档大纲">
+          <div className="outline-panel-header">
+            <div>
+              <span className="outline-panel-title">文档大纲</span>
+              <span className="outline-panel-file">{activeFile.split('/').pop()}</span>
+            </div>
+            <Button
+              type="text"
+              size="small"
+              icon={<CloseOutlined />}
+              aria-label="隐藏右侧大纲"
+              onClick={() => setShowOutline(false)}
+            />
+          </div>
+          <div className="outline-panel-body">
+            {outlineItems.length === 0 && (
+              <div className="outline-empty">当前文档还没有标题</div>
+            )}
+            {outlineItems.map((item, i) => (
+              <button
+                type="button"
+                className="outline-item"
+                key={`${item.pos}-${i}`}
+                style={{ paddingLeft: 12 + (item.level - 1) * 14 }}
+                onClick={() => {
+                  if (!editor || item.pos == null) return
+                  editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
+                }}
+                title={item.text}
+              >
+                <span className="outline-level">H{item.level}</span>
+                <span>{item.text || '无标题'}</span>
+              </button>
+            ))}
+          </div>
+        </aside>
+      )}
 
       {/* 新建 */}
       <Modal title={createModal.type === 'dir' ? '新建文件夹' : '新建文件'} open={createModal.open}

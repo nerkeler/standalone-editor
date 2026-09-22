@@ -71,7 +71,9 @@ export default function App() {
       theme={{
         algorithm: theme === 'dark' ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
         token: {
-          colorPrimary: theme === 'dark' ? '#60a5fa' : '#1a73e8',
+          colorPrimary: theme === 'dark' ? '#91bdd0' : '#517893',
+          colorInfo: theme === 'dark' ? '#91bdd0' : '#517893',
+          colorLink: theme === 'dark' ? '#91bdd0' : '#517893',
           borderRadius: 8,
         },
       }}
