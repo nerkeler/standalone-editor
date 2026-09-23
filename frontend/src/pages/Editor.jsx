@@ -37,7 +37,7 @@ const API = '/api/workspace'
 
 function SaveStatus({ status, onRetry }) {
   const states = {
-    modified: { icon: <span className="save-status-dot" />, label: '修改待保存', className: 'is-modified' },
+    modified: { icon: <EditOutlined />, label: '修改待保存', className: 'is-modified' },
     saving: { icon: <LoadingOutlined spin />, label: '保存中', className: 'is-saving' },
     saved: { icon: <CheckOutlined />, label: '已保存', className: 'is-saved' },
     error: { icon: <CloseCircleOutlined />, label: '保存失败', className: 'is-error' },
@@ -556,8 +556,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const captureCurrentDraft = useCallback(() => {
     const path = activeFileRef.current
     if (!path || isImageFile(path) || loadingRef.current || renderedFileRef.current !== path) return undefined
+    // Converting Markdown to editor HTML and back can normalize whitespace or
+    // syntax even when the user has not touched the document. Keep the exact
+    // loaded bytes for clean files; real edits are already marked by the
+    // editor update handler (or the source textarea's change handler).
+    if (!dirtyRef.current[path]) return draftContentsRef.current[path] ?? cleanContentsRef.current[path]
     const content = showSourceRef.current ? sourceContentRef.current : serializeCurrentEditor()
-    setDraft(path, content)
+    setDraft(path, content, true)
     return content
   }, [serializeCurrentEditor])
 
@@ -1208,13 +1213,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         />
       ) : (
         <div
-          style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, paddingLeft: node.type === 'file' ? 20 : 0 }}
+          style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0, overflow: 'hidden', paddingLeft: node.type === 'file' ? 20 : 0 }}
           onClick={node.type === 'file' ? e => { e.stopPropagation(); handleFileOpen(node); if (isMobile) setMobileSidebarOpen(false) } : undefined}
           onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
         >
-          {isDirty[node.path] && <span style={{ color: 'var(--color-warning)', marginRight: 2 }}>●</span>}
           {node.type === 'dir' ? <FolderOpenOutlined style={{ color: 'var(--color-warning)' }} /> : <FileOutlined style={{ color: 'var(--color-file)' }} />}
-          <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
+          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
           <span
             className="tree-node-more"
             onClick={e => { e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
@@ -1254,6 +1258,30 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   ]
   const activeHeading = [1, 2, 3, 4, 5, 6].find(level => editor?.isActive('heading', { level }))
   const activeHeadingLabel = activeHeading ? `标题 ${activeHeading}` : '正文'
+  const mobileToolbarItems = [
+    { key: 'strike', label: '删除线', icon: <StrikethroughOutlined /> },
+    { key: 'bullet-list', label: '无序列表', icon: <UnorderedListOutlined /> },
+    { key: 'ordered-list', label: '有序列表', icon: <OrderedListOutlined /> },
+    { key: 'task-list', label: '任务列表', icon: <CheckSquareOutlined /> },
+    { type: 'divider' },
+    { key: 'blockquote', label: '引用', icon: <HolderOutlined /> },
+    { key: 'code-block', label: '代码块', icon: <ApiOutlined /> },
+    { key: 'link', label: '插入链接', icon: <LinkOutlined /> },
+    { key: 'table', label: '插入表格', icon: <TableOutlined /> },
+    { key: 'image', label: '上传图片', icon: <UploadOutlined /> },
+  ]
+  const applyMobileToolbarAction = ({ key }) => {
+    const chain = editor?.chain().focus()
+    if (key === 'strike') chain?.toggleStrike().run()
+    if (key === 'bullet-list') chain?.toggleBulletList().run()
+    if (key === 'ordered-list') chain?.toggleOrderedList().run()
+    if (key === 'task-list') chain?.toggleTaskList().run()
+    if (key === 'blockquote') chain?.toggleBlockquote().run()
+    if (key === 'code-block') chain?.toggleCodeBlock().run()
+    if (key === 'link') handleInsertLink()
+    if (key === 'table') chain?.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
+    if (key === 'image') document.getElementById('img-up')?.click()
+  }
 
   return (
     <div
@@ -1333,7 +1361,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   ))}
                 </div>
               )}
-              <div className="tree-scroll" style={{ flex: 1, overflow: 'auto', padding: '0 8px 8px' }}>
+              <div className="tree-scroll" style={{ flex: '1 1 0%', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto', padding: '0 8px 8px' }}>
                 <Tree
                   treeData={renderTreeNodes(tree)}
                   selectedKeys={[selectedKey]}
@@ -1513,16 +1541,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       </Modal>
 
       {/* 主区域 */}
-      <div className="editor-main" style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, overflow: editorFullscreen ? 'hidden' : 'visible' }}>
+      <div className="editor-main" style={{ flex: '1 1 0%', display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
         {/* 标签页 */}
         {openFiles.length > 0 && (
           <div className="document-tabs" style={{
             display: 'flex', background: 'var(--color-bg-card)',
             borderRadius: 0, border: '1px solid var(--color-border)', borderBottom: 'none',
-            overflow: 'auto', flexShrink: 0,
+            overflowX: 'auto', overflowY: 'hidden', flexShrink: 0, flexWrap: 'nowrap',
           }}>
             {isMobile && (
-              <div style={{ display: 'flex', alignItems: 'center', padding: '0 6px', height: 36, flexShrink: 0, borderRight: '1px solid var(--color-border)', gap: 2 }}>
+              <div className="document-tabs-utility" style={{ display: 'flex', alignItems: 'center', padding: '0 6px', height: 40, flexShrink: 0, borderRight: '1px solid var(--color-border)', gap: 2 }}>
                 <Tooltip title="打开目录"><Button aria-label="打开目录" size="small" icon={<AppstoreOutlined />} onClick={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }} /></Tooltip>
                 <Tooltip title="查看大纲"><Button aria-label="查看大纲" size="small" icon={<ReadOutlined />} onClick={() => { setSidebarView('outline'); setMobileSidebarOpen(true) }} /></Tooltip>
                 <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button aria-label={showToolbar ? '隐藏工具栏' : '显示工具栏'} size="small" {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
@@ -1531,27 +1559,33 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             {openFiles.map(f => {
               const name = f.split('/').pop() || f
               const active = f === activeFile
+              const hasSaveError = Boolean(saveErrors[f])
+              const hasUnsavedChanges = Boolean(isDirty[f])
               return (
-                <div key={f} onClick={() => {
+                <div key={f} className={`document-tab${active ? ' is-active' : ''}`} title={f} onClick={() => {
                     handleFileOpen({ path: f, name, type: 'file' })
                     setMobileSidebarOpen(false)
                   }}
+                  aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
                   onContextMenu={e => { e.preventDefault(); setTabMenu({ visible: true, x: e.clientX, y: e.clientY, target: f }) }}
                   style={{
-                    position: 'relative', display: 'flex', alignItems: 'center',
-                    padding: '0 14px', height: 36, fontSize: 13, cursor: 'pointer',
+                    cursor: 'pointer',
                     borderRight: '1px solid var(--color-border)',
-                    background: active ? 'var(--color-bg-card)' : 'transparent',
-                    color: active ? 'var(--color-text)' : 'var(--color-text-secondary)',
-                    whiteSpace: 'nowrap', minWidth: 100, gap: 0,
                   }}>
-                  {active && <div style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', width: 6, height: 6, borderRadius: '50%', background: 'var(--color-primary)' }} />}
-                  <FileOutlined style={{ color: 'var(--color-file)', marginLeft: 10 }} />
-                  <span style={{ marginLeft: 6 }}>{name}</span>
-                  <CloseOutlined style={{ fontSize: 10, marginLeft: 4, opacity: 0.6, cursor: 'pointer' }}
-                    onClick={e => handleClose(f, e)}
-                    onMouseEnter={e => e.currentTarget.style.opacity = '1'}
-                    onMouseLeave={e => e.currentTarget.style.opacity = '0.6'} />
+                  <FileOutlined aria-hidden="true" />
+                  <span className="document-tab-title">{name}</span>
+                  {hasSaveError ? (
+                    <Tooltip title="保存失败">
+                      <span className="tab-status-label is-error" aria-label="保存失败">失败</span>
+                    </Tooltip>
+                  ) : hasUnsavedChanges ? (
+                    <Tooltip title="修改待保存">
+                      <span className="tab-status-label is-modified" aria-label="修改待保存">未保存</span>
+                    </Tooltip>
+                  ) : null}
+                  <button type="button" className="tab-close" aria-label={`关闭 ${name}`} title={`关闭 ${name}`} onClick={e => handleClose(f, e)}>
+                    <CloseOutlined aria-hidden="true" />
+                  </button>
                 </div>
               )
             })}
@@ -1689,6 +1723,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                       <span>{activeHeadingLabel}</span><DownOutlined />
                     </Button>
                   </Dropdown>
+                  <Dropdown
+                    trigger={['click']}
+                    menu={{ items: mobileToolbarItems, selectable: false, onClick: applyMobileToolbarAction }}
+                  >
+                    <Button className="mobile-more-formats" aria-label="更多格式" {...tbBtn(false, 'var(--color-text-secondary)')} icon={<MoreOutlined />}>更多格式</Button>
+                  </Dropdown>
+                  <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
                   <span className="toolbar-spacer" />
                   <Tooltip title={showSource ? '编辑' : '源码'}>
                     <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
