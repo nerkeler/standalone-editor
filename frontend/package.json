@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --strictPort",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:interaction": "node --test tests/editor-save.browser.test.js"
   },
   "dependencies": {
     "@ant-design/icons": "^5.3.0",

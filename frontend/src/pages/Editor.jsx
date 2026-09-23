@@ -29,6 +29,8 @@ import { marked } from 'marked'
 import Turndown from 'turndown'
 import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
+import useEditorDrafts, { isImageFile } from './useEditorDrafts'
+import DocumentTabs from './DocumentTabs'
 import './Editor.css'
 
 const lowlight = createLowlight(common)
@@ -232,7 +234,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [openFiles, setOpenFiles] = useState([])
   const [activeFile, setActiveFile] = useState('')
   const [tabMenu, setTabMenu] = useState({ visible: false, x: 0, y: 0, target: '' })
-  const [savedContents, setSavedContents] = useState({})
   const [createModal, setCreateModal] = useState({ open: false, parent: '', type: 'file' })
   const [createName, setCreateName] = useState('')
   const [uploading, setUploading] = useState(false)
@@ -254,7 +255,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   })
   const sidebarWidthRef = useRef(sidebarWidth)
   const isDraggingRef = useRef(false)
-  const [isDirty, setIsDirty] = useState({})
   const [expandedKeys, setExpandedKeys] = useState([])
   const [isAllExpanded, setIsAllExpanded] = useState(false)
   const [outlineItems, setOutlineItems] = useState([])
@@ -263,8 +263,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState([])
   const [importModal, setImportModal] = useState(false)
-  const [saveStatus, setSaveStatus] = useState('idle')
-  const [saveErrors, setSaveErrors] = useState({})
   const [fileLoading, setFileLoading] = useState(false)
 
   // The editor renders one document at a time, but every open tab keeps its
@@ -275,13 +273,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const showSourceRef = useRef(showSource)
   const sourceContentRef = useRef(sourceContent)
   const openFilesRef = useRef([])
-  const draftContentsRef = useRef({})
-  const dirtyRef = useRef({})
-  const saveTimersRef = useRef(new Map())
-  const saveQueuesRef = useRef(new Map())
-  const saveStatusRef = useRef('idle')
-  const saveErrorsRef = useRef({})
-  const cleanContentsRef = useRef({})
+  const {
+    savedContents, setSavedContents,
+    isDirty, setIsDirty,
+    saveStatus, setSaveStatus,
+    saveErrors, setSaveErrors,
+    draftContentsRef, dirtyRef, saveTimersRef, saveQueuesRef,
+    saveErrorsRef, cleanContentsRef,
+    writePendingDrafts,
+    remapPendingDrafts, removePendingDrafts,
+    setDraft, clearSaveTimer, doSave, scheduleSave, waitForPathSaves,
+  } = useEditorDrafts(workspace, activeFileRef)
   // renderedFileRef identifies the document currently represented by the
   // ProseMirror instance. While a file request is pending the editor still
   // contains the previous tab, so capturing it as the new tab would corrupt
@@ -297,8 +299,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   useEffect(() => { openFilesRef.current = openFiles }, [openFiles])
   useEffect(() => { showSourceRef.current = showSource }, [showSource])
   useEffect(() => { sourceContentRef.current = sourceContent }, [sourceContent])
-  useEffect(() => { saveStatusRef.current = saveStatus }, [saveStatus])
-  useEffect(() => { saveErrorsRef.current = saveErrors }, [saveErrors])
 
   useEffect(() => {
     if (workspaceInfo?.workspaceId) {
@@ -308,65 +308,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       localStorage.setItem('editor_workspace', workspaceInfo.workspace || workspace)
     }
   }, [workspaceInfo, workspace])
-
-  const pendingDraftKey = `editor_pending_drafts:${encodeURIComponent(workspace || '')}`
-  const readPendingDrafts = useCallback(() => {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(pendingDraftKey) || 'null')
-      if (!parsed || typeof parsed.drafts !== 'object') return {}
-      // A draft left by a crashed/closed tab should not shadow a file forever.
-      if (parsed.savedAt && Date.now() - parsed.savedAt > 7 * 24 * 60 * 60 * 1000) {
-        localStorage.removeItem(pendingDraftKey)
-        return {}
-      }
-      return Object.fromEntries(Object.entries(parsed.drafts).filter(([, value]) => typeof value === 'string'))
-    } catch { return {} }
-  }, [pendingDraftKey])
-
-  const writePendingDrafts = useCallback(drafts => {
-    try {
-      if (Object.keys(drafts).length) {
-        localStorage.setItem(pendingDraftKey, JSON.stringify({ savedAt: Date.now(), drafts }))
-      } else {
-        localStorage.removeItem(pendingDraftKey)
-      }
-    } catch {}
-  }, [pendingDraftKey])
-
-  const clearPendingDraft = useCallback((path, expectedContent) => {
-    const drafts = readPendingDrafts()
-    if (expectedContent === undefined || drafts[path] === expectedContent) {
-      delete drafts[path]
-      writePendingDrafts(drafts)
-    }
-  }, [readPendingDrafts, writePendingDrafts])
-
-  const remapPendingDrafts = useCallback((oldPath, newPath) => {
-    const drafts = readPendingDrafts()
-    const remapped = Object.fromEntries(Object.entries(drafts).map(([key, value]) => [remapPath(key, oldPath, newPath), value]))
-    writePendingDrafts(remapped)
-  }, [readPendingDrafts, writePendingDrafts])
-
-  const removePendingDrafts = useCallback(path => {
-    const drafts = readPendingDrafts()
-    const remaining = Object.fromEntries(Object.entries(drafts).filter(([key]) => (
-      key !== path && !key.startsWith(`${path}/`)
-    )))
-    writePendingDrafts(remaining)
-  }, [readPendingDrafts, writePendingDrafts])
-
-  useEffect(() => {
-    const restored = readPendingDrafts()
-    const paths = Object.keys(restored)
-    if (!paths.length) return
-    Object.assign(draftContentsRef.current, restored)
-    paths.forEach(path => { dirtyRef.current[path] = true })
-    setSavedContents(prev => ({ ...prev, ...restored }))
-    setIsDirty(prev => ({ ...prev, ...Object.fromEntries(paths.map(path => [path, true])) }))
-  }, [readPendingDrafts])
-
-  const IMAGE_EXTS = ['jpg','jpeg','png','gif','webp','bmp','svg','ico','tiff','tif']
-  const isImageFile = (name) => IMAGE_EXTS.includes(name.split('.').pop()?.toLowerCase() || '')
 
   const [renamingPath, setRenamingPath] = useState(null)
   const [renameValue, setRenameValue] = useState('')
@@ -512,25 +453,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     return () => document.removeEventListener('click', handler)
   }, [])
 
-  const setDraft = (path, content, dirty = content !== cleanContentsRef.current[path]) => {
-    const previousContent = draftContentsRef.current[path]
-    draftContentsRef.current[path] = content
-    dirtyRef.current[path] = Boolean(dirty)
-    if (dirty && saveErrorsRef.current[path] && previousContent !== content) {
-      const nextErrors = { ...saveErrorsRef.current }
-      delete nextErrors[path]
-      saveErrorsRef.current = nextErrors
-      setSaveErrors(nextErrors)
-    }
-    setSavedContents(prev => ({ ...prev, [path]: content }))
-    setIsDirty(prev => {
-      const next = { ...prev }
-      if (dirty) next[path] = true
-      else delete next[path]
-      return next
-    })
-  }
-
   const setEditorMarkdown = useCallback((content) => {
     if (!editor) return
     suppressEditorUpdateRef.current = true
@@ -565,76 +487,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     setDraft(path, content, true)
     return content
   }, [serializeCurrentEditor])
-
-  const clearSaveTimer = useCallback(path => {
-    const timer = saveTimersRef.current.get(path)
-    if (timer) clearTimeout(timer)
-    saveTimersRef.current.delete(path)
-  }, [])
-
-  const doSave = useCallback((path, content = draftContentsRef.current[path]) => {
-    if (!path || isImageFile(path) || content === undefined) return Promise.resolve(false)
-    clearSaveTimer(path)
-    const previous = saveQueuesRef.current.get(path) || Promise.resolve()
-    const operation = previous.catch(() => {}).then(async () => {
-      if (activeFileRef.current === path) setSaveStatus('saving')
-      try {
-        await axios.put(API, { path, content })
-        // A request may have been in flight while the user typed again. Only
-        // clear dirty state when the response corresponds to the current draft.
-        if (draftContentsRef.current[path] === content) {
-          cleanContentsRef.current[path] = content
-          dirtyRef.current[path] = false
-          clearPendingDraft(path, content)
-          const nextErrors = { ...saveErrorsRef.current }
-          delete nextErrors[path]
-          saveErrorsRef.current = nextErrors
-          setSaveErrors(nextErrors)
-          setSavedContents(prev => ({ ...prev, [path]: content }))
-          setIsDirty(prev => { const next = { ...prev }; delete next[path]; return next })
-          if (activeFileRef.current === path) {
-            setSaveStatus('saved')
-          }
-        } else if (activeFileRef.current === path) {
-          setSaveStatus('modified')
-        }
-        return true
-      } catch (error) {
-        const nextErrors = { ...saveErrorsRef.current, [path]: error?.message || '保存失败' }
-        saveErrorsRef.current = nextErrors
-        setSaveErrors(nextErrors)
-        if (activeFileRef.current === path) setSaveStatus('error')
-        throw error
-      }
-    })
-    saveQueuesRef.current.set(path, operation)
-    operation.then(
-      () => { if (saveQueuesRef.current.get(path) === operation) saveQueuesRef.current.delete(path) },
-      () => { if (saveQueuesRef.current.get(path) === operation) saveQueuesRef.current.delete(path) },
-    )
-    return operation
-  }, [clearPendingDraft, clearSaveTimer])
-
-  const scheduleSave = useCallback((path, content) => {
-    clearSaveTimer(path)
-    const timer = setTimeout(() => {
-      saveTimersRef.current.delete(path)
-      doSave(path, content).catch(() => {})
-    }, 3000)
-    saveTimersRef.current.set(path, timer)
-  }, [clearSaveTimer, doSave])
-
-  const waitForPathSaves = useCallback(async paths => {
-    const unique = [...new Set(paths)]
-    for (const path of unique) {
-      clearSaveTimer(path)
-      if (dirtyRef.current[path] && draftContentsRef.current[path] !== undefined) {
-        await doSave(path, draftContentsRef.current[path])
-      }
-      const pending = saveQueuesRef.current.get(path)
-      if (pending) await pending
-    }
-  }, [clearSaveTimer, doSave])
 
   // 编辑内容变化 → 将当前快照绑定到当前路径，再防抖保存。
   useEffect(() => {
@@ -1543,54 +1395,26 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       {/* 主区域 */}
       <div className="editor-main" style={{ flex: '1 1 0%', display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, overflow: 'hidden' }}>
         {/* 标签页 */}
-        {openFiles.length > 0 && (
-          <div className="document-tabs" style={{
-            display: 'flex', background: 'var(--color-bg-card)',
-            borderRadius: 0, border: '1px solid var(--color-border)', borderBottom: 'none',
-            overflowX: 'auto', overflowY: 'hidden', flexShrink: 0, flexWrap: 'nowrap',
-          }}>
-            {isMobile && (
-              <div className="document-tabs-utility" style={{ display: 'flex', alignItems: 'center', padding: '0 6px', height: 40, flexShrink: 0, borderRight: '1px solid var(--color-border)', gap: 2 }}>
-                <Tooltip title="打开目录"><Button aria-label="打开目录" size="small" icon={<AppstoreOutlined />} onClick={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }} /></Tooltip>
-                <Tooltip title="查看大纲"><Button aria-label="查看大纲" size="small" icon={<ReadOutlined />} onClick={() => { setSidebarView('outline'); setMobileSidebarOpen(true) }} /></Tooltip>
-                <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button aria-label={showToolbar ? '隐藏工具栏' : '显示工具栏'} size="small" {...tbBtn(!showToolbar)} onClick={() => setShowToolbar(v => !v)} icon={<AlignLeftOutlined />} /></Tooltip>
-              </div>
-            )}
-            {openFiles.map(f => {
-              const name = f.split('/').pop() || f
-              const active = f === activeFile
-              const hasSaveError = Boolean(saveErrors[f])
-              const hasUnsavedChanges = Boolean(isDirty[f])
-              return (
-                <div key={f} className={`document-tab${active ? ' is-active' : ''}`} title={f} onClick={() => {
-                    handleFileOpen({ path: f, name, type: 'file' })
-                    setMobileSidebarOpen(false)
-                  }}
-                  aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
-                  onContextMenu={e => { e.preventDefault(); setTabMenu({ visible: true, x: e.clientX, y: e.clientY, target: f }) }}
-                  style={{
-                    cursor: 'pointer',
-                    borderRight: '1px solid var(--color-border)',
-                  }}>
-                  <FileOutlined aria-hidden="true" />
-                  <span className="document-tab-title">{name}</span>
-                  {hasSaveError ? (
-                    <Tooltip title="保存失败">
-                      <span className="tab-status-label is-error" aria-label="保存失败">失败</span>
-                    </Tooltip>
-                  ) : hasUnsavedChanges ? (
-                    <Tooltip title="修改待保存">
-                      <span className="tab-status-label is-modified" aria-label="修改待保存">未保存</span>
-                    </Tooltip>
-                  ) : null}
-                  <button type="button" className="tab-close" aria-label={`关闭 ${name}`} title={`关闭 ${name}`} onClick={e => handleClose(f, e)}>
-                    <CloseOutlined aria-hidden="true" />
-                  </button>
-                </div>
-              )
-            })}
-          </div>
-        )}
+        <DocumentTabs
+          files={openFiles}
+          activeFile={activeFile}
+          saveErrors={saveErrors}
+          isDirty={isDirty}
+          isMobile={isMobile}
+          showToolbar={showToolbar}
+          onShowTree={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }}
+          onShowOutline={() => { setSidebarView('outline'); setMobileSidebarOpen(true) }}
+          onToggleToolbar={() => setShowToolbar(value => !value)}
+          onOpenFile={(path, name) => {
+            handleFileOpen({ path, name, type: 'file' })
+            setMobileSidebarOpen(false)
+          }}
+          onCloseFile={handleClose}
+          onTabContextMenu={(target, event) => {
+            event.preventDefault()
+            setTabMenu({ visible: true, x: event.clientX, y: event.clientY, target })
+          }}
+        />
 
         {/* 编辑区 */}
         <div className="editor-surface" style={{

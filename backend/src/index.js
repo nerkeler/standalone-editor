@@ -19,6 +19,7 @@ import {
   writeFile,
   uploadFile,
   listAll,
+  searchWorkspace,
 } from './fileService.js'
 import {
   configuredRootValues,
@@ -451,28 +452,8 @@ app.get('/api/workspace/assets/:filename', workspaceGuard, async (req, res) => {
 // 递归搜索文件名和 Markdown 文本。
 app.get('/api/workspace/search', workspaceGuard, async (req, res) => {
   try {
-    const query = String(req.query.q || '').trim().toLowerCase()
-    if (!query) return sendData(res, [], req)
-    const results = []
     const ws = workspaceFor(req)
-    for (const item of await listAll(ws)) {
-      let preview = ''
-      if (item.name.toLowerCase().includes(query)) {
-        results.push({ ...item })
-        continue
-      }
-      if (!item.name.toLowerCase().endsWith('.md')) continue
-      try {
-        const content = (await readFile(ws, item.path)).content
-        const index = content.toLowerCase().indexOf(query)
-        if (index !== -1) {
-          preview = content.slice(Math.max(0, index - 40), index + 120).replace(/\s+/g, ' ')
-          results.push({ ...item, preview })
-        }
-      } catch {}
-      if (results.length >= 100) break
-    }
-    sendData(res, results, req)
+    sendData(res, await searchWorkspace(ws, req.query.q), req)
   } catch (error) { sendError(res, error, req) }
 })
 

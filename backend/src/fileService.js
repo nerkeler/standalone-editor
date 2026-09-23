@@ -128,15 +128,34 @@ export async function listTree(workspace) {
     for (const entry of entries) {
       if (entry.name.startsWith('.')) continue
       const entryPath = path.join(dir, entry.name)
-      const stat = await fs.lstat(entryPath)
-      if (stat.isSymbolicLink()) continue
+      // Dirent already carries the common file types from readdir. Avoid a
+      // separate lstat for every normal file and directory; only unusual file
+      // systems that report an unknown type need the slower fallback.
+      if (entry.isSymbolicLink()) continue
+      let type
+      if (entry.isDirectory()) {
+        // Recheck directories just before descending: if a directory was
+        // replaced with a symlink after readdir, do not traverse its target.
+        const stat = await fs.lstat(entryPath)
+        if (stat.isSymbolicLink()) continue
+        type = stat.isDirectory() ? 'dir' : 'file'
+      } else if (
+        entry.isFile() || entry.isBlockDevice() || entry.isCharacterDevice() ||
+        entry.isFIFO() || entry.isSocket()
+      ) {
+        type = 'file'
+      } else {
+        const stat = await fs.lstat(entryPath)
+        if (stat.isSymbolicLink()) continue
+        type = stat.isDirectory() ? 'dir' : 'file'
+      }
       const item = {
         name: entry.name,
-        type: stat.isDirectory() ? 'dir' : 'file',
+        type,
         path: relativePath(base, entryPath),
       }
       result.push(item)
-      if (stat.isDirectory()) await walk(entryPath)
+      if (type === 'dir') await walk(entryPath)
     }
   }
   await walk(full)
@@ -258,6 +277,67 @@ export async function uploadFile(workspace, reqPath, file) {
 // 列出所有文件（用于判断是否为空工作空间）
 export async function listAll(workspace) {
   return (await listTree(workspace)).filter(item => item.type === 'file')
+}
+
+const SEARCH_READ_CONCURRENCY = 4
+const SEARCH_RESULT_LIMIT = 100
+
+// Search names in tree order and Markdown text in bounded batches. Batches
+// preserve the old deterministic result order while allowing disk reads to
+// overlap; resolving every entry in a batch before moving on also preserves
+// the first-100-results behavior. At most SEARCH_READ_CONCURRENCY - 1 files
+// can be read beyond the item that fills the result limit.
+export async function searchWorkspace(workspace, query) {
+  const normalizedQuery = String(query || '').trim().toLowerCase()
+  if (!normalizedQuery) return []
+
+  const files = await listAll(workspace)
+  const results = []
+  let pendingMarkdown = []
+
+  async function flushMarkdownBatch() {
+    if (!pendingMarkdown.length) return true
+    const batch = pendingMarkdown
+    pendingMarkdown = []
+    const matches = await Promise.all(batch.map(async item => {
+      try {
+        const content = (await readFile(workspace, item.path)).content
+        const index = content.toLowerCase().indexOf(normalizedQuery)
+        if (index === -1) return null
+        return {
+          ...item,
+          preview: content.slice(Math.max(0, index - 40), index + 120).replace(/\s+/g, ' '),
+        }
+      } catch {
+        // Files can disappear or become unreadable after the tree snapshot.
+        return null
+      }
+    }))
+
+    for (const match of matches) {
+      if (match) results.push(match)
+      if (results.length >= SEARCH_RESULT_LIMIT) return false
+    }
+    return true
+  }
+
+  for (const item of files) {
+    if (item.name.toLowerCase().includes(normalizedQuery)) {
+      if (!await flushMarkdownBatch()) return results
+      results.push({ ...item })
+      if (results.length >= SEARCH_RESULT_LIMIT) return results
+      continue
+    }
+    if (!item.name.toLowerCase().endsWith('.md')) continue
+
+    pendingMarkdown.push(item)
+    if (pendingMarkdown.length >= SEARCH_READ_CONCURRENCY && !await flushMarkdownBatch()) {
+      return results
+    }
+  }
+
+  await flushMarkdownBatch()
+  return results
 }
 
 export { makeError }

@@ -135,4 +135,7 @@ cd backend
 npm test
 cd ../frontend
 npm run build
+npm run test:interaction
 ```
+
+交互回归测试需要本机安装 Chrome 或 Chromium（Node.js 需支持内置 WebSocket）；默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试会在临时目录中创建笔记工作区和浏览器配置，并使用临时回环端口启动前后端。
