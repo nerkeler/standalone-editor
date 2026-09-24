@@ -10,7 +10,7 @@ import {
   AlignLeftOutlined, DownOutlined,
   CheckOutlined, LoadingOutlined, CloseCircleOutlined, ReloadOutlined,
   ReadOutlined, FileAddOutlined, FolderAddOutlined, SearchOutlined,
-  ZoomInOutlined, ZoomOutOutlined
+  ZoomInOutlined, ZoomOutOutlined, WarningOutlined, HistoryOutlined
 } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -43,6 +43,7 @@ function SaveStatus({ status, onRetry }) {
     saving: { icon: <LoadingOutlined spin />, label: '保存中', className: 'is-saving' },
     saved: { icon: <CheckOutlined />, label: '已保存', className: 'is-saved' },
     error: { icon: <CloseCircleOutlined />, label: '保存失败', className: 'is-error' },
+    conflict: { icon: <WarningOutlined />, label: '内容冲突待处理', className: 'is-error' },
   }
   const current = states[status] || states.saved
   return (
@@ -71,6 +72,17 @@ function imageSrcWithWorkspaceIdentity(src, info) {
     if (info.workspaceVersion != null) url.searchParams.set('workspaceVersion', String(info.workspaceVersion))
     return `${url.pathname}${url.search}${url.hash}`
   } catch { return src }
+}
+
+function requiresSourceMode(markdown) {
+  const content = String(markdown || '')
+  return Boolean(
+    /^\uFEFF?---\s*\r?\n[\s\S]*?\r?\n---(?:\s|$)/.test(content) ||
+    /!?\[\[[^\]\n]+\]\]/.test(content) ||
+    /^(?: {2,}|\t+)(?:[-*+]|\d+[.)])\s+(?:\[[ xX]\]\s+)?/m.test(content) ||
+    /<\/?[A-Za-z][\w:-]*(?:\s[^<>]*?)?\s*\/?>/.test(content) ||
+    /^(?:```|~~~)\s*[\w+-]+(?:\s+[^`\r\n]+)+$/m.test(content)
+  )
 }
 
 function markdownToHtml(markdown, imageIdentity) {
@@ -264,6 +276,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [searchResults, setSearchResults] = useState([])
   const [importModal, setImportModal] = useState(false)
   const [fileLoading, setFileLoading] = useState(false)
+  const [conflictReview, setConflictReview] = useState(null)
+  const [historyModal, setHistoryModal] = useState({ open: false, path: '', entries: [], loading: false })
+  const [trashModalOpen, setTrashModalOpen] = useState(false)
+  const [trashItems, setTrashItems] = useState([])
+  const [trashLoading, setTrashLoading] = useState(false)
+  const [recoveryModalOpen, setRecoveryModalOpen] = useState(false)
 
   // The editor renders one document at a time, but every open tab keeps its
   // own Markdown draft. Refs make save callbacks independent of React's
@@ -280,10 +298,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     saveErrors, setSaveErrors,
     draftContentsRef, dirtyRef, saveTimersRef, saveQueuesRef,
     saveErrorsRef, cleanContentsRef,
-    writePendingDrafts,
-    remapPendingDrafts, removePendingDrafts,
+    fileRevisions, setFileRevisions, fileRevisionsRef,
+    fileConflicts, setFileConflicts, conflictsRef, restoredDraftsRef,
+    recoveryAlternatives, applyRecoveryAlternative,
+    draftStorageError, setFileRevision, setFileConflict, clearFileConflict,
+    writePendingDrafts, clearPendingDraft, collectDirtyDrafts,
+    remapPendingDrafts, removePendingDrafts, waitForDraftRestore,
     setDraft, clearSaveTimer, doSave, scheduleSave, waitForPathSaves,
-  } = useEditorDrafts(workspace, activeFileRef)
+  } = useEditorDrafts(workspace, activeFileRef, workspaceInfo?.workspaceId)
   // renderedFileRef identifies the document currently represented by the
   // ProseMirror instance. While a file request is pending the editor still
   // contains the previous tab, so capturing it as the new tab would corrupt
@@ -345,7 +367,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       activeFile && !fileLoading && !isImageFile(activeFile) &&
       renderedFileRef.current === activeFile
     )
-    editor.setEditable(editable)
+    editor.setEditable(editable, false)
   }, [activeFile, editor, fileLoading])
 
   const refreshOutline = useCallback(() => {
@@ -456,8 +478,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const setEditorMarkdown = useCallback((content) => {
     if (!editor) return
     suppressEditorUpdateRef.current = true
-    editor.commands.setContent(markdownToHtml(content, workspaceInfoRef.current), false)
-    setTimeout(() => { suppressEditorUpdateRef.current = false }, 0)
+    try {
+      // setContent(..., false) does not emit an update. Keep the guard only
+      // around the synchronous replacement so an immediate user keystroke
+      // cannot be mistaken for a programmatic update and silently ignored.
+      editor.commands.setContent(markdownToHtml(content, workspaceInfoRef.current), false)
+    } finally {
+      suppressEditorUpdateRef.current = false
+    }
   }, [editor])
 
   const serializeCurrentEditor = useCallback(() => {
@@ -497,7 +525,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       if (!path || isImageFile(path) || showSourceRef.current || loadingRef.current || renderedFileRef.current !== path) return
       const content = serializeCurrentEditor()
       setDraft(path, content, true)
-      setSaveStatus('modified')
+      setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
       scheduleSave(path, content)
     }
     editor.on('update', handler)
@@ -508,9 +536,31 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     try {
       const res = await axios.get(`${API}/file`, { params: { path } })
       const fetched = res.data.content ?? ''
-      if (draftContentsRef.current[path] === undefined || !dirtyRef.current[path]) {
-        cleanContentsRef.current[path] = fetched
+      const diskRevision = res.data.revision
+      const hasDirtyDraft = Boolean(dirtyRef.current[path] && draftContentsRef.current[path] !== undefined)
+      const restoredSnapshot = restoredDraftsRef.current[path]
+      const draftBaseline = restoredSnapshot
+        ? restoredSnapshot.baseRevision
+        : (fileRevisionsRef.current[path] ?? null)
+      cleanContentsRef.current[path] = fetched
+      if (!hasDirtyDraft) {
+        if (diskRevision) setFileRevision(path, diskRevision)
         setDraft(path, fetched, false)
+        clearFileConflict(path)
+      } else {
+        // Never advance a dirty draft's baseline just because a reload saw a
+        // newer disk revision. This applies to both crash-recovered and
+        // in-memory drafts; a mismatch must be compared before it can save.
+        if (!draftBaseline || !diskRevision || draftBaseline !== diskRevision) {
+          setFileConflict(path, {
+            type: draftBaseline ? 'draft-stale' : 'draft-unverified',
+            baseRevision: draftBaseline,
+            diskRevision: diskRevision || null,
+            diskContent: fetched,
+          })
+        } else {
+          setFileRevision(path, diskRevision)
+        }
       }
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
       const visible = draftContentsRef.current[path] ?? fetched
@@ -524,9 +574,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       renderedFileRef.current = path
       loadingRef.current = false
       setFileLoading(false)
-      setEditorMarkdown(withoutZoom)
+      const keepSource = requiresSourceMode(visible)
+      showSourceRef.current = keepSource
+      setShowSource(keepSource)
+      if (!keepSource) setEditorMarkdown(withoutZoom)
       setSourceContent(visible)
-      setSaveStatus(saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved'))
+      setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
       if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
       setTimeout(applyZoom, 0)
     } catch (error) {
@@ -540,9 +593,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setSaveStatus('idle')
       message.error('打开文件失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyZoom, setEditorMarkdown])
+  }, [applyZoom, clearFileConflict, setEditorMarkdown, setDraft, setFileConflict, setFileRevision])
 
   const handleFileOpen = useCallback(async node => {
+    // The tab identity probe and own-tab crash recovery must finish before a
+    // file load decides whether the disk bytes or a recovered draft to show.
+    await waitForDraftRestore()
     const path = node.path
     if (
       activeFileRef.current === path &&
@@ -550,7 +606,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       !loadingRef.current
     ) {
       setFileLoading(false)
-      editor?.setEditable(!isImageFile(node.name || path))
+      editor?.setEditable(!isImageFile(node.name || path), false)
       return
     }
     const requestId = ++openRequestRef.current
@@ -570,7 +626,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     showSourceRef.current = false
     loadingRef.current = true
     setFileLoading(true)
-    editor?.setEditable(false)
+    editor?.setEditable(false, false)
 
     if (isImageFile(node.name || path)) {
       setImageViewer(null)
@@ -594,7 +650,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       return
     }
     setImageViewer(null)
-    if (draftContentsRef.current[path] !== undefined) {
+    if (draftContentsRef.current[path] !== undefined && !restoredDraftsRef.current[path]) {
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
       const visible = draftContentsRef.current[path]
       const zoomMap = {}
@@ -607,14 +663,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       renderedFileRef.current = path
       loadingRef.current = false
       setFileLoading(false)
-      setEditorMarkdown(withoutZoom)
+      const keepSource = requiresSourceMode(visible)
+      showSourceRef.current = keepSource
+      setShowSource(keepSource)
+      if (!keepSource) setEditorMarkdown(withoutZoom)
       setSourceContent(visible)
-      setSaveStatus(saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved'))
+      setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
       setTimeout(applyZoom, 0)
     } else {
       await loadFile(path, requestId)
     }
-  }, [applyZoom, captureCurrentDraft, editor, loadFile, setEditorMarkdown])
+  }, [applyZoom, captureCurrentDraft, editor, loadFile, setEditorMarkdown, waitForDraftRestore])
 
   const removeTabState = useCallback(path => {
     clearSaveTimer(path)
@@ -626,6 +685,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     delete draftContentsRef.current[path]
     delete dirtyRef.current[path]
     delete cleanContentsRef.current[path]
+    delete fileRevisionsRef.current[path]
+    delete conflictsRef.current[path]
+    delete restoredDraftsRef.current[path]
+    setFileRevisions(prev => { const next = { ...prev }; delete next[path]; return next })
+    setFileConflicts(prev => { const next = { ...prev }; delete next[path]; return next })
     setIsDirty(prev => { const next = { ...prev }; delete next[path]; return next })
     setSavedContents(prev => { const next = { ...prev }; delete next[path]; return next })
   }, [clearSaveTimer])
@@ -633,6 +697,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const pathsUnder = useCallback(path => (
     openFilesRef.current.filter(file => file === path || file.startsWith(`${path}/`))
   ), [])
+
+  const migrateVersionState = useCallback((oldPath, newPath) => {
+    const migrate = source => Object.fromEntries(
+      Object.entries(source).map(([key, value]) => [remapPath(key, oldPath, newPath), value])
+    )
+    fileRevisionsRef.current = migrate(fileRevisionsRef.current)
+    conflictsRef.current = migrate(conflictsRef.current)
+    restoredDraftsRef.current = migrate(restoredDraftsRef.current)
+    setFileRevisions(fileRevisionsRef.current)
+    setFileConflicts(conflictsRef.current)
+  }, [setFileConflicts, setFileRevisions])
 
   const flushPaths = useCallback(async paths => {
     if (paths.includes(activeFileRef.current)) captureCurrentDraft()
@@ -680,21 +755,329 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (!path || isImageFile(path)) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
+    if (conflictsRef.current[path]) {
+      setSaveStatus('conflict')
+      message.warning('文件已在磁盘上变化，请先查看冲突内容')
+      return
+    }
     setSaveStatus('saving')
     try {
       await doSave(path, content)
       message.success('保存成功')
-    } catch { message.error('保存失败，已保留未保存状态') }
+    } catch (error) {
+      message.error(error?.response?.data?.code === 'FILE_CONFLICT'
+        ? '文件已在磁盘上变化；本地草稿已保留，没有覆盖磁盘内容'
+        : '保存失败，已保留未保存状态')
+    }
   }, [captureCurrentDraft, doSave])
 
   const handleRetrySave = useCallback(() => {
     const path = activeFileRef.current
-    if (!path || isImageFile(path)) return
+    if (!path || isImageFile(path) || conflictsRef.current[path]) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
     setSaveStatus('saving')
     doSave(path, content).catch(() => {})
   }, [captureCurrentDraft, doSave])
+
+  const handleShowConflictReview = useCallback(async (requestedPath = activeFileRef.current, suppliedConflict) => {
+    const path = requestedPath
+    const conflict = suppliedConflict || conflictsRef.current[path] || fileConflicts[path]
+    if (!path || !conflict) return
+    try {
+      const res = await axios.get(`${API}/file`, { params: { path } })
+      setFileConflict(path, {
+        ...conflict,
+        diskRevision: res.data.revision ?? null,
+        diskContent: res.data.content ?? '',
+      })
+      setConflictReview({
+        path,
+        localContent: draftContentsRef.current[path] ?? '',
+        diskContent: res.data.content ?? '',
+        diskRevision: res.data.revision ?? null,
+      })
+    } catch (error) {
+      setConflictReview({
+        path,
+        localContent: draftContentsRef.current[path] ?? '',
+        diskContent: null,
+        diskRevision: conflict.diskRevision ?? null,
+      })
+      message.warning('无法读取当前磁盘版本；本地草稿仍已保留，可先下载备份')
+    }
+  }, [fileConflicts, setFileConflict])
+
+  const handleUseRecoveryAlternative = useCallback(async (path, entry) => {
+    try {
+      clearSaveTimer(path)
+      const pendingSave = saveQueuesRef.current.get(path)
+      if (pendingSave) await pendingSave.catch(() => {})
+      if (activeFileRef.current !== path) {
+        await handleFileOpen({ path, name: path.split('/').pop(), type: 'file' })
+      }
+      applyRecoveryAlternative(path, entry)
+      const content = entry.snapshot.content
+      const withoutZoom = content.replace(/!\[(.*?)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)')
+      const keepSource = requiresSourceMode(content)
+      sourceContentRef.current = content
+      setSourceContent(content)
+      showSourceRef.current = keepSource
+      setShowSource(keepSource)
+      if (!keepSource) setEditorMarkdown(withoutZoom)
+      setSaveStatus('conflict')
+      setRecoveryModalOpen(false)
+      await handleShowConflictReview(path, conflictsRef.current[path])
+    } catch (error) {
+      message.error('载入恢复草稿失败：' + (error.response?.data?.error || error.message))
+    }
+  }, [applyRecoveryAlternative, clearSaveTimer, handleFileOpen, handleShowConflictReview, setEditorMarkdown])
+
+  const handleSaveLocalConflict = useCallback(async () => {
+    if (!conflictReview?.path || conflictReview.diskRevision == null || conflictReview.diskContent == null) return
+    const { path } = conflictReview
+    try {
+      const latest = await axios.get(`${API}/file`, { params: { path } })
+      const latestContent = latest.data.content ?? ''
+      const latestRevision = latest.data.revision ?? null
+      const localContent = draftContentsRef.current[path] ?? ''
+      if (localContent !== conflictReview.localContent || latestRevision !== conflictReview.diskRevision) {
+        const currentConflict = conflictsRef.current[path] || {}
+        setFileConflict(path, {
+          ...currentConflict,
+          type: latestRevision === conflictReview.diskRevision ? currentConflict.type : 'disk-changed-during-review',
+          diskRevision: latestRevision,
+          diskContent: latestContent,
+        })
+        setConflictReview({ path, localContent, diskContent: latestContent, diskRevision: latestRevision })
+        message.warning(localContent !== conflictReview.localContent
+          ? '本地草稿在比较后又有修改，请核对更新后的内容'
+          : '磁盘文件在比较后又有变化，请核对最新版本')
+        return
+      }
+      if (!latestRevision) {
+        message.error('缺少当前文件版本，无法安全保存本地草稿')
+        return
+      }
+
+      // The fresh revision above must still match the reviewed version. The
+      // server performs the final compare-and-swap so a later race is safe.
+      const response = await axios.put(API, { path, content: localContent, expectedRevision: latestRevision })
+      const nextRevision = response.data?.revision || response.headers?.['x-file-revision']
+      cleanContentsRef.current[path] = localContent
+      if (nextRevision) setFileRevision(path, nextRevision)
+      const currentDraft = draftContentsRef.current[path] ?? localContent
+      const changedWhileSaving = currentDraft !== localContent
+      if (changedWhileSaving) {
+        const restored = restoredDraftsRef.current[path]
+        if (restored && nextRevision) restoredDraftsRef.current[path] = { ...restored, baseRevision: nextRevision }
+        setDraft(path, currentDraft, true)
+      } else {
+        delete restoredDraftsRef.current[path]
+        setDraft(path, localContent, false)
+      }
+      clearPendingDraft(path, localContent)
+      clearFileConflict(path)
+      const nextErrors = { ...saveErrorsRef.current }
+      delete nextErrors[path]
+      saveErrorsRef.current = nextErrors
+      setSaveErrors(nextErrors)
+      if (activeFileRef.current === path) {
+        if (changedWhileSaving) {
+          setSaveStatus('modified')
+          scheduleSave(path, currentDraft)
+        } else {
+          sourceContentRef.current = localContent
+          setSourceContent(localContent)
+          setSaveStatus('saved')
+        }
+      }
+      setConflictReview(null)
+      message.success(changedWhileSaving
+        ? '已保存比较时的草稿；之后的新修改仍待保存，原磁盘版本已保留在历史记录中'
+        : '本地草稿已保存；原磁盘版本已保留在历史记录中')
+    } catch (error) {
+      if (error.response?.status === 409 && error.response?.data?.code === 'FILE_CONFLICT') {
+        try {
+          const latest = await axios.get(`${API}/file`, { params: { path } })
+          const currentConflict = conflictsRef.current[path] || {}
+          const refreshed = {
+            path,
+            localContent: draftContentsRef.current[path] ?? '',
+            diskContent: latest.data.content ?? '',
+            diskRevision: latest.data.revision ?? null,
+          }
+          setFileConflict(path, { ...currentConflict, type: 'disk-changed-during-save', diskRevision: refreshed.diskRevision, diskContent: refreshed.diskContent })
+          setConflictReview(refreshed)
+          message.warning('保存前磁盘版本再次变化；本地草稿仍保留，请重新比较')
+        } catch {
+          message.error('条件保存失败，且无法重新读取磁盘版本；本地草稿仍已保留')
+        }
+        return
+      }
+      message.error('保存本地草稿失败：' + (error.response?.data?.error || error.message))
+    }
+  }, [clearFileConflict, clearPendingDraft, conflictReview, scheduleSave, setDraft, setFileConflict, setFileRevision])
+
+  const handleExportConflictDraft = useCallback(() => {
+    const path = conflictReview?.path || activeFileRef.current
+    const content = draftContentsRef.current[path]
+    if (!path || content === undefined) return
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${path.split('/').pop()}.local-draft.md`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(url)
+  }, [conflictReview])
+
+  const handleReloadDiskAfterConflict = useCallback(() => {
+    const path = conflictReview?.path
+    if (!path) return
+    Modal.confirm({
+      title: '放弃本地草稿并载入磁盘版本？',
+      content: '这会丢弃编辑器中的本地草稿。建议先下载草稿备份，再继续。',
+      okText: '丢弃草稿并载入',
+      cancelText: '保留本地草稿',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        // Fetch again at confirmation time so a second external change cannot
+        // leave the editor showing an older version than the current disk.
+        const draftAtRequest = draftContentsRef.current[path]
+        const res = await axios.get(`${API}/file`, { params: { path } })
+        const content = res.data.content ?? ''
+        const latestDraft = draftContentsRef.current[path]
+        if (latestDraft !== draftAtRequest) {
+          if (res.data.revision) setFileRevision(path, res.data.revision)
+          setFileConflict(path, {
+            ...(conflictsRef.current[path] || {}),
+            type: 'draft-changed-during-discard',
+            diskRevision: res.data.revision ?? null,
+            diskContent: content,
+          })
+          setConflictReview({
+            path,
+            localContent: latestDraft ?? '',
+            diskContent: content,
+            diskRevision: res.data.revision ?? null,
+          })
+          message.warning('确认期间本地草稿又有修改；草稿已保留，请重新比较后再决定')
+          return
+        }
+        cleanContentsRef.current[path] = content
+        if (res.data.revision) setFileRevision(path, res.data.revision)
+        setDraft(path, content, false)
+        clearPendingDraft(path)
+        clearFileConflict(path)
+        const nextErrors = { ...saveErrorsRef.current }
+        delete nextErrors[path]
+        saveErrorsRef.current = nextErrors
+        setSaveErrors(nextErrors)
+        if (activeFileRef.current === path) {
+          sourceContentRef.current = content
+          setSourceContent(content)
+          const keepSource = requiresSourceMode(content)
+          showSourceRef.current = keepSource
+          setShowSource(keepSource)
+          if (!keepSource) setEditorMarkdown(content)
+          setSaveStatus('saved')
+        }
+        setConflictReview(null)
+        message.success('已载入磁盘版本')
+      },
+    })
+  }, [clearFileConflict, clearPendingDraft, conflictReview, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
+
+  const handleOpenHistory = useCallback(async (path = activeFileRef.current) => {
+    if (!path || isImageFile(path)) return
+    setHistoryModal({ open: true, path, entries: [], loading: true })
+    try {
+      const res = await axios.get(`${API}/file/history`, { params: { path } })
+      setHistoryModal({ open: true, path, entries: res.data.history || [], loading: false })
+    } catch (error) {
+      setHistoryModal({ open: false, path: '', entries: [], loading: false })
+      message.error('读取版本历史失败：' + (error.response?.data?.error || error.message))
+    }
+  }, [])
+
+  const handleRestoreHistory = useCallback(entry => {
+    const path = historyModal.path
+    if (!path || dirtyRef.current[path] || conflictsRef.current[path]) {
+      message.warning('请先保存或处理当前草稿，再恢复历史版本')
+      return
+    }
+    const expectedRevision = fileRevisionsRef.current[path]
+    if (!expectedRevision) {
+      message.error('缺少当前文件版本，无法安全恢复')
+      return
+    }
+    Modal.confirm({
+      title: '恢复这个历史版本？',
+      content: '恢复会用历史内容替换当前磁盘版本，并保留当前版本作为新历史记录。',
+      okText: '恢复版本',
+      cancelText: '取消',
+      onOk: async () => {
+        try {
+          const draftAtRequest = draftContentsRef.current[path]
+          await axios.post(`${API}/file/restore`, { path, historyId: entry.id, expectedRevision })
+          const res = await axios.get(`${API}/file`, { params: { path } })
+          const content = res.data.content ?? ''
+          cleanContentsRef.current[path] = content
+          if (res.data.revision) setFileRevision(path, res.data.revision)
+          const currentDraft = draftContentsRef.current[path]
+          const changedDuringRestore = dirtyRef.current[path] || currentDraft !== draftAtRequest
+          if (changedDuringRestore) {
+            setFileConflict(path, {
+              type: 'history-restored-during-edit',
+              baseRevision: expectedRevision,
+              diskRevision: res.data.revision ?? null,
+              diskContent: content,
+            })
+            setConflictReview({
+              path,
+              localContent: currentDraft ?? '',
+              diskContent: content,
+              diskRevision: res.data.revision ?? null,
+            })
+            if (currentDraft !== undefined) setDraft(path, currentDraft, true)
+            if (activeFileRef.current === path) setSaveStatus('conflict')
+            message.warning('历史版本已恢复；恢复期间的新草稿已保留，请先比较磁盘版本')
+          } else {
+            setDraft(path, content, false)
+            clearPendingDraft(path)
+            if (activeFileRef.current === path) {
+              sourceContentRef.current = content
+              setSourceContent(content)
+              const keepSource = requiresSourceMode(content)
+              showSourceRef.current = keepSource
+              setShowSource(keepSource)
+              if (!keepSource) setEditorMarkdown(content)
+              setSaveStatus('saved')
+            }
+            message.success('已恢复历史版本')
+          }
+          const updated = await axios.get(`${API}/file/history`, { params: { path } })
+          setHistoryModal({ open: true, path, entries: updated.data.history || [], loading: false })
+        } catch (error) {
+          if (error.response?.status === 409 && error.response?.data?.code === 'FILE_CONFLICT') {
+            const conflict = {
+              type: 'disk-changed',
+              baseRevision: expectedRevision,
+              diskRevision: error.response.data.currentRevision ?? null,
+              diskContent: error.response.data.currentContent ?? null,
+            }
+            setFileConflict(path, conflict)
+            message.error('磁盘文件已变化，历史版本未恢复；请先查看冲突')
+          } else {
+            message.error('恢复历史版本失败：' + (error.response?.data?.error || error.message))
+          }
+        }
+      },
+    })
+  }, [clearPendingDraft, historyModal.path, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleToggleSource = useCallback(() => {
     const path = activeFileRef.current
@@ -708,18 +1091,31 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       return
     }
     const content = sourceContentRef.current
-    const zoomMap = {}
-    content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
-      zoomMap[src.replace(/^\//, '')] = zoom
-      return ''
-    })
-    zoomMapRef.current = zoomMap
-    setEditorMarkdown(content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)'))
-    setDraft(path, content, content !== cleanContentsRef.current[path])
-    if (content !== cleanContentsRef.current[path]) setSaveStatus('modified')
-    showSourceRef.current = false
-    setShowSource(false)
-    setTimeout(applyZoom, 0)
+    const enterRichMode = () => {
+      const zoomMap = {}
+      content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
+        zoomMap[src.replace(/^\//, '')] = zoom
+        return ''
+      })
+      zoomMapRef.current = zoomMap
+      setEditorMarkdown(content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)'))
+      setDraft(path, content, content !== cleanContentsRef.current[path])
+      if (content !== cleanContentsRef.current[path]) setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
+      showSourceRef.current = false
+      setShowSource(false)
+      setTimeout(applyZoom, 0)
+    }
+    if (requiresSourceMode(content)) {
+      Modal.confirm({
+        title: '此文档包含源码模式保护内容',
+        content: '富文本编辑器无法完整保留 YAML、WikiLinks、缩进任务、原始 HTML 或代码围栏附加信息。继续使用源码模式可以原样保存；仍切换后，下一次富文本编辑可能改写这些内容。',
+        okText: '仍切换到富文本',
+        cancelText: '继续源码模式',
+        onOk: enterRichMode,
+      })
+      return
+    }
+    enterRichMode()
   }, [applyZoom, captureCurrentDraft, setEditorMarkdown])
 
   const handleChangeWorkspace = useCallback(async () => {
@@ -754,17 +1150,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       // Preserve drafts locally instead of issuing a second unordered PUT
       // beside an in-flight save. If the user cancels the browser prompt,
       // existing timers and queues continue normally.
-      const drafts = Object.fromEntries([...pendingPaths].flatMap(path => {
-        const content = draftContentsRef.current[path]
-        return content === undefined || isImageFile(path) ? [] : [[path, content]]
-      }))
+      const drafts = collectDirtyDrafts()
       writePendingDrafts(drafts)
       event.preventDefault()
       event.returnValue = ''
     }
     window.addEventListener('beforeunload', handler)
     return () => window.removeEventListener('beforeunload', handler)
-  }, [captureCurrentDraft, writePendingDrafts])
+  }, [captureCurrentDraft, collectDirtyDrafts, writePendingDrafts])
 
   const closeTabGroup = useCallback(async paths => {
     const closing = new Set(paths)
@@ -905,11 +1298,40 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }
       }
       await loadTree()
-      message.success('删除成功')
+      message.success(`已移入回收站：${node.path}。可从回收站恢复`)
     } catch (error) {
-      message.error('删除失败：' + (error.response?.data?.error || error.message))
+      message.error('移入回收站失败：' + (error.response?.data?.error || error.message))
     }
   }
+
+  const loadTrash = useCallback(async () => {
+    setTrashLoading(true)
+    try {
+      const res = await axios.get(`${API}/trash`)
+      setTrashItems(Array.isArray(res.data?.items) ? res.data.items : [])
+      return true
+    } catch (error) {
+      message.error('读取回收站失败：' + (error.response?.data?.error || error.message))
+      return false
+    } finally {
+      setTrashLoading(false)
+    }
+  }, [])
+
+  const handleOpenTrash = useCallback(async () => {
+    setTrashModalOpen(true)
+    await loadTrash()
+  }, [loadTrash])
+
+  const handleRestoreTrashItem = useCallback(async item => {
+    try {
+      await axios.post(`${API}/trash/restore`, { id: item.id })
+      await Promise.all([loadTree(), loadTrash()])
+      message.success(`已从回收站恢复：${item.path}`)
+    } catch (error) {
+      message.error('恢复失败：' + (error.response?.data?.error || error.message))
+    }
+  }, [loadTrash, loadTree])
 
   const handleMove = async (node, newParent) => {
     const parts = node.path.split('/')
@@ -932,6 +1354,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       draftContentsRef.current = migrate(draftContentsRef.current)
       dirtyRef.current = migrate(dirtyRef.current)
       cleanContentsRef.current = migrate(cleanContentsRef.current)
+      migrateVersionState(node.path, newPath)
       const migratedErrors = migrate(saveErrorsRef.current)
       saveErrorsRef.current = migratedErrors
       setSaveErrors(migratedErrors)
@@ -1000,6 +1423,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       draftContentsRef.current = migrate(draftContentsRef.current)
       dirtyRef.current = migrate(dirtyRef.current)
       cleanContentsRef.current = migrate(cleanContentsRef.current)
+      migrateVersionState(renamingPath, newPath)
       const migratedErrors = migrate(saveErrorsRef.current)
       saveErrorsRef.current = migratedErrors
       setSaveErrors(migratedErrors)
@@ -1096,8 +1520,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   })
 
   const moveFolderTree = moveModal.node ? collectFolders(tree, moveModal.node.path) : []
+  const activeConflict = activeFile ? fileConflicts[activeFile] : null
+  const sourceModeRequired = showSource && requiresSourceMode(sourceContent)
+  const recoveryAlternativeCount = Object.values(recoveryAlternatives).reduce((count, entries) => count + entries.length, 0)
   const activeSaveStatus = activeFile
-    ? (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus))
+    ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
     : 'idle'
   const headingItems = [
     { key: 'paragraph', label: '正文' },
@@ -1176,6 +1603,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                         { key: 'folder', label: '新建文件夹', icon: <FolderAddOutlined /> },
                         { key: 'import', label: '导入文件', icon: <UploadOutlined /> },
                         { key: 'export', label: '导出当前文件', icon: <ApiOutlined />, disabled: !activeFile },
+                        { type: 'divider' },
+                        { key: 'trash', label: '回收站', icon: <DeleteOutlined /> },
+                        { key: 'recovery-drafts', label: `其他恢复草稿（${recoveryAlternativeCount}）`, icon: <HistoryOutlined />, disabled: recoveryAlternativeCount === 0 },
                       ],
                       onClick: ({ key }) => {
                         if (key === 'expand') handleToggleExpandAll()
@@ -1183,6 +1613,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                         if (key === 'folder') setCreateModal({ open: true, parent: '', type: 'dir' })
                         if (key === 'import') setImportModal(true)
                         if (key === 'export') handleExport()
+                        if (key === 'trash') handleOpenTrash()
+                        if (key === 'recovery-drafts') setRecoveryModalOpen(true)
                       },
                     }}
                   >
@@ -1337,13 +1769,15 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         width={300}
       >
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          <div style={{ display: 'flex', gap: 4 }}>
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
             <Tooltip title="更改目录"><Button size="small" icon={<FolderOpenOutlined />} onClick={handleChangeWorkspace} aria-label="更改目录" title="更改目录" /></Tooltip>
             <Tooltip title={isAllExpanded ? '全部折叠' : '全部展开'}><Button aria-label={isAllExpanded ? '全部折叠' : '全部展开'} size="small" icon={<MenuOutlined />} onClick={handleToggleExpandAll} title={isAllExpanded ? '全部折叠' : '全部展开'} /></Tooltip>
             <Tooltip title="定位当前文件"><Button aria-label="定位当前文件" size="small" icon={<NodeIndexOutlined />} onClick={handleLocateCurrentFile} title="定位当前文件" disabled={!activeFile} /></Tooltip>
             <Tooltip title={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'}><Button aria-label={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'} size="small" icon={<ReadOutlined />} onClick={() => setSidebarView(v => v === 'outline' ? 'tree' : 'outline')} title={sidebarView === 'outline' ? '返回文件目录' : '查看文档大纲'} /></Tooltip>
             <Tooltip title="新建文件夹"><Button aria-label="新建文件夹" size="small" icon={<PlusOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'dir' })} title="新建文件夹" /></Tooltip>
             <Tooltip title="新建文件"><Button aria-label="新建文件" size="small" icon={<FileOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} title="新建文件" /></Tooltip>
+            <Tooltip title="回收站"><Button aria-label="打开回收站" size="small" icon={<DeleteOutlined />} onClick={() => { setMobileSidebarOpen(false); handleOpenTrash() }} /></Tooltip>
+            {recoveryAlternativeCount > 0 && <Tooltip title={`其他恢复草稿（${recoveryAlternativeCount}）`}><Button aria-label="打开其他恢复草稿" size="small" icon={<HistoryOutlined />} onClick={() => { setMobileSidebarOpen(false); setRecoveryModalOpen(true) }} /></Tooltip>}
           </div>
           {sidebarView === 'outline' ? (
             <div className="mobile-outline-list" aria-label="文档大纲">
@@ -1390,6 +1824,151 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             <div title={workspace} aria-label={`当前目录：${workspace}`} style={{ fontSize: 11, lineHeight: '16px', color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{workspace}</div>
           </div>
         </div>
+      </Modal>
+
+      <Modal
+        title={`回收站（${trashItems.length}）`}
+        open={trashModalOpen}
+        onCancel={() => setTrashModalOpen(false)}
+        footer={<Button onClick={() => setTrashModalOpen(false)}>关闭</Button>}
+        width={640}
+      >
+        {trashLoading ? (
+          <div role="status" style={{ padding: 24, textAlign: 'center' }}>正在读取回收站…</div>
+        ) : trashItems.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--color-text-secondary)' }}>回收站为空</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '60vh', overflow: 'auto' }}>
+            {trashItems.map(item => (
+              <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 10, border: '1px solid var(--color-border)', borderRadius: 6 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.path}>{item.path}</div>
+                  <div style={{ marginTop: 3, color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                    {item.type === 'directory' ? '文件夹' : '文件'} · 移入时间：{new Date(item.createdAt).toLocaleString()}
+                  </div>
+                </div>
+                <Button size="small" type="primary" aria-label={`恢复 ${item.path}`} onClick={() => handleRestoreTrashItem(item)}>恢复</Button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        title={`其他本地恢复草稿（${recoveryAlternativeCount}）`}
+        open={recoveryModalOpen}
+        onCancel={() => setRecoveryModalOpen(false)}
+        footer={<Button onClick={() => setRecoveryModalOpen(false)}>关闭</Button>}
+        width="min(1050px, 94vw)"
+      >
+        {recoveryAlternativeCount === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--color-text-secondary)' }}>没有其他可恢复草稿</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14, maxHeight: '65vh', overflow: 'auto' }}>
+            {Object.entries(recoveryAlternatives).flatMap(([path, entries]) => entries.map(entry => {
+              const currentDraft = savedContents[path] ?? draftContentsRef.current[path]
+              return (
+                <section key={`${path}:${entry.id}`} style={{ padding: 12, border: '1px solid var(--color-border)', borderRadius: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    <strong style={{ minWidth: 0, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={path}>{path}</strong>
+                    <span style={{ color: 'var(--color-text-secondary)', fontSize: 11, whiteSpace: 'nowrap' }}>
+                      {entry.sourceSession === '旧版恢复数据' ? '旧版草稿' : '其他标签页'} · {new Date(entry.snapshot.savedAt).toLocaleString()}
+                    </span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: 10 }}>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, fontWeight: 600 }}>
+                      当前标签页草稿
+                      <Input.TextArea readOnly value={currentDraft ?? '当前标签页还没有本地草稿'} autoSize={{ minRows: 5, maxRows: 12 }} aria-label={`当前草稿 ${path}`} />
+                    </label>
+                    <label style={{ display: 'flex', flexDirection: 'column', gap: 5, fontSize: 12, fontWeight: 600 }}>
+                      其他恢复草稿{entry.snapshot.baseRevision ? `（基于 ${entry.snapshot.baseRevision.slice(0, 12)}）` : '（磁盘基线未知）'}
+                      <Input.TextArea readOnly value={entry.snapshot.content} autoSize={{ minRows: 5, maxRows: 12 }} aria-label={`其他恢复草稿 ${path}`} />
+                    </label>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 8 }}>
+                    <Button type="primary" onClick={() => handleUseRecoveryAlternative(path, entry)}>载入并比较磁盘版本</Button>
+                  </div>
+                </section>
+              )
+            }))}
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        title={`文件冲突：${conflictReview?.path || ''}`}
+        open={Boolean(conflictReview)}
+        onCancel={() => setConflictReview(null)}
+        footer={[
+          <Button key="download" onClick={handleExportConflictDraft}>下载本地草稿</Button>,
+          <Button key="reload" danger disabled={conflictReview?.diskContent == null} onClick={handleReloadDiskAfterConflict}>丢弃草稿并重载</Button>,
+          <Button key="close" type="primary" onClick={() => setConflictReview(null)}>保留草稿</Button>,
+          <Button
+            key="save-local"
+            disabled={conflictReview?.diskContent == null || conflictReview?.diskRevision == null}
+            onClick={() => Modal.confirm({
+              title: '采用本地草稿并覆盖当前磁盘内容？',
+              content: '确认后会重新读取磁盘版本；只有版本仍与上方比较内容一致时才保存本地草稿。若版本再次变化，保存会停止并刷新比较内容。',
+              okText: '确认并保存本地草稿',
+              cancelText: '返回比较',
+              okButtonProps: { danger: true },
+              onOk: handleSaveLocalConflict,
+            })}
+          >覆盖磁盘并保存本地草稿</Button>,
+        ]}
+        width="min(1100px, 94vw)"
+      >
+        <div style={{ marginBottom: 12, color: 'var(--color-text-secondary)', fontSize: 13 }}>
+          请先比较本地草稿与当前磁盘版本。编辑器不会自动合并或覆盖；采用本地草稿前会再次确认，保存也会重新校验磁盘版本并使用条件写入。
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 12 }}>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12, fontWeight: 600 }}>
+            本地草稿
+            <Input.TextArea readOnly value={conflictReview?.localContent ?? ''} autoSize={{ minRows: 14, maxRows: 24 }} aria-label="本地草稿内容" />
+          </label>
+          <label style={{ display: 'flex', flexDirection: 'column', gap: 6, fontSize: 12, fontWeight: 600 }}>
+            当前磁盘版本
+            <Input.TextArea readOnly value={conflictReview?.diskContent ?? '磁盘文件当前不可读取。请保留并下载本地草稿。'} autoSize={{ minRows: 14, maxRows: 24 }} aria-label="当前磁盘版本内容" />
+          </label>
+        </div>
+      </Modal>
+
+      <Modal
+        title={`版本历史：${historyModal.path || ''}`}
+        open={historyModal.open}
+        confirmLoading={historyModal.loading}
+        onCancel={() => setHistoryModal({ open: false, path: '', entries: [], loading: false })}
+        footer={<Button onClick={() => setHistoryModal({ open: false, path: '', entries: [], loading: false })}>关闭</Button>}
+        width={640}
+      >
+        {historyModal.loading ? (
+          <div role="status" style={{ padding: 24, textAlign: 'center' }}>正在读取版本历史…</div>
+        ) : historyModal.entries.length === 0 ? (
+          <div style={{ padding: 24, textAlign: 'center', color: 'var(--color-text-secondary)' }}>暂无可恢复的历史版本</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '60vh', overflow: 'auto' }}>
+            {(isDirty[historyModal.path] || fileConflicts[historyModal.path]) && (
+              <div role="alert" style={{ padding: 10, color: 'var(--color-warning)', background: 'var(--color-bg-muted)', borderRadius: 6 }}>
+                请先保存或处理当前本地草稿，再恢复历史版本。
+              </div>
+            )}
+            {historyModal.entries.map(entry => (
+              <div key={entry.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 10, border: '1px solid var(--color-border)', borderRadius: 6 }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{new Date(entry.savedAt).toLocaleString()}</div>
+                  <div title={entry.revision} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: 'var(--color-text-secondary)', fontSize: 11 }}>
+                    {entry.revision?.slice(0, 16)} · {Number(entry.size || 0).toLocaleString()} 字节
+                  </div>
+                </div>
+                <Button
+                  size="small"
+                  disabled={Boolean(isDirty[historyModal.path] || fileConflicts[historyModal.path])}
+                  onClick={() => handleRestoreHistory(entry)}
+                >恢复</Button>
+              </div>
+            ))}
+          </div>
+        )}
       </Modal>
 
       {/* 主区域 */}
@@ -1575,6 +2154,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               )}
 
               {/* 编辑区 */}
+              {sourceModeRequired && (
+                <div role="alert" className="source-fidelity-warning" style={{ padding: '7px 12px', color: 'var(--color-warning)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
+                  此文档包含富文本模式无法完整保留的 Markdown 语法。当前使用源码模式，可原样编辑和保存；切换到富文本前会再次提示风险。
+                </div>
+              )}
               {fileLoading && (
                 <div style={{
                   position: 'absolute', inset: '48px 0 0', zIndex: 3,
@@ -1595,7 +2179,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                     const path = activeFileRef.current
                     if (path) {
                       setDraft(path, value, true)
-                      setSaveStatus('modified')
+                      setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
                       scheduleSave(path, value)
                     }
                   }}
@@ -1682,6 +2266,20 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               )}
             </>
           )}
+          {draftStorageError && (
+            <div role="alert" className="draft-storage-warning" style={{ padding: '6px 12px', color: 'var(--color-warning)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
+              {draftStorageError}。服务端自动保存仍会继续。
+            </div>
+          )}
+          {activeConflict && (
+            <div role="alert" className="file-conflict-banner" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 12px', color: 'var(--color-danger)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
+              <WarningOutlined aria-hidden="true" />
+              <span style={{ flex: '1 1 280px' }}>磁盘文件已变化；本地草稿已保留，自动保存已暂停。请比较版本后选择处理。</span>
+              <Button size="small" onClick={() => handleShowConflictReview()}>查看磁盘版本</Button>
+              <Button size="small" onClick={handleExportConflictDraft}>下载本地草稿</Button>
+              <Button size="small" danger disabled={!activeConflict.diskRevision} onClick={handleReloadDiskAfterConflict}>丢弃草稿并重载</Button>
+            </div>
+          )}
           <div className="editor-statusbar" aria-label="文档状态栏">
             <div className="editor-file-location" title={activeFile || '尚未选择文件'}>
               <FileOutlined aria-hidden="true" />
@@ -1689,6 +2287,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             </div>
             <div className="editor-status-actions">
               {activeFile && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
+              {activeFile && !imageViewer && (
+                <Button aria-label="查看版本历史" size="small" icon={<HistoryOutlined />} onClick={() => handleOpenHistory(activeFile)}>历史</Button>
+              )}
               {activeFile && !imageViewer && (
                 <Button aria-label="保存当前文件" size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
               )}
@@ -1799,7 +2400,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { setMoveModal({ open: true, node: contextMenu.node }); setMoveTarget(''); setContextMenu(p => ({ ...p, visible: false })) }}>
             <SwapOutlined />移动到...
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13, color: 'var(--color-danger)' }} onClick={() => { setContextMenu(p => ({ ...p, visible: false })); Modal.confirm({ title: `确定删除「${contextMenu.node.name}」？`, content: contextMenu.node.type === 'dir' ? '将递归删除所有内容' : '删除后不可恢复', okText: '删除', cancelText: '取消', okButtonProps: { danger: true }, onOk: () => handleDelete(contextMenu.node) }) }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13, color: 'var(--color-danger)' }} onClick={() => { setContextMenu(p => ({ ...p, visible: false })); Modal.confirm({ title: `将「${contextMenu.node.name}」移入回收站？`, content: contextMenu.node.type === 'dir' ? '整个文件夹及其中内容会一起移入回收站，可从回收站恢复。' : '文件会移入回收站，可从回收站恢复。', okText: '移入回收站', cancelText: '取消', okButtonProps: { danger: true }, onOk: () => handleDelete(contextMenu.node) }) }}>
             <DeleteOutlined />删除
           </div>
         </div>

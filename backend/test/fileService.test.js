@@ -3,11 +3,16 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { createHash } from 'node:crypto'
 import {
   listAll,
   listTree,
+  listFileHistory,
+  moveItem,
   searchWorkspace,
   writeFile,
+  readFile,
+  restoreFileHistory,
   uploadFile,
 } from '../src/fileService.js'
 
@@ -17,12 +22,23 @@ async function temporaryWorkspace(t) {
   return workspace
 }
 
+function revision(content) {
+  return createHash('sha256').update(content).digest('hex')
+}
+
+async function temporaryRecovery(t) {
+  const recovery = await fs.mkdtemp(path.join(os.tmpdir(), 'standalone-editor-recovery-'))
+  t.after(() => fs.rm(recovery, { recursive: true, force: true }))
+  return recovery
+}
+
 test('atomic writes preserve private file permissions', async t => {
   const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
   await fs.writeFile(path.join(workspace, 'private.md'), 'old', { mode: 0o600 })
   await fs.chmod(path.join(workspace, 'private.md'), 0o600)
 
-  await writeFile(workspace, 'private.md', 'new')
+  await writeFile(workspace, 'private.md', 'new', revision('old'), { root: recovery })
 
   if (process.platform !== 'win32') {
     assert.equal((await fs.stat(path.join(workspace, 'private.md'))).mode & 0o777, 0o600)
@@ -33,7 +49,7 @@ test('atomic writes preserve private file permissions', async t => {
 test('new atomic writes default to owner-only permissions', async t => {
   const workspace = await temporaryWorkspace(t)
 
-  await writeFile(workspace, 'new.md', 'draft')
+  await writeFile(workspace, 'new.md', 'draft', null)
 
   if (process.platform !== 'win32') {
     assert.equal((await fs.stat(path.join(workspace, 'new.md'))).mode & 0o777, 0o600)
@@ -145,4 +161,151 @@ test('workspace search omits external symlink content and caps results at 100', 
   assert.deepEqual(matches.map(item => item.path), expected)
   assert.ok(matches.every(item => item.preview === undefined))
   assert.deepEqual(await searchWorkspace(workspace, 'symlink-secret'), [])
+})
+
+test('versioned writes reject a stale client and preserve the current disk revision', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'initial')
+
+  const clientA = await readFile(workspace, 'note.md')
+  const clientB = await readFile(workspace, 'note.md')
+  const savedByB = await writeFile(workspace, 'note.md', 'B edit', clientB.revision, { root: recovery })
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'A stale edit', clientA.revision, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT' &&
+      error.details.currentRevision === savedByB.revision &&
+      error.details.currentContent === 'B edit',
+  )
+  assert.equal((await fs.readFile(path.join(workspace, 'note.md'), 'utf8')), 'B edit')
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(history.history.length, 1)
+  assert.equal(history.history[0].revision, clientA.revision)
+})
+
+test('versioned writes reject external changes and require an explicit revision', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'before external edit')
+  const opened = await readFile(workspace, 'note.md')
+  await fs.writeFile(path.join(workspace, 'note.md'), 'external edit')
+
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'stale client write', opened.revision, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT' && error.details.currentContent === 'external edit',
+  )
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'unversioned write', undefined, { root: recovery }),
+    error => error.code === 'REVISION_REQUIRED',
+  )
+  assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'external edit')
+  assert.deepEqual((await listFileHistory(workspace, 'note.md', { root: recovery })).history, [])
+})
+
+test('null revision creates only absent files; restore uses the same current-revision guard', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const created = await writeFile(workspace, 'note.md', 'version one', null, { root: recovery })
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'must not replace', null, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT' && error.details.currentRevision === created.revision,
+  )
+  const saved = await writeFile(workspace, 'note.md', 'version two', created.revision, { root: recovery })
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  const restored = await restoreFileHistory(workspace, 'note.md', history.history[0].id, saved.revision, { root: recovery })
+  assert.equal(restored.revision, created.revision)
+  assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'version one')
+  await assert.rejects(
+    restoreFileHistory(workspace, 'note.md', history.history[0].id, saved.revision, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT',
+  )
+})
+
+test('history is private, preserves file mode, and a history storage failure aborts replacement', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'private.md'), 'old', { mode: 0o600 })
+  await fs.chmod(path.join(workspace, 'private.md'), 0o600)
+  const old = await readFile(workspace, 'private.md')
+  await writeFile(workspace, 'private.md', 'new', old.revision, { root: recovery })
+
+  if (process.platform !== 'win32') {
+    assert.equal((await fs.stat(path.join(workspace, 'private.md'))).mode & 0o777, 0o600)
+    const historyEntry = (await listFileHistory(workspace, 'private.md', { root: recovery })).history[0]
+    const bucket = path.join(recovery, 'history', createHash('sha256').update(await fs.realpath(workspace)).digest('hex'), createHash('sha256').update('private.md').digest('hex'))
+    assert.equal((await fs.stat(recovery)).mode & 0o777, 0o700)
+    assert.equal((await fs.stat(bucket)).mode & 0o777, 0o700)
+    assert.equal((await fs.stat(path.join(bucket, `${historyEntry.id}.json`))).mode & 0o777, 0o600)
+  }
+
+  const recoveryBlocker = path.join(await temporaryWorkspace(t), 'not-a-directory')
+  await fs.writeFile(recoveryBlocker, 'block')
+  await assert.rejects(
+    writeFile(workspace, 'private.md', 'must not replace', revision('new'), { root: recoveryBlocker }),
+    error => error.code === 'RECOVERY_STORAGE_ERROR',
+  )
+  assert.equal(await fs.readFile(path.join(workspace, 'private.md'), 'utf8'), 'new')
+})
+
+test('recovery storage cannot resolve inside the workspace, including through a symlink', async t => {
+  const workspace = await temporaryWorkspace(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'old')
+  const opened = await readFile(workspace, 'note.md')
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'new', opened.revision, { root: path.join(workspace, '.recovery') }),
+    error => error.code === 'RECOVERY_STORAGE_ERROR',
+  )
+
+  if (process.platform !== 'win32') {
+    const outside = await temporaryWorkspace(t)
+    const alias = path.join(outside, 'recovery-link')
+    await fs.symlink(workspace, alias)
+    await assert.rejects(
+      writeFile(workspace, 'note.md', 'new', opened.revision, { root: alias }),
+      error => error.code === 'RECOVERY_STORAGE_ERROR',
+    )
+  }
+  assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'old')
+})
+
+test('file move migrates history; history conflicts and injected failures roll back note and metadata paths', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.mkdir(path.join(workspace, 'folder'))
+  await fs.writeFile(path.join(workspace, 'folder', 'one.md'), 'one')
+  await fs.writeFile(path.join(workspace, 'folder', 'two.md'), 'two')
+  const one = await readFile(workspace, 'folder/one.md')
+  const two = await readFile(workspace, 'folder/two.md')
+  await writeFile(workspace, 'folder/one.md', 'one updated', one.revision, { root: recovery })
+  await writeFile(workspace, 'folder/two.md', 'two updated', two.revision, { root: recovery })
+
+  await assert.rejects(
+    moveItem(workspace, 'folder/one.md', 'moved.md', { root: recovery, moveHistoryBucket: () => { throw new Error('injected metadata move failure') } }),
+    /injected metadata move failure/,
+  )
+  assert.equal(await fs.readFile(path.join(workspace, 'folder', 'one.md'), 'utf8'), 'one updated')
+  assert.equal((await listFileHistory(workspace, 'folder/one.md', { root: recovery })).history.length, 1)
+  assert.deepEqual((await listFileHistory(workspace, 'moved.md', { root: recovery })).history, [])
+
+  // A prior history chain at the destination blocks the move before either
+  // the note path or source metadata is changed.
+  await fs.writeFile(path.join(workspace, 'moved.md'), 'previous occupant')
+  const occupant = await readFile(workspace, 'moved.md')
+  await writeFile(workspace, 'moved.md', 'replaced occupant', occupant.revision, { root: recovery })
+  await fs.unlink(path.join(workspace, 'moved.md'))
+  await assert.rejects(
+    moveItem(workspace, 'folder/one.md', 'moved.md', { root: recovery }),
+    error => error.code === 'HISTORY_CONFLICT',
+  )
+  assert.equal(await fs.readFile(path.join(workspace, 'folder', 'one.md'), 'utf8'), 'one updated')
+  assert.equal((await listFileHistory(workspace, 'folder/one.md', { root: recovery })).history.length, 1)
+
+  await moveItem(workspace, 'folder', 'renamed', { root: recovery })
+  const migrated = await listFileHistory(workspace, 'renamed/one.md', { root: recovery })
+  assert.equal(migrated.history.length, 1)
+  assert.equal(migrated.history[0].sourcePath, 'folder/one.md')
+  const now = await readFile(workspace, 'renamed/one.md')
+  const restored = await restoreFileHistory(workspace, 'renamed/one.md', migrated.history[0].id, now.revision, { root: recovery })
+  assert.equal(restored.revision, one.revision)
+  assert.equal(await fs.readFile(path.join(workspace, 'renamed', 'one.md'), 'utf8'), 'one')
 })

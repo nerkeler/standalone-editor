@@ -1,6 +1,6 @@
-# 📝 独立在线编辑器
+# 📝 独立本地 Markdown 编辑器
 
-基于 TipTap 的轻量级 Markdown 富文本编辑器，支持选择本地目录作为工作空间，通过浏览器编辑本地文件。工作空间路径会保存在后端配置中，启动时会先校验当前目录身份。
+基于 TipTap 的本地 Markdown 编辑器，支持选择本机目录作为工作空间，通过浏览器编辑本地文件。工作空间路径会保存在后端配置中，启动时会先校验当前目录身份。
 
 ## 技术栈
 
@@ -51,11 +51,16 @@ standalone-editor/
 │   ├── package.json
 │   ├── test/
 │   │   ├── directoryPicker.test.js
-│   │   └── fileService.test.js
+│   │   ├── fileService.test.js
+│   │   ├── fileApi.test.js
+│   │   ├── trashService.test.js
+│   │   └── zipImportService.test.js
 │   └── src/
 │       ├── index.js         # Express 服务入口
 │       ├── directoryPicker.js # 跨平台目录选择路径规则
-│       └── fileService.js    # 文件 CRUD 核心逻辑
+│       ├── fileService.js    # 文件操作、版本历史
+│       ├── trashService.js   # 可恢复删除
+│       └── zipImportService.js # ZIP 内容验证和导入
 ├── frontend/
 │   ├── package.json
 │   ├── vite.config.js
@@ -76,22 +81,24 @@ standalone-editor/
 ## 功能清单
 
 ### 编辑器
-- [x] Markdown 富文本编辑（TipTap）
+- [x] 常用 Markdown 富文本编辑（TipTap；并非完整 Markdown 语法实现）
 - [x] 标题、列表、任务列表、引用、代码块
 - [x] 插入图片（支持拖拽上传、右键缩放）
 - [x] 插入链接、插入表格
 - [x] 3 秒防抖自动保存
 - [x] 手动保存
-- [x] 源码模式查看/编辑
+- [x] 源码模式查看/编辑；含 YAML front matter、WikiLinks、缩进列表、原始 HTML 或带额外选项的代码围栏等语法的文档会默认以源码模式打开。主动切换到富文本模式前会提示：富文本模式不能完整保留所有 Markdown 语法和元数据；需要保留原文时请继续使用源码模式。
 - [x] 标签页多文件编辑
 - [x] 浏览器记住当前工作目录，下次打开自动进入
+- [x] 保存冲突提示和逐文件版本历史
+- [x] 浏览器本地草稿快照和恢复选项
 
 ### 文件管理
 - [x] 文件树（树形结构）
 - [x] 新建文件/文件夹
 - [x] 重命名
 - [x] 拖拽移动文件
-- [x] 删除文件/文件夹（右键菜单）
+- [x] 将文件/文件夹移入回收站，并可查看和恢复
 - [x] 全部折叠/展开
 
 ### 界面
@@ -108,9 +115,13 @@ standalone-editor/
 | GET | `/api/workspace` | 列出目录文件 |
 | GET | `/api/workspace/check` | 检查工作空间状态 |
 | GET | `/api/workspace/file?path=...` | 读取文件内容 |
+| GET | `/api/workspace/file/history?path=...` | 查看该文件的版本历史 |
+| POST | `/api/workspace/file/restore` | 安全恢复该文件的历史版本 |
 | POST | `/api/workspace` | 新建文件或目录 |
 | PUT | `/api/workspace` | 写入文件 |
-| DELETE | `/api/workspace?path=...` | 删除文件或目录 |
+| DELETE | `/api/workspace?path=...` | 将文件或目录移入回收站 |
+| GET | `/api/workspace/trash` | 列出工作空间的回收站项目 |
+| POST | `/api/workspace/trash/restore` | 恢复回收站项目 |
 | POST | `/api/workspace/move` | 移动/重命名 |
 | POST | `/api/workspace/upload` | 上传文件 |
 | POST | `/api/upload/assets` | 上传图片到 `assets/`（兼容别名） |
@@ -122,6 +133,20 @@ standalone-editor/
 
 除 `/api/workspace/check`、`/api/workspace/set` 和目录浏览外，工作空间 API 需要 `X-Workspace-Id`，并建议同时发送 `X-Workspace-Version`。前端自动附带这些标识；图片 `<img>` URL 使用同名 query 参数，因为浏览器资源请求不能附加自定义请求头。
 
+读取文件会返回按文件内容计算的 SHA-256 `revision`。保存和恢复版本必须提交 `expectedRevision`：缺少时返回 HTTP `428`；磁盘文件或工作空间已变化时返回 HTTP `409`，响应会携带冲突信息，客户端应先处理冲突再保存。对尚不存在的文件，`expectedRevision: null` 表示仅在目标仍不存在时创建。每个文件最多保留最近 50 个被替换的版本；历史版本保存在工作空间之外，默认位于 `~/.standalone-editor/recovery`，可用 `EDITOR_RECOVERY_DIR` 更改。
+
+删除会把项目移到工作空间之外的回收站，目录内的内容一并保存；可在编辑器中列出并恢复。恢复时若原路径已有同名项目，会报告冲突，不会覆盖它。回收站项目有到期时间元数据，但当前不会自动清理。
+
+未保存的编辑会定期保存在当前浏览器配置的本地存储中，重新打开工作空间时可以恢复。其他标签页遗留的草稿会作为独立恢复选项显示，不会自动覆盖当前草稿。浏览器草稿保留 7 天；浏览器清理站点数据、禁用本地存储或存储空间不足时，草稿恢复可能不可用。
+
+### ZIP 导入范围
+
+ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支持的图片（`.jpg`、`.jpeg`、`.png`、`.gif`、`.webp`、`.bmp`、`.svg`、`.ico`、`.tif`、`.tiff`）。隐藏路径和 `__MACOSX` 元数据会跳过；导入目标已存在时不会覆盖。单个压缩包最大 100 MiB，最多 5,000 个压缩包条目、1,000 个可导入文件；解压后单文件最多 50 MiB、合计最多 250 MiB，压缩率上限为 500:1。支持常规 ZIP 的存储和 Deflate 压缩；不支持 ZIP64、多卷、加密、符号链接或特殊文件。文件名须为 ASCII 或标记 UTF-8；旧式 CP437/GBK 文件名暂不支持。导入路径也会校验 Windows 保留名称及非法字符；目录选择器支持 Windows 盘符和 UNC 路径。
+
+### 本地运行边界
+
+后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。不要把监听地址改为局域网或公网可访问的地址，也不要把它当作多用户服务部署。
+
 ### 跨平台目录选择
 
 目录选择器由后端主机决定路径规则。`/api/dirs` 返回 `platform`、当前 `path`、`parent`、`canGoUp`、`canSelect`、`breadcrumb`、`roots` 和 `entries`；条目和面包屑中的 `path` 都是完整的主机路径，前端应原样传回接口，不自行拼接 `/`、`\\` 或驱动器路径。Windows 的盘符根（例如 `C:\\`）和 UNC 根（例如 `\\\\server\\share\\`）也遵循同一规则。
@@ -130,12 +155,22 @@ standalone-editor/
 
 ## 测试
 
+CI 在每次 push 和 pull request 时分别运行后端测试和前端构建。可在本地复现：
+
 ```bash
 cd backend
+npm ci
 npm test
 cd ../frontend
+npm ci
 npm run build
+```
+
+可选的浏览器交互回归测试：
+
+```bash
+cd frontend
 npm run test:interaction
 ```
 
-交互回归测试需要本机安装 Chrome 或 Chromium（Node.js 需支持内置 WebSocket）；默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试会在临时目录中创建笔记工作区和浏览器配置，并使用临时回环端口启动前后端。
+浏览器交互测试需要安装 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试会在临时目录中创建笔记工作区和浏览器配置，并使用临时回环端口启动前后端。

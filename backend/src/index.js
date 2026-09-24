@@ -6,21 +6,22 @@ import os from 'os'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import fs from 'fs/promises'
-import { execFile } from 'child_process'
-import { promisify } from 'util'
 import {
   listDir,
   listTree,
   readFile,
   readFileBase64,
   createItem,
-  deleteItem,
   moveItem,
   writeFile,
+  listFileHistory,
+  restoreFileHistory,
   uploadFile,
   listAll,
   searchWorkspace,
 } from './fileService.js'
+import { createTrashService } from './trashService.js'
+import { importZip } from './zipImportService.js'
 import {
   configuredRootValues,
   defaultRootCandidates,
@@ -34,14 +35,14 @@ import {
 } from './directoryPicker.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const execFileAsync = promisify(execFile)
 
 function envNumber(name, fallback) {
   const value = Number(process.env[name])
   return Number.isFinite(value) && value > 0 ? value : fallback
 }
 
-const PORT = envNumber('PORT', envNumber('EDITOR_PORT', 5557))
+const configuredPort = process.env.PORT ?? process.env.EDITOR_PORT
+const PORT = configuredPort === '0' ? 0 : envNumber('PORT', envNumber('EDITOR_PORT', 5557))
 const HOST = process.env.HOST || process.env.EDITOR_HOST || '127.0.0.1'
 const CONFIG_FILE = process.env.WORKSPACE_CONFIG_FILE
   || process.env.EDITOR_CONFIG_FILE
@@ -55,15 +56,24 @@ let workspaceVersion = 1
 const workspaceMutationTails = new Map()
 
 function errorStatus(error) {
-  if (error?.code === 'CONFLICT' || error?.code === 'WORKSPACE_MISMATCH') return 409
-  if (error?.code === 'ENOENT') return 404
+  if (
+    error?.code === 'CONFLICT' || error?.code === 'FILE_CONFLICT' ||
+    error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH'
+  ) return 409
+  if (error?.code === 'REVISION_REQUIRED') return 428
+  if (error?.code === 'ENOENT' || error?.code === 'HISTORY_NOT_FOUND') return 404
+  if (
+    error?.code === 'RECOVERY_STORAGE_ERROR' || error?.code === 'HISTORY_CORRUPT' ||
+    error?.code === 'HISTORY_ROLLBACK_FAILED' || error?.code === 'MOVE_ROLLBACK_FAILED'
+  ) return 500
+  if (error?.code === 'ZIP_LIMIT') return 413
   return 400
 }
 
 function sendError(res, error, req = res.req) {
   console.error(`[${res.req.method} ${res.req.originalUrl}]`, error?.message || error)
   if (req?.workspaceSnapshot) setWorkspaceHeaders(res, req.workspaceSnapshot)
-  res.status(errorStatus(error)).json({ error: error?.message || '请求失败', code: error?.code })
+  res.status(errorStatus(error)).json({ error: error?.message || '请求失败', code: error?.code, ...(error?.details || {}) })
 }
 
 function workspaceIdFor(realPath) {
@@ -161,10 +171,6 @@ async function allowedDirectoryRoots() {
     } catch {}
   }
   return roots
-}
-
-function isWithin(root, target) {
-  return isWithinPath(root, target, process.platform)
 }
 
 async function defaultDirectoryPickerPath() {
@@ -364,6 +370,42 @@ app.get('/api/workspace/file', workspaceGuard, async (req, res) => {
   } catch (error) { sendError(res, error, req) }
 })
 
+app.get('/api/workspace/file/history', workspaceGuard, async (req, res) => {
+  try {
+    const reqPath = req.query.path
+    if (!reqPath) throw new Error('缺少 path 参数')
+    sendData(res, await listFileHistory(workspaceFor(req), reqPath), req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.get('/api/workspace/trash', workspaceGuard, async (req, res) => {
+  try {
+    const ws = workspaceFor(req)
+    const items = await createTrashService(ws).list()
+    sendData(res, { items }, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.post('/api/workspace/trash/restore', workspaceGuard, async (req, res) => {
+  try {
+    const { id } = req.body || {}
+    if (!id) throw new Error('缺少 id 参数')
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, () => createTrashService(ws).restore(id))
+    sendData(res, result, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.post('/api/workspace/file/restore', workspaceGuard, async (req, res) => {
+  try {
+    const { path: reqPath, historyId, expectedRevision } = req.body || {}
+    if (!reqPath || !historyId) throw new Error('缺少 path 或 historyId 参数')
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, () => restoreFileHistory(ws, reqPath, historyId, expectedRevision))
+    sendData(res, result, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
 app.get('/api/workspace/image', workspaceGuard, async (req, res) => {
   try {
     const reqPath = req.query.path
@@ -384,10 +426,10 @@ app.post('/api/workspace', workspaceGuard, async (req, res) => {
 
 app.put('/api/workspace', workspaceGuard, async (req, res) => {
   try {
-    const { path: reqPath, content } = req.body || {}
+    const { path: reqPath, content, expectedRevision } = req.body || {}
     if (!reqPath) throw new Error('缺少 path 参数')
     const ws = workspaceFor(req)
-    const result = await withWorkspaceMutation(ws, () => writeFile(ws, reqPath, content ?? ''))
+    const result = await withWorkspaceMutation(ws, () => writeFile(ws, reqPath, content ?? '', expectedRevision))
     sendData(res, result, req)
   } catch (error) { sendError(res, error, req) }
 })
@@ -397,7 +439,7 @@ app.delete('/api/workspace', workspaceGuard, async (req, res) => {
     const reqPath = req.query.path
     if (!reqPath) throw new Error('缺少 path 参数')
     const ws = workspaceFor(req)
-    const result = await withWorkspaceMutation(ws, () => deleteItem(ws, reqPath))
+    const result = await withWorkspaceMutation(ws, () => createTrashService(ws).trash(reqPath))
     sendData(res, result, req)
   } catch (error) { sendError(res, error, req) }
 })
@@ -478,114 +520,22 @@ app.get('/api/workspace/export', workspaceGuard, async (req, res) => {
   } catch (error) { sendError(res, error, req) }
 })
 
-// 从 ZIP 导入 Markdown 和图片。条目逐一通过 unzip -p 写入排他目标，
-// 同名文件会在任何写入前被拒绝；所有路径和父目录都经过边界检查。
+// 从 ZIP 导入 Markdown 和图片。服务会先验证并暂存全部内容，再排他写入；
+// 路径、父目录和目标冲突都在工作空间变更锁内检查。
 app.post('/api/workspace/import', workspaceGuard, upload.single('file'), async (req, res) => {
-  let archivePath = null
   try {
     if (!req.file) throw new Error('缺少导入文件')
     if (path.extname(req.file.originalname).toLowerCase() !== '.zip') throw new Error('只允许导入 .zip 文件')
-    archivePath = path.join(os.tmpdir(), `standalone-editor-${crypto.randomUUID()}.zip`)
-    await fs.writeFile(archivePath, req.file.buffer, { flag: 'wx' })
-    const listing = await execFileAsync('unzip', ['-Z1', archivePath], { maxBuffer: 2 * 1024 * 1024 })
-    const entries = []
-    const normalizedEntries = new Set()
-    for (const raw of listing.stdout.split(/\r?\n/).map(item => item.trim()).filter(Boolean)) {
-      if (raw.endsWith('/') || raw.startsWith('__MACOSX/')) continue
-      const normalized = path.posix.normalize(raw.replace(/^\.\/+/, ''))
-      const pieces = normalized.split('/')
-      const extension = path.posix.extname(normalized).toLowerCase().slice(1)
-      if (!normalized || normalized === '.' || normalized.startsWith('../') || normalized.includes('\\') || path.posix.isAbsolute(normalized)) {
-        throw new Error('压缩包包含非法路径')
-      }
-      if (pieces.some(piece => !piece || piece === '.' || piece === '..' || piece.startsWith('.'))) continue
-      if (extension !== 'md' && !IMAGE_EXTENSIONS.has(extension)) continue
-      if (normalizedEntries.has(normalized)) {
-        throw Object.assign(new Error(`压缩包包含重复文件：${normalized}`), { code: 'CONFLICT' })
-      }
-      normalizedEntries.add(normalized)
-      entries.push({ raw, normalized })
-    }
-    if (entries.length === 0) throw new Error('压缩包中没有可导入的 .md 或图片文件')
-
-    const base = workspaceFor(req)
-    const imported = await withWorkspaceMutation(base, async () => {
-      // Validate every destination before creating any directory or file. This
-      // keeps a conflict from leaving a half-created import tree behind.
-      for (const entry of entries) {
-        const destination = path.resolve(base, ...entry.normalized.split('/'))
-        if (!isWithin(base, destination)) throw new Error('压缩包路径超出工作空间')
-        await validateImportDirectory(base, path.dirname(destination))
-        try {
-          await fs.lstat(destination)
-          throw Object.assign(new Error(`导入目标已存在：${entry.normalized}`), { code: 'CONFLICT' })
-        } catch (error) {
-          if (error.code !== 'ENOENT') throw error
-        }
-      }
-
-      let count = 0
-      const created = []
-      try {
-        for (const entry of entries) {
-          const destination = path.resolve(base, ...entry.normalized.split('/'))
-          const parent = path.dirname(destination)
-          await ensureImportDirectory(base, parent)
-          // unzip emits raw bytes. The default execFile UTF-8 decoding corrupts
-          // PNG/JPEG data, so extraction explicitly asks Node for a Buffer.
-          const extracted = await execFileAsync(
-            'unzip',
-            ['-p', archivePath, entry.raw],
-            { encoding: 'buffer', maxBuffer: 100 * 1024 * 1024 },
-          )
-          await fs.writeFile(destination, extracted.stdout, { flag: 'wx' })
-          created.push(destination)
-          count += 1
-        }
-      } catch (error) {
-        await Promise.all(created.map(file => fs.unlink(file).catch(() => {})))
-        throw error
-      }
-      return count
-    })
-    sendData(res, { success: true, imported, message: `已导入 ${imported} 个文件` }, req)
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, () => importZip(ws, req.file.buffer))
+    sendData(res, {
+      success: true,
+      imported: result.imported,
+      files: result.files,
+      message: `已导入 ${result.imported} 个文件`,
+    }, req)
   } catch (error) { sendError(res, error, req) }
-  finally {
-    if (archivePath) { try { await fs.unlink(archivePath) } catch {} }
-  }
 })
-
-async function validateImportDirectory(base, target) {
-  if (!isWithin(base, target)) throw new Error('导入目录超出工作空间')
-  const relative = path.relative(base, target)
-  let current = base
-  for (const part of relative ? relative.split(path.sep) : []) {
-    current = path.join(current, part)
-    try {
-      const stat = await fs.lstat(current)
-      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('导入目录包含非法符号链接')
-    } catch (error) {
-      if (error.code === 'ENOENT') return
-      throw error
-    }
-  }
-}
-
-async function ensureImportDirectory(base, target) {
-  if (!isWithin(base, target)) throw new Error('导入目录超出工作空间')
-  const relative = path.relative(base, target)
-  let current = base
-  for (const part of relative ? relative.split(path.sep) : []) {
-    current = path.join(current, part)
-    try {
-      const stat = await fs.lstat(current)
-      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('导入目录包含非法符号链接')
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error
-      await fs.mkdir(current)
-    }
-  }
-}
 
 // ---------- 静态资源 ----------
 
@@ -596,7 +546,7 @@ const server = app.listen(PORT, HOST, async () => {
     await saveConfig(workspace)
     console.log('✅ 编辑器后端已启动')
     console.log(`📁 工作空间：${workspace}`)
-    console.log(`🌐 http://${HOST}:${PORT}`)
+    console.log(`🌐 http://${HOST}:${server.address()?.port ?? PORT}`)
   } catch (error) {
     console.error('保存工作空间配置失败：', error.message)
   }
@@ -607,4 +557,4 @@ server.on('error', error => {
   process.exitCode = 1
 })
 
-export { app, currentWorkspaceInfo }
+export { app, currentWorkspaceInfo, server }
