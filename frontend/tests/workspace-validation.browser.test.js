@@ -71,6 +71,32 @@ async function waitUntil(description, check, timeoutMs = 12000) {
   throw new Error(`Timed out waiting for ${description}${lastError ? `: ${lastError.message}` : ''}\n${logs}`)
 }
 
+function waitForProcessExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true)
+  return new Promise(resolve => {
+    const finish = exited => {
+      clearTimeout(timeout)
+      child.removeListener('exit', onExit)
+      resolve(exited)
+    }
+    const onExit = () => finish(true)
+    const timeout = setTimeout(() => finish(false), timeoutMs)
+    child.once('exit', onExit)
+  })
+}
+
+async function stopProcess(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return
+
+  child.kill('SIGTERM')
+  if (await waitForProcessExit(child, 2500)) return
+
+  child.kill('SIGKILL')
+  if (!await waitForProcessExit(child, 1500)) {
+    throw new Error(`Process ${child.pid} did not exit after SIGKILL`)
+  }
+}
+
 function sendJson(response, status, body) {
   response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
   response.end(JSON.stringify(body))
@@ -301,11 +327,29 @@ before(async () => {
 
 after(async () => {
   connection?.close()
+  const cleanupErrors = []
   for (const child of [chromeProcess, frontendProcess]) {
-    if (child && child.exitCode == null) child.kill('SIGTERM')
+    try {
+      await stopProcess(child)
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
   }
-  if (backendServer?.listening) await new Promise(resolve => backendServer.close(resolve))
-  if (tempRoot) await rm(tempRoot, { recursive: true, force: true })
+  if (backendServer?.listening) {
+    try {
+      await new Promise((resolve, reject) => backendServer.close(error => error ? reject(error) : resolve()))
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+  if (tempRoot) {
+    try {
+      await rm(tempRoot, { recursive: true, force: true, maxRetries: 8, retryDelay: 100 })
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+  }
+  if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Browser test cleanup failed')
 })
 
 test('stale browser workspace is diagnostic only and retry enters editor only after /check succeeds', async () => {
