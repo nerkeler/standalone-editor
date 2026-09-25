@@ -298,7 +298,7 @@ async function canonicalProjectedPath(target) {
   while (true) {
     try {
       const canonical = await fs.realpath(current)
-      return path.resolve(canonical, ...missingParts.reverse())
+      return path.resolve(canonical, ...missingParts)
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
       const parent = path.dirname(current)

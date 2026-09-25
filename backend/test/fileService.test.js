@@ -16,6 +16,7 @@ import {
   restoreFileHistory,
   uploadFile,
 } from '../src/fileService.js'
+import { getRecoveryStats } from '../src/recoveryStatsService.js'
 
 async function temporaryWorkspace(t) {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'standalone-editor-test-'))
@@ -420,6 +421,48 @@ test('recovery storage cannot resolve inside the workspace, including through a 
     )
   }
   assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'old')
+})
+
+test('missing recovery-root components stay ordered for history writes and statistics', async t => {
+  const outer = await temporaryWorkspace(t)
+  const workspace = path.join(outer, 'notes')
+  await fs.mkdir(workspace)
+  const recovery = path.join(outer, 'missing-a', 'missing-b', 'recovery')
+  await fs.writeFile(path.join(workspace, 'note.md'), 'before')
+
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'after', opened.revision, { root: recovery })
+
+  const workspaceKey = createHash('sha256').update(await fs.realpath(workspace)).digest('hex')
+  const fileKey = createHash('sha256').update('note.md').digest('hex')
+  const bucket = path.join(recovery, 'history', workspaceKey, fileKey)
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(history.history.length, 1)
+
+  const recordPath = path.join(bucket, `${history.history[0].id}.json`)
+  assert.equal(JSON.parse(await fs.readFile(recordPath, 'utf8')).contentBase64, Buffer.from('before').toString('base64'))
+  const expectedBytes = (await fs.stat(recordPath)).size
+  const stats = await getRecoveryStats(workspace, { recoveryRoot: recovery })
+  assert.equal(stats.history.items, 1)
+  assert.equal(stats.history.bytes, expectedBytes)
+
+  const wronglyReversedRoot = path.join(outer, 'recovery', 'missing-b', 'missing-a')
+  await assert.rejects(fs.lstat(wronglyReversedRoot), error => error.code === 'ENOENT')
+})
+
+test('multi-level missing recovery roots inside the workspace are rejected on write', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = path.join(workspace, 'missing-a', 'missing-b', 'recovery')
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'before')
+  const opened = await readFile(workspace, 'note.md')
+
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'after', opened.revision, { root: recovery }),
+    error => error.code === 'RECOVERY_STORAGE_ERROR',
+  )
+  assert.equal(await fs.readFile(notePath, 'utf8'), 'before')
+  await assert.rejects(fs.lstat(recovery), error => error.code === 'ENOENT')
 })
 
 test('file move migrates history; history conflicts and injected failures roll back note and metadata paths', async t => {
