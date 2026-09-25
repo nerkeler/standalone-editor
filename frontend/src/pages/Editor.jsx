@@ -29,8 +29,9 @@ import { marked } from 'marked'
 import Turndown from 'turndown'
 import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
-import useEditorDrafts, { isImageFile } from './useEditorDrafts'
+import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import DocumentTabs from './DocumentTabs'
+import OrphanHistoryManager from './OrphanHistoryManager'
 import './Editor.css'
 
 const lowlight = createLowlight(common)
@@ -285,6 +286,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [isAllExpanded, setIsAllExpanded] = useState(false)
   const [outlineItems, setOutlineItems] = useState([])
   const [imageViewer, setImageViewer] = useState(null)   // { path, url, name }
+  const [attachmentViewer, setAttachmentViewer] = useState(null) // { path, name }
   const [imageZoom, setImageZoom] = useState(100)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState([])
@@ -401,7 +403,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   useEffect(() => {
     if (!editor) return
     const editable = Boolean(
-      activeFile && !fileLoading && !isImageFile(activeFile) &&
+      activeFile && !fileLoading && isMarkdownFile(activeFile) &&
       renderedFileRef.current === activeFile
     )
     editor.setEditable(editable, false)
@@ -433,10 +435,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       const currentPath = activeFileRef.current
       if (e.key === 's') {
         e.preventDefault()
-        if (currentPath && !isImageFile(currentPath)) handleSave()
+        if (currentPath && isMarkdownFile(currentPath)) handleSave()
         return
       }
-      if (!currentPath || isImageFile(currentPath) || showSourceRef.current) return
+      if (!isMarkdownFile(currentPath) || showSourceRef.current) return
       if (e.key === 'b') { e.preventDefault(); editor.chain().focus().toggleBold().run() }
       if (e.key === 'i') { e.preventDefault(); editor.chain().focus().toggleItalic().run() }
     }
@@ -542,7 +544,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const captureCurrentDraft = useCallback(() => {
     const path = activeFileRef.current
-    if (!path || isImageFile(path) || loadingRef.current || renderedFileRef.current !== path) return undefined
+    if (!isMarkdownFile(path) || loadingRef.current || renderedFileRef.current !== path) return undefined
     // Converting Markdown to editor HTML and back can normalize whitespace or
     // syntax even when the user has not touched the document. Keep the exact
     // loaded bytes for clean files; real edits are already marked by the
@@ -559,7 +561,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     const handler = () => {
       if (suppressEditorUpdateRef.current) return
       const path = activeFileRef.current
-      if (!path || isImageFile(path) || showSourceRef.current || loadingRef.current || renderedFileRef.current !== path) return
+      if (!isMarkdownFile(path) || showSourceRef.current || loadingRef.current || renderedFileRef.current !== path) return
       const content = serializeCurrentEditor()
       setDraft(path, content, true)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
@@ -643,7 +645,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       !loadingRef.current
     ) {
       setFileLoading(false)
-      editor?.setEditable(!isImageFile(node.name || path), false)
+      editor?.setEditable(isMarkdownFile(node.name || path), false)
       return
     }
     const requestId = ++openRequestRef.current
@@ -661,12 +663,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     setActiveFile(path)
     setShowSource(false)
     showSourceRef.current = false
+    setImageViewer(null)
+    setAttachmentViewer(null)
     loadingRef.current = true
     setFileLoading(true)
     editor?.setEditable(false, false)
 
     if (isImageFile(node.name || path)) {
-      setImageViewer(null)
       try {
         const res = await axios.get(`${API}/image`, { params: { path } })
         if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
@@ -686,7 +689,19 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       }
       return
     }
-    setImageViewer(null)
+    if (!isMarkdownFile(node.name || path)) {
+      // Attachments remain manageable in the tree and tab strip, but never
+      // enter the text read, autosave, or local draft recovery paths.
+      renderedFileRef.current = path
+      loadingRef.current = false
+      setFileLoading(false)
+      setEditorMarkdown('')
+      sourceContentRef.current = ''
+      setSourceContent('')
+      setAttachmentViewer({ path, name: node.name || path.split('/').pop() })
+      setSaveStatus('idle')
+      return
+    }
     if (draftContentsRef.current[path] !== undefined && !restoredDraftsRef.current[path]) {
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
       const visible = draftContentsRef.current[path]
@@ -772,6 +787,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       activeFileRef.current = next
       setActiveFile(next)
       setImageViewer(null)
+      setAttachmentViewer(null)
       if (next) {
         await handleFileOpen({ path: next, name: next.split('/').pop(), type: 'file' })
       } else {
@@ -789,7 +805,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleSave = useCallback(async () => {
     const path = activeFileRef.current
-    if (!path || isImageFile(path)) return
+    if (!isMarkdownFile(path)) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
     if (conflictsRef.current[path]) {
@@ -810,7 +826,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleRetrySave = useCallback(() => {
     const path = activeFileRef.current
-    if (!path || isImageFile(path) || conflictsRef.current[path]) return
+    if (!isMarkdownFile(path) || conflictsRef.current[path]) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
     setSaveStatus('saving')
@@ -1029,7 +1045,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }, [clearFileConflict, clearPendingDraft, conflictReview, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleOpenHistory = useCallback(async (path = activeFileRef.current) => {
-    if (!path || isImageFile(path)) return
+    if (!isMarkdownFile(path)) return
     setHistoryModal({ open: true, path, entries: [], loading: true })
     try {
       const res = await axios.get(`${API}/file/history`, { params: { path } })
@@ -1174,7 +1190,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       if (
         activeFileRef.current && !loadingRef.current &&
         renderedFileRef.current === activeFileRef.current &&
-        !isImageFile(activeFileRef.current)
+        isMarkdownFile(activeFileRef.current)
       ) captureCurrentDraft()
 
       const pendingPaths = new Set([
@@ -1213,6 +1229,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       activeFileRef.current = next
       setActiveFile(next)
       setImageViewer(null)
+      setAttachmentViewer(null)
       if (next) {
         await handleFileOpen({ path: next, name: next.split('/').pop(), type: 'file' })
       } else {
@@ -1229,18 +1246,19 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }, [flushPaths, handleFileOpen, removeTabState, setEditorMarkdown])
 
   // 导出当前文件。下载请求也要经过 API 客户端，以带上工作空间标识。
-  const handleExport = async () => {
-    const path = activeFileRef.current
-    if (!path || isImageFile(path)) return
+  const handleExport = async (targetPath = activeFileRef.current) => {
+    const path = targetPath
+    if (!path) return
     try {
-      const res = await axios.get(`${API}/export`, { params: { path }, responseType: 'blob' })
+      const markdown = isMarkdownFile(path)
+      const res = await axios.get(`${API}/${markdown ? 'export' : 'download'}`, { params: { path }, responseType: 'blob' })
       const url = URL.createObjectURL(res.data)
       const a = document.createElement('a')
       a.href = url
-      a.download = path.split('/').pop() || 'export.md'
+      a.download = path.split('/').pop() || (markdown ? 'export.md' : 'attachment')
       a.click()
       setTimeout(() => URL.revokeObjectURL(url), 1000)
-    } catch (error) { message.error('导出失败：' + (error.response?.data?.error || error.message)) }
+    } catch (error) { message.error('下载失败：' + (error.response?.data?.error || error.message)) }
   }
 
   // 导入弹窗处理
@@ -1273,7 +1291,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     const targetFile = activeFileRef.current
     const requestId = openRequestRef.current
     if (
-      !targetFile || isImageFile(targetFile) || loadingRef.current ||
+      !isMarkdownFile(targetFile) || loadingRef.current ||
       renderedFileRef.current !== targetFile
     ) {
       message.error('请先打开一个 Markdown 文件')
@@ -1320,6 +1338,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           activeFileRef.current = next
           setActiveFile(next)
           setImageViewer(null)
+          setAttachmentViewer(null)
           if (next) {
             await handleFileOpen({ path: next, name: next.split('/').pop(), type: 'file' })
           } else {
@@ -1477,7 +1496,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (!item?.id) return
     Modal.confirm({
       title: `永久删除「${item.path}」？`,
-      content: `这会永久删除回收站中的「${item.path}」及其内容，无法从编辑器恢复。`,
+      content: `这会永久删除回收站中的「${item.path}」及其内容，无法从编辑器恢复。该路径已归档的历史版本会保留，可在“已删除文件的历史版本”中单独查看或删除。`,
       okText: '永久删除',
       cancelText: '取消',
       okButtonProps: { danger: true },
@@ -1765,7 +1784,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                         { type: 'divider' },
                         { key: 'folder', label: '新建文件夹', icon: <FolderAddOutlined /> },
                         { key: 'import', label: '导入文件', icon: <UploadOutlined /> },
-                        { key: 'export', label: '导出当前文件', icon: <ApiOutlined />, disabled: !activeFile },
+                        { key: 'export', label: isMarkdownFile(activeFile) ? '导出当前文件' : '下载当前文件', icon: <ApiOutlined />, disabled: !activeFile },
                         { type: 'divider' },
                         { key: 'trash', label: '回收站', icon: <DeleteOutlined /> },
                         { key: 'recovery-drafts', label: `其他恢复草稿（${recoveryAlternativeCount}）`, icon: <HistoryOutlined />, disabled: recoveryAlternativeCount === 0 },
@@ -2034,6 +2053,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             onClick={handlePurgeExpiredTrash}
           >清理过期项目</Button>
         </div>
+        {trashModalOpen && (
+          <OrphanHistoryManager onChange={async change => {
+            await refreshTrashAndRecoveryStats()
+            if (change?.type === 'restore') await loadTree()
+          }} />
+        )}
         {trashLoading ? (
           <div role="status" style={{ padding: 24, textAlign: 'center' }}>正在读取回收站…</div>
         ) : visibleTrashItems.length === 0 ? (
@@ -2260,6 +2285,17 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 </div>
               </div>
             </>
+          ) : attachmentViewer ? (
+            <div className="attachment-viewer" role="region" aria-label="附件只读查看">
+              <FileOutlined className="empty-editor-icon" aria-hidden="true" />
+              <div className="attachment-viewer-name">{attachmentViewer.name}</div>
+              <div className="attachment-viewer-copy">
+                此文件作为附件保留原始字节，当前不会按 Markdown 打开或自动保存。
+              </div>
+              <Button type="primary" aria-label="下载附件" onClick={() => handleExport(attachmentViewer.path)}>
+                下载原始文件
+              </Button>
+            </div>
           ) : (
             <>
               {showToolbar && !isMobile && (
@@ -2498,19 +2534,22 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>
             </div>
             <div className="editor-status-actions">
-              {activeFile && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
-              {activeFile && !imageViewer && (
+              {activeFile && isMarkdownFile(activeFile) && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
+              {activeFile && isMarkdownFile(activeFile) && (
                 <Button aria-label="查看版本历史" size="small" icon={<HistoryOutlined />} onClick={() => handleOpenHistory(activeFile)}>历史</Button>
               )}
-              {activeFile && !imageViewer && (
+              {activeFile && isMarkdownFile(activeFile) && (
                 <Button aria-label="保存当前文件" size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
+              )}
+              {attachmentViewer && (
+                <Button aria-label="下载附件" size="small" icon={<ApiOutlined />} onClick={() => handleExport(attachmentViewer.path)}>下载</Button>
               )}
             </div>
           </div>
         </div>
       </div>
 
-      {!isMobile && !editorFullscreen && showOutline && activeFile && (
+      {!isMobile && !editorFullscreen && showOutline && isMarkdownFile(activeFile) && (
         <aside className="outline-panel" aria-label="文档大纲">
           <div className="outline-panel-header">
             <div>

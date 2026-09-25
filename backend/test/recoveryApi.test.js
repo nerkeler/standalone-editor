@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { createZip } from './zipFixture.js'
 
 const backendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -188,4 +189,144 @@ test('recovery API is workspace-guarded, reports stored bytes, and cleans only o
     method: 'DELETE', headers,
   })
   assert.equal(duplicateTrashRemove.status, 404)
+})
+
+test('orphan-history API previews, restores, isolates path reuse, and survives trash deletion', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-orphan-api-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-orphan-api-data-')
+  await fs.writeFile(path.join(workspace, 'note.md'), 'generation A')
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const info = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'X-Workspace-Id': info.workspaceId,
+    'X-Workspace-Version': String(info.workspaceVersion),
+  }
+  const jsonHeaders = { ...headers, 'Content-Type': 'application/json' }
+
+  const opened = await (await fetch(`${baseUrl}/api/workspace/file?path=note.md`, { headers })).json()
+  const savedResponse = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers: jsonHeaders,
+    body: JSON.stringify({ path: 'note.md', content: 'generation A current', expectedRevision: opened.revision }),
+  })
+  assert.equal(savedResponse.status, 200)
+  const oldHistory = (await (await fetch(`${baseUrl}/api/workspace/file/history?path=note.md`, { headers })).json()).history
+  assert.equal(oldHistory.length, 1)
+
+  const trashedResponse = await fetch(`${baseUrl}/api/workspace?path=note.md`, { method: 'DELETE', headers })
+  assert.equal(trashedResponse.status, 200)
+  const trashed = await trashedResponse.json()
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/workspace/file/history?path=note.md`, { headers })).json()).history, [])
+
+  const wrongWorkspace = await fetch(`${baseUrl}/api/workspace/recovery/history`, {
+    headers: { ...headers, 'X-Workspace-Id': 'wrong-workspace' },
+  })
+  assert.equal(wrongWorkspace.status, 409)
+  const orphanList = await (await fetch(`${baseUrl}/api/workspace/recovery/history`, { headers })).json()
+  assert.equal(orphanList.items.length, 1)
+  const orphan = orphanList.items[0]
+  assert.equal(orphan.path, 'note.md')
+  assert.equal(orphan.trashEntryId, trashed.id)
+  assert.equal(orphan.history.length, 1)
+
+  const previewResponse = await fetch(
+    `${baseUrl}/api/workspace/recovery/history/content?orphanId=${encodeURIComponent(orphan.id)}&historyId=${encodeURIComponent(oldHistory[0].id)}`,
+    { headers },
+  )
+  assert.equal(previewResponse.status, 200)
+  assert.deepEqual(await previewResponse.json(), {
+    content: 'generation A',
+    revision: opened.revision,
+    savedAt: oldHistory[0].savedAt,
+    sourcePath: 'note.md',
+  })
+
+  const deletedTrash = await fetch(`${baseUrl}/api/workspace/trash?id=${encodeURIComponent(trashed.id)}`, {
+    method: 'DELETE', headers,
+  })
+  assert.equal(deletedTrash.status, 200)
+  assert.equal((await (await fetch(`${baseUrl}/api/workspace/recovery/history`, { headers })).json()).items.length, 1)
+  const stats = await (await fetch(`${baseUrl}/api/workspace/recovery/stats`, { headers })).json()
+  assert.equal(stats.history.items, 1)
+
+  const createResponse = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'POST', headers: jsonHeaders,
+    body: JSON.stringify({ path: '', type: 'file', name: 'note.md' }),
+  })
+  assert.equal(createResponse.status, 200)
+  const newFile = await (await fetch(`${baseUrl}/api/workspace/file?path=note.md`, { headers })).json()
+  const newSave = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers: jsonHeaders,
+    body: JSON.stringify({ path: 'note.md', content: 'generation B', expectedRevision: newFile.revision }),
+  })
+  assert.equal(newSave.status, 200)
+  const newHistory = (await (await fetch(`${baseUrl}/api/workspace/file/history?path=note.md`, { headers })).json()).history
+  assert.equal(newHistory.length, 1)
+  assert.equal(newHistory[0].revision, newFile.revision)
+  assert.notEqual(newHistory[0].revision, opened.revision)
+
+  const restored = await fetch(`${baseUrl}/api/workspace/recovery/history/restore`, {
+    method: 'POST', headers: jsonHeaders,
+    body: JSON.stringify({ orphanId: orphan.id, historyId: oldHistory[0].id, path: 'restored.md', expectedRevision: null }),
+  })
+  assert.equal(restored.status, 200)
+  assert.equal((await (await fetch(`${baseUrl}/api/workspace/file?path=restored.md`, { headers })).json()).content, 'generation A')
+
+  const deletedOrphan = await fetch(`${baseUrl}/api/workspace/recovery/history?id=${encodeURIComponent(orphan.id)}`, {
+    method: 'DELETE', headers,
+  })
+  assert.equal(deletedOrphan.status, 200)
+  assert.equal((await deletedOrphan.json()).deletedHistory, 1)
+  assert.deepEqual((await (await fetch(`${baseUrl}/api/workspace/recovery/history`, { headers })).json()).items, [])
+
+  async function leaveStaleHistory(relativePath, oldContent, currentContent) {
+    const fullPath = path.join(workspace, relativePath)
+    await fs.writeFile(fullPath, oldContent)
+    const original = await (await fetch(`${baseUrl}/api/workspace/file?path=${encodeURIComponent(relativePath)}`, { headers })).json()
+    const save = await fetch(`${baseUrl}/api/workspace`, {
+      method: 'PUT', headers: jsonHeaders,
+      body: JSON.stringify({ path: relativePath, content: currentContent, expectedRevision: original.revision }),
+    })
+    assert.equal(save.status, 200)
+    const history = (await (await fetch(
+      `${baseUrl}/api/workspace/file/history?path=${encodeURIComponent(relativePath)}`, { headers },
+    )).json()).history
+    assert.equal(history.length, 1)
+    // An external deletion bypasses the app's archive hook and is the path
+    // reuse case create/upload/import must safely detach on first observation.
+    await fs.unlink(fullPath)
+    return history[0]
+  }
+
+  const uploadedOldHistory = await leaveStaleHistory('uploaded-reused.md', 'upload generation A', 'upload generation A current')
+  const uploadForm = new FormData()
+  uploadForm.append('path', '')
+  uploadForm.append('file', new Blob(['upload generation B']), 'uploaded-reused.md')
+  const uploadResponse = await fetch(`${baseUrl}/api/workspace/upload`, {
+    method: 'POST', headers, body: uploadForm,
+  })
+  assert.equal(uploadResponse.status, 200)
+  assert.equal(await fs.readFile(path.join(workspace, 'uploaded-reused.md'), 'utf8'), 'upload generation B')
+  assert.deepEqual((await (await fetch(
+    `${baseUrl}/api/workspace/file/history?path=uploaded-reused.md`, { headers },
+  )).json()).history, [])
+
+  const zipOldHistory = await leaveStaleHistory('zipped-reused.md', 'ZIP generation A', 'ZIP generation A current')
+  const zipForm = new FormData()
+  zipForm.append('file', new Blob([createZip([{ name: 'zipped-reused.md', data: 'ZIP generation B' }])]), 'notes.zip')
+  const zipResponse = await fetch(`${baseUrl}/api/workspace/import`, {
+    method: 'POST', headers, body: zipForm,
+  })
+  assert.equal(zipResponse.status, 200)
+  assert.equal(await fs.readFile(path.join(workspace, 'zipped-reused.md'), 'utf8'), 'ZIP generation B')
+  assert.deepEqual((await (await fetch(
+    `${baseUrl}/api/workspace/file/history?path=zipped-reused.md`, { headers },
+  )).json()).history, [])
+
+  const reusedOrphans = (await (await fetch(`${baseUrl}/api/workspace/recovery/history`, { headers })).json()).items
+  const uploadOrphan = reusedOrphans.find(item => item.path === 'uploaded-reused.md')
+  const zipOrphan = reusedOrphans.find(item => item.path === 'zipped-reused.md')
+  assert.ok(uploadOrphan)
+  assert.ok(zipOrphan)
+  assert.equal(uploadOrphan.history[0].id, uploadedOldHistory.id)
+  assert.equal(zipOrphan.history[0].id, zipOldHistory.id)
 })

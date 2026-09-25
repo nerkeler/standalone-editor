@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { createTrashService } from '../src/trashService.js'
+import { archiveFileHistory, listOrphanFileHistory, readFile, writeFile } from '../src/fileService.js'
 
 async function tempDirectory(t, prefix) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), prefix))
@@ -42,6 +43,37 @@ test('expired entries are removed only by the explicit purge operation', async t
   assert.ok(result.bytes > Buffer.byteLength('old recovery'))
   assert.deepEqual(await trash.list(), [])
   await assert.rejects(fs.lstat(entryDirectory), error => error.code === 'ENOENT')
+})
+
+test('permanent trash removal and expiry purge leave archived Markdown history intact', async t => {
+  const { workspace, recovery } = await fixture(t)
+  const trash = createTrashService(workspace, { recoveryRoot: recovery })
+  for (const name of ['permanent.md', 'expired.md']) {
+    await fs.writeFile(path.join(workspace, name), `${name} before`)
+    const opened = await readFile(workspace, name)
+    await writeFile(workspace, name, `${name} after`, opened.revision, { root: recovery })
+  }
+
+  const permanent = await trash.trash('permanent.md')
+  await archiveFileHistory(workspace, 'permanent.md', {
+    root: recovery, reason: 'trash', trashEntryId: permanent.id,
+  })
+  await trash.remove(permanent.id)
+
+  const expired = await trash.trash('expired.md')
+  await archiveFileHistory(workspace, 'expired.md', {
+    root: recovery, reason: 'trash', trashEntryId: expired.id,
+  })
+  const entryDirectory = path.join(recovery, 'trash', await workspaceKey(workspace), expired.id)
+  const manifestPath = path.join(entryDirectory, 'entry.json')
+  const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'))
+  manifest.expiresAt = '2000-01-01T00:00:00.000Z'
+  await fs.writeFile(manifestPath, JSON.stringify(manifest))
+  assert.equal((await trash.purgeExpired({ at: new Date('2001-01-01T00:00:00.000Z') })).purged, 1)
+
+  const orphans = await listOrphanFileHistory(workspace, { root: recovery })
+  assert.deepEqual(orphans.items.map(item => item.path).sort(), ['expired.md', 'permanent.md'])
+  assert.ok(orphans.items.every(item => item.history.length === 1))
 })
 
 test('permanent removal requires a ready entry belonging to the selected workspace', async t => {

@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
-import { writeFile } from '../src/fileService.js'
+import { archiveFileHistory, writeFile } from '../src/fileService.js'
 import { createTrashService } from '../src/trashService.js'
 import { getRecoveryStats } from '../src/recoveryStatsService.js'
 
@@ -59,6 +59,33 @@ test('recovery statistics count serialized storage bytes and isolate each worksp
   assert.equal(stats.total.items, 2)
   assert.equal(stats.total.bytes, stats.history.bytes + stats.trash.bytes)
   assert.match(stats.generatedAt, /^\d{4}-\d\d-\d\dT/)
+})
+
+test('recovery statistics count archived history records without mixing workspace archives', async t => {
+  const outer = await tempDirectory(t, 'standalone-editor-recovery-orphan-stats-')
+  const workspace = path.join(outer, 'notes')
+  const otherWorkspace = path.join(outer, 'other-notes')
+  const recovery = path.join(outer, 'recovery')
+  await Promise.all([fs.mkdir(workspace), fs.mkdir(otherWorkspace), fs.mkdir(recovery)])
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'before archive')
+  const opened = { revision: hash('before archive') }
+  await writeFile(workspace, 'note.md', 'after archive', opened.revision, { root: recovery })
+  await fs.rename(notePath, path.join(outer, 'trashed-note.md'))
+  await archiveFileHistory(workspace, 'note.md', {
+    root: recovery,
+    reason: 'trash',
+    trashEntryId: '11111111-1111-4111-8111-111111111111',
+  })
+
+  const workspaceKey = hash(await fs.realpath(workspace))
+  const historyRoot = path.join(recovery, 'history', workspaceKey)
+  const stats = await getRecoveryStats(workspace, { recoveryRoot: recovery })
+  assert.equal(stats.history.items, 1)
+  assert.equal(stats.history.bytes, await regularFileBytes(historyRoot))
+
+  const otherStats = await getRecoveryStats(otherWorkspace, { recoveryRoot: recovery })
+  assert.deepEqual(otherStats.history, { items: 0, bytes: 0 })
 })
 
 test('recovery statistics skip symlink targets when measuring bytes', async t => {

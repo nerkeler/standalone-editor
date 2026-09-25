@@ -416,18 +416,45 @@ async function switchWorkspace(targetDirectoryName) {
   })()`)
   await clickVisibleButton('选择工作目录')
   await waitUntil('directory picker to open', () => cdp.evaluate(`Boolean(document.querySelector('.ant-modal-body'))`))
-  await clickVisibleButton('返回')
-  await waitUntil(`${targetDirectoryName} directory in picker`, () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('.ant-modal-body div')).some(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)})`,
-  ))
-  await cdp.evaluate(`(() => {
-    const row = Array.from(document.querySelectorAll('.ant-modal-body div')).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
-    row?.click();
-    return Boolean(row);
+  const pickerState = await cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('选择工作目录'));
+    const body = modal?.querySelector('.ant-modal-body');
+    const target = ${JSON.stringify(targetDirectoryName)};
+    const listed = Array.from(body?.querySelectorAll('div') || []).some(item => item.innerText.trim() === target);
+    const rootButton = Array.from(body?.querySelectorAll('button[title]') || []).find(button => button.innerText.trim() === target);
+    const back = Array.from(body?.querySelectorAll('button') || []).find(button => button.innerText.trim() === '返回');
+    const currentName = Array.from(body?.querySelectorAll('.ant-breadcrumb-link') || []).at(-1)?.innerText.trim() || '';
+    return { listed, rootButton: Boolean(rootButton), currentName, canGoUp: Boolean(back && !back.disabled) };
   })()`)
-  await waitUntil(`${targetDirectoryName} selected in picker`, () => cdp.evaluate(
-    `document.querySelector('.ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)}) && !Array.from(document.querySelectorAll('button')).find(item => item.innerText.trim() === '确认选择')?.disabled`,
-  ))
+  let selectedRoot = pickerState.currentName === targetDirectoryName
+  if (!pickerState.listed && pickerState.rootButton) {
+    await cdp.evaluate(`(() => {
+      const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('选择工作目录'));
+      const body = modal?.querySelector('.ant-modal-body');
+      const button = Array.from(body?.querySelectorAll('button[title]') || []).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
+      button?.click();
+      return Boolean(button);
+    })()`)
+    selectedRoot = true
+    await waitUntil(`${targetDirectoryName} root to open in picker`, () => cdp.evaluate(
+      `document.querySelector('.ant-modal .ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)})`,
+    ))
+  } else if (!pickerState.listed && pickerState.canGoUp) {
+    await clickVisibleButton('返回')
+  }
+  if (!selectedRoot) {
+    await waitUntil(`${targetDirectoryName} directory in picker`, () => cdp.evaluate(
+      `Array.from(document.querySelectorAll('.ant-modal-body div')).some(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)})`,
+    ))
+    await cdp.evaluate(`(() => {
+      const row = Array.from(document.querySelectorAll('.ant-modal-body div')).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
+      row?.click();
+      return Boolean(row);
+    })()`)
+    await waitUntil(`${targetDirectoryName} selected in picker`, () => cdp.evaluate(
+      `document.querySelector('.ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)}) && !Array.from(document.querySelectorAll('button')).find(item => item.innerText.trim() === '确认选择')?.disabled`,
+    ))
+  }
   await clickVisibleButton('确认选择')
   await waitUntil(`${targetDirectoryName} workspace to load`, () => cdp.evaluate(`(() => {
     const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
@@ -585,6 +612,61 @@ test('an edit is persisted by the three-second autosave', async () => {
   }, 9000)
   assert.ok(Date.now() - editedAt >= 2700, 'the write should follow the three-second debounce')
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
+})
+
+test('.markdown stays editable while attachments use a read-only byte download view', async () => {
+  const markdownPath = 'extended.markdown'
+  const attachmentPath = 'archive.sqlite'
+  const attachmentBytes = Buffer.from([0x00, 0xff, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a])
+  await writeFile(path.join(workspace, markdownPath), '# Markdown extension seed')
+  await writeFile(path.join(workspace, attachmentPath), attachmentBytes)
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('editor to reload after creating Markdown and attachment fixtures', () => pageIsReady())
+
+  await openFile(markdownPath, 'Markdown extension seed')
+  const markdownToken = `MARKDOWN-EXTENSION-${Date.now()}`
+  await insertAtDocumentEnd(markdownToken)
+  await waitUntil('the .markdown document to autosave', async () => {
+    const content = await readFile(path.join(workspace, markdownPath), 'utf8')
+    return content.includes(markdownToken) ? content : null
+  }, 9000)
+
+  const requestOffset = cdp.networkRequests.length
+  await waitUntil(`${attachmentPath} in the file tree`, () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === ${JSON.stringify(attachmentPath)})`,
+  ))
+  await cdp.evaluate(`(() => {
+    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(attachmentPath)});
+    node?.click();
+    return Boolean(node);
+  })()`)
+  await waitUntil('attachment to open in its read-only panel', () => cdp.evaluate(
+    `Boolean(document.querySelector('[aria-label="附件只读查看"]') && document.querySelector('[aria-label="附件只读查看"]').innerText.includes('不会按 Markdown 打开或自动保存'))`,
+  ))
+  const attachmentState = await cdp.evaluate(`JSON.stringify({
+    sourceEditor: Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]')),
+    saveButton: Boolean(document.querySelector('button[aria-label="保存当前文件"]')),
+    historyButton: Boolean(document.querySelector('button[aria-label="查看版本历史"]')),
+    attachedDraft: Object.values(localStorage).some(value => value.includes(${JSON.stringify(attachmentPath)})),
+    editorEditable: document.querySelector('.ProseMirror')?.getAttribute('contenteditable') || null,
+  })`)
+  assert.deepEqual(JSON.parse(attachmentState), {
+    sourceEditor: false,
+    saveButton: false,
+    historyButton: false,
+    attachedDraft: false,
+    editorEditable: null,
+  })
+  const openedFileRequests = cdp.networkRequests.slice(requestOffset).filter(request =>
+    request.method === 'GET' && request.url.includes('/file?path=archive.sqlite'),
+  )
+  assert.deepEqual(openedFileRequests, [], 'opening an attachment must not request text content')
+
+  await clickExactAriaButton('下载附件')
+  await waitUntil('the attachment to use the binary download endpoint', () => Promise.resolve(
+    cdp.networkRequests.some(request => request.method === 'GET' && request.url.includes('/download?path=archive.sqlite')),
+  ))
+  assert.deepEqual(await readFile(path.join(workspace, attachmentPath)), attachmentBytes)
 })
 
 test('a pending edit stays bound to its file when the user switches tabs', async () => {
@@ -1005,7 +1087,7 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
   await waitUntil('single trash deletion confirmation to explain irreversible effect', () => cdp.evaluate(
     `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
       const style = getComputedStyle(dialog);
-      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && dialog.innerText.includes('无法从编辑器恢复');
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && dialog.innerText.includes('无法从编辑器恢复') && dialog.innerText.includes('历史版本会保留');
     })`,
   ))
   const beforeTrashDeleteCancel = cdp.networkRequests.length
@@ -1251,4 +1333,94 @@ test('a renderer crash restores the throttled draft without writing it blindly',
   }))
   assert.deepEqual(afterRecoveryWindow.requests, [], 'recovered content must not trigger an automatic PUT')
   assert.equal(afterRecoveryWindow.disk, firstSeed, `a restored draft stays local until a deliberate save; states: ${JSON.stringify({ crashCommand, beforeCrash, afterCrash, afterClose, beforeOpen, afterOpen, afterRecoveryWindow })}`)
+})
+
+test('orphan history can be previewed, restored without silent overwrite, and explicitly deleted', async () => {
+  const token = Date.now()
+  const orphanFile = `orphan-${token}.md`
+  const orphanSeed = `Orphan source seed ${token}`
+  const editToken = `ORPHAN-HISTORY-${token}`
+  const restoredPath = `restored-${token}.md`
+  await writeFile(path.join(workspace, orphanFile), orphanSeed)
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('editor to reload after creating the orphan test file', () => pageIsReady())
+  await waitUntil('orphan test file in the workspace tree', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(orphanFile)})`,
+  ))
+  await openFile(orphanFile, orphanSeed)
+  await insertAtSourceEnd(`\n${editToken}`)
+  await clickAriaButton('保存当前文件')
+  await waitUntil('edited content to save and create a history version', async () => {
+    const disk = await readFile(path.join(workspace, orphanFile), 'utf8').catch(() => '')
+    const history = await readWorkspaceHistory(orphanFile)
+    return disk.includes(editToken) && history.status === 200 && history.data.history?.length > 0
+  })
+  await moveFileToTrash(orphanFile)
+  assert.equal(await readFile(path.join(workspace, orphanFile)).catch(error => error.code), 'ENOENT')
+
+  await openTrash()
+  await waitUntil('orphan history manager to show its count', () => cdp.evaluate(
+    `Boolean(Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === '管理已删除文件历史')?.innerText.includes('1'))`,
+  ))
+  await clickAriaButton('管理已删除文件历史')
+  await waitUntil('deleted file history to show its path, version count, and path state', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('已删除文件的历史版本'));
+    return modal?.innerText.includes(${JSON.stringify(orphanFile)}) && modal?.innerText.includes('1 个版本') && modal?.innerText.includes('原路径不存在');
+  })()`))
+
+  await clickVisibleButton('查看版本')
+  await waitUntil('archived version actions to appear', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('button')).some(button => button.innerText.trim() === '预览内容')`,
+  ))
+  await clickVisibleButton('预览内容')
+  await waitUntil('orphan history preview to contain the original Markdown', () => cdp.evaluate(
+    `document.querySelector('textarea[aria-label="孤儿历史预览 ${orphanFile}"]')?.value.includes(${JSON.stringify(orphanSeed)})`,
+  ))
+
+  await clickVisibleButton('恢复此版本…')
+  const restoreInputLabel = `恢复目标路径 ${orphanFile}`
+  const setRestorePath = async value => cdp.evaluate(`(() => {
+    const input = document.querySelector('input[aria-label=${JSON.stringify(restoreInputLabel)}]');
+    if (!input) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(input, ${JSON.stringify(value)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return input.value === ${JSON.stringify(value)};
+  })()`)
+
+  assert.equal(await setRestorePath(secondFile), true)
+  const beforeOverwriteAttempt = cdp.networkRequests.length
+  await clickVisibleButton('恢复到此路径')
+  await waitUntil('restoring over an existing document to require explicit confirmation', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => dialog.innerText.includes('覆盖当前文件') && dialog.innerText.includes(${JSON.stringify(secondFile)}))`,
+  ))
+  assert.equal(cdp.networkRequests.slice(beforeOverwriteAttempt).filter(request =>
+    request.method === 'POST' && new URL(request.url).pathname.endsWith('/api/workspace/recovery/history/restore'),
+  ).length, 0, 'an existing target must not be restored before explicit confirmation')
+  await cancelVisibleConfirmation()
+  await waitUntil('overwrite confirmation to close after cancel', async () => !await hasVisibleConfirmation())
+  assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
+
+  assert.equal(await setRestorePath(restoredPath), true)
+  const beforeNewPathRestore = cdp.networkRequests.length
+  await clickVisibleButton('恢复到此路径')
+  await waitUntil('orphan version restore to finish', () => cdp.evaluate(
+    `document.body.innerText.includes(${JSON.stringify(`已将历史版本恢复到 ${restoredPath}`)})`,
+  ))
+  assert.equal(await readFile(path.join(workspace, restoredPath), 'utf8'), orphanSeed)
+  assert.ok(cdp.networkRequests.slice(beforeNewPathRestore).some(request =>
+    request.method === 'POST' && new URL(request.url).pathname.endsWith('/api/workspace/recovery/history/restore'),
+  ), 'restoring to a new path should use the guarded recovery endpoint')
+
+  await clickExactAriaButton(`永久删除孤儿历史 ${orphanFile}`)
+  await waitUntil('orphan history delete confirmation to explain the permanent effect', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => dialog.innerText.includes('1 个历史版本') && dialog.innerText.includes('无法恢复'))`,
+  ))
+  await clickConfirmButton('永久删除这些历史')
+  await waitUntil('orphan history delete confirmation to close', async () => !await hasVisibleConfirmation())
+  await waitUntil('orphan history to disappear only after confirmation', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('已删除文件的历史版本'));
+    return modal?.innerText.includes('当前没有孤儿历史');
+  })()`))
+  assert.equal(await readFile(path.join(workspace, restoredPath), 'utf8'), orphanSeed, 'deleting orphan history must not delete the restored workspace file')
 })

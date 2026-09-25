@@ -7,7 +7,11 @@ const DRAFT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const DRAFT_SNAPSHOT_INTERVAL_MS = 500
 
 export function isImageFile(name) {
-  return IMAGE_EXTS.includes(name.split('.').pop()?.toLowerCase() || '')
+  return IMAGE_EXTS.includes(String(name || '').split('.').pop()?.toLowerCase() || '')
+}
+
+export function isMarkdownFile(name) {
+  return /\.(?:md|markdown)$/i.test(String(name || ''))
 }
 
 function remapPath(pathValue, oldPath, newPath) {
@@ -113,6 +117,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
         return {}
       }
       return Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
+        if (!isMarkdownFile(path)) return []
         const snapshot = normalizeDraftSnapshot(value, savedAt)
         if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
         return [[path, snapshot]]
@@ -175,7 +180,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const collectDirtyDrafts = useCallback(() => Object.fromEntries(
     Object.entries(dirtyRef.current).flatMap(([path, dirty]) => {
       const content = draftContentsRef.current[path]
-      if (!dirty || content === undefined || isImageFile(path)) return []
+      if (!dirty || content === undefined || !isMarkdownFile(path)) return []
       const restored = restoredDraftsRef.current[path]
       return [[path, {
         content,
@@ -208,6 +213,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const restoreDraftSnapshots = useCallback((snapshots, sourceSession = '本标签页') => {
     const accepted = {}
     for (const [path, snapshot] of Object.entries(snapshots)) {
+      if (!isMarkdownFile(path)) continue
       const current = restoredDraftsRef.current[path]
       if (current && current.content !== snapshot.content) {
         addRecoveryAlternative(path, snapshot, sourceSession)
@@ -417,6 +423,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
             continue
           }
           const abandoned = Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
+            if (!isMarkdownFile(path)) return []
             const snapshot = normalizeDraftSnapshot(value, savedAt)
             if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
             return [[path, snapshot]]
@@ -455,6 +462,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   }, [collectDirtyDrafts, scheduleDraftSnapshot, sessionIdentityReady])
 
   const setDraft = useCallback((path, content, dirty = content !== cleanContentsRef.current[path]) => {
+    if (!isMarkdownFile(path)) return
     const previousContent = draftContentsRef.current[path]
     draftContentsRef.current[path] = content
     dirtyRef.current[path] = Boolean(dirty)
@@ -482,7 +490,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
 
   const applyRecoveryAlternative = useCallback((path, entry) => {
     const snapshot = entry?.snapshot
-    if (!path || !snapshot) return
+    if (!isMarkdownFile(path) || !snapshot) return
     const currentContent = draftContentsRef.current[path]
     if (dirtyRef.current[path] && currentContent !== undefined && currentContent !== snapshot.content) {
       addRecoveryAlternative(path, {
@@ -509,7 +517,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   }, [])
 
   const doSave = useCallback((path, content = draftContentsRef.current[path]) => {
-    if (!path || isImageFile(path) || content === undefined) return Promise.resolve(false)
+    if (!isMarkdownFile(path) || content === undefined) return Promise.resolve(false)
     clearSaveTimer(path)
     const previous = saveQueuesRef.current.get(path) || Promise.resolve()
     const operation = previous.catch(() => {}).then(async () => {

@@ -91,12 +91,16 @@ async function regularFileBytes(target, knownStat) {
   return bytes
 }
 
-async function countHistoryItems(workspaceHistory) {
+async function countHistoryItems(workspaceHistory, workspaceKey) {
   const workspaceStat = await directoryOrNull(workspaceHistory)
   if (!workspaceStat) return 0
 
   let items = 0
   for (const fileKey of await entriesOrEmpty(workspaceHistory)) {
+    if (fileKey === 'orphans') {
+      items += await countOrphanHistoryItems(path.join(workspaceHistory, fileKey), workspaceKey)
+      continue
+    }
     if (!HASH_PATTERN.test(fileKey)) continue
     const bucket = path.join(workspaceHistory, fileKey)
     if (!await directoryOrNull(bucket)) continue
@@ -136,6 +140,53 @@ async function countHistoryItems(workspaceHistory) {
         // not counted as usable versions.
       }
     }
+  }
+  return items
+}
+
+async function countOrphanHistoryItems(orphanRoot, workspaceKey) {
+  if (!await directoryOrNull(orphanRoot)) return 0
+  let items = 0
+  for (const id of await entriesOrEmpty(orphanRoot)) {
+    if (!UUID_PATTERN.test(id)) continue
+    const bucket = path.join(orphanRoot, id)
+    if (!await directoryOrNull(bucket)) continue
+    const orphanPath = path.join(bucket, '.orphan.json')
+    const orphanStat = await lstatOrNull(orphanPath)
+    if (!orphanStat || orphanStat.isSymbolicLink() || !orphanStat.isFile()) continue
+    try {
+      const manifest = JSON.parse(await fs.readFile(orphanPath, 'utf8'))
+      if (
+        manifest?.version !== 1 || manifest.id !== id || manifest.workspaceKey !== workspaceKey ||
+        !safeRelativePath(manifest.path) || typeof manifest.createdAt !== 'string' ||
+        !Number.isFinite(Date.parse(manifest.createdAt)) || typeof manifest.reason !== 'string' ||
+        (manifest.trashEntryId !== null && !UUID_PATTERN.test(manifest.trashEntryId || ''))
+      ) continue
+      const ownerPath = path.join(bucket, '.owner.json')
+      const ownerStat = await lstatOrNull(ownerPath)
+      let owner = null
+      if (ownerStat) {
+        if (ownerStat.isSymbolicLink() || !ownerStat.isFile()) continue
+        const parsed = JSON.parse(await fs.readFile(ownerPath, 'utf8'))
+        if (parsed?.version !== 1 || typeof parsed.path !== 'string' || parsed.path !== manifest.path) continue
+        owner = parsed.path
+      }
+      for (const name of await entriesOrEmpty(bucket)) {
+        if (!name.endsWith('.json') || !UUID_PATTERN.test(name.slice(0, -'.json'.length))) continue
+        const entryPath = path.join(bucket, name)
+        const entryStat = await lstatOrNull(entryPath)
+        if (!entryStat || entryStat.isSymbolicLink() || !entryStat.isFile()) continue
+        try {
+          const entry = JSON.parse(await fs.readFile(entryPath, 'utf8'))
+          if (
+            entry?.version === 1 && entry.id === name.slice(0, -'.json'.length) &&
+            (owner === null ? entry.path === manifest.path : owner === manifest.path) &&
+            safeRelativePath(entry.path) && typeof entry.contentBase64 === 'string' &&
+            typeof entry.savedAt === 'string'
+          ) items += 1
+        } catch {}
+      }
+    } catch {}
   }
   return items
 }

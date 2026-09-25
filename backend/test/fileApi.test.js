@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createZip } from './zipFixture.js'
 
@@ -119,6 +120,141 @@ test('file API requires revisions, returns structured conflicts, and restores gu
   assert.equal((await duplicateCreate.json()).code, 'FILE_CONFLICT')
 })
 
+test('file API confines text editing to valid Markdown and downloads attachment bytes unchanged', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-types-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-types-recovery-')
+  const attachmentBytes = Buffer.from([0x00, 0xff, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a])
+  const invalidUtf8Bytes = Buffer.from([0x23, 0x20, 0xc3, 0x28])
+  const nulTextBytes = Buffer.from('looks textual\0but is not')
+  await fs.writeFile(path.join(workspace, 'readme.markdown'), '# searchable note')
+  await fs.writeFile(path.join(workspace, 'archive.bin'), attachmentBytes)
+  await fs.writeFile(path.join(workspace, 'invalid.md'), invalidUtf8Bytes)
+  await fs.writeFile(path.join(workspace, 'nul.markdown'), nulTextBytes)
+  let fifoCreated = false
+  if (process.platform !== 'win32') {
+    try {
+      execFileSync('mkfifo', [path.join(workspace, 'blocked.md')])
+      fifoCreated = true
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const check = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'X-Workspace-Id': check.workspaceId,
+    'X-Workspace-Version': String(check.workspaceVersion),
+    'Content-Type': 'application/json',
+  }
+  const get = filePath => fetch(`${baseUrl}/api/workspace/file?path=${encodeURIComponent(filePath)}`, { headers })
+  const download = filePath => fetch(`${baseUrl}/api/workspace/download?path=${encodeURIComponent(filePath)}`, { headers })
+
+  const tree = await (await fetch(`${baseUrl}/api/workspace?recursive=1`, { headers })).json()
+  assert.ok(tree.some(item => item.path === 'archive.bin'))
+  assert.ok(tree.some(item => item.path === 'readme.markdown'))
+  if (fifoCreated) assert.ok(!tree.some(item => item.path === 'blocked.md'))
+
+  const markdown = await get('readme.markdown')
+  assert.equal(markdown.status, 200)
+  const markdownData = await markdown.json()
+  assert.equal(markdownData.content, '# searchable note')
+  const search = await fetch(`${baseUrl}/api/workspace/search?q=${encodeURIComponent('searchable')}`, { headers })
+  assert.deepEqual((await search.json()).map(item => item.path), ['readme.markdown'])
+  const markdownSave = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'readme.markdown', content: '# searchable note\nupdated', expectedRevision: markdownData.revision }),
+  })
+  assert.equal(markdownSave.status, 200)
+  const savedMarkdown = await markdownSave.json()
+  assert.equal(savedMarkdown.success, true)
+  const secondMarkdownSave = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'readme.markdown', content: '# searchable note\nsecond update', expectedRevision: savedMarkdown.revision }),
+  })
+  assert.equal(secondMarkdownSave.status, 200)
+  const savedAgain = await secondMarkdownSave.json()
+  const markdownHistory = await fetch(`${baseUrl}/api/workspace/file/history?path=readme.markdown`, { headers })
+  const history = await markdownHistory.json()
+  assert.equal(markdownHistory.status, 200)
+  assert.equal(history.history.length, 2)
+  const restoredMarkdown = await fetch(`${baseUrl}/api/workspace/file/restore`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ path: 'readme.markdown', historyId: history.history[0].id, expectedRevision: savedAgain.revision }),
+  })
+  assert.equal(restoredMarkdown.status, 200)
+  assert.equal((await get('readme.markdown').then(response => response.json())).content, '# searchable note\nupdated')
+
+  const unsupportedRead = await get('archive.bin')
+  assert.equal(unsupportedRead.status, 400)
+  assert.equal((await unsupportedRead.json()).code, 'UNSUPPORTED_FILE_TYPE')
+  const invalidRead = await get('invalid.md')
+  assert.equal(invalidRead.status, 400)
+  assert.equal((await invalidRead.json()).code, 'INVALID_UTF8')
+  const nulRead = await get('nul.markdown')
+  assert.equal(nulRead.status, 400)
+  assert.equal((await nulRead.json()).code, 'INVALID_TEXT_FILE')
+
+  const badPut = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'archive.bin', content: 'replacement', expectedRevision: null }),
+  })
+  assert.equal(badPut.status, 400)
+  assert.equal((await badPut.json()).code, 'UNSUPPORTED_FILE_TYPE')
+  const overwriteInvalidMarkdown = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({
+      path: 'invalid.md', content: 'replacement',
+      expectedRevision: createHash('sha256').update(invalidUtf8Bytes).digest('hex'),
+    }),
+  })
+  assert.equal(overwriteInvalidMarkdown.status, 400)
+  assert.equal((await overwriteInvalidMarkdown.json()).code, 'INVALID_UTF8')
+  assert.deepEqual(await fs.readFile(path.join(workspace, 'invalid.md')), invalidUtf8Bytes)
+
+  const invalidRestore = await fetch(`${baseUrl}/api/workspace/file/restore`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ path: 'invalid.md', historyId: 'not-a-history', expectedRevision: createHash('sha256').update(invalidUtf8Bytes).digest('hex') }),
+  })
+  assert.equal(invalidRestore.status, 400)
+  assert.equal((await invalidRestore.json()).code, 'INVALID_UTF8')
+  const attachmentHistory = await fetch(`${baseUrl}/api/workspace/file/history?path=archive.bin`, { headers })
+  assert.equal(attachmentHistory.status, 400)
+  assert.equal((await attachmentHistory.json()).code, 'UNSUPPORTED_FILE_TYPE')
+
+  const downloaded = await download('archive.bin')
+  assert.equal(downloaded.status, 200)
+  assert.match(downloaded.headers.get('content-disposition'), /archive\.bin/)
+  assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), attachmentBytes)
+  const unguardedDownload = await fetch(`${baseUrl}/api/workspace/download?path=archive.bin`)
+  assert.equal(unguardedDownload.status, 409)
+  assert.equal((await unguardedDownload.json()).code, 'WORKSPACE_MISMATCH')
+  const traversalDownload = await download('../outside.bin')
+  assert.equal(traversalDownload.status, 400)
+  if (process.platform !== 'win32') {
+    const outsideAttachment = path.join(recovery, 'outside.bin')
+    await fs.writeFile(outsideAttachment, Buffer.from('outside'))
+    await fs.symlink(outsideAttachment, path.join(workspace, 'linked.bin'))
+    const symlinkDownload = await download('linked.bin')
+    assert.equal(symlinkDownload.status, 400)
+  }
+  const rawMarkdown = await download('invalid.md')
+  assert.equal(rawMarkdown.status, 200)
+  assert.deepEqual(Buffer.from(await rawMarkdown.arrayBuffer()), invalidUtf8Bytes)
+
+  if (fifoCreated) {
+    const fifoRead = await get('blocked.md')
+    assert.equal(fifoRead.status, 400)
+    assert.equal((await fifoRead.json()).code, 'UNSUPPORTED_FILE_TYPE')
+    const fifoWrite = await fetch(`${baseUrl}/api/workspace`, {
+      method: 'PUT', headers,
+      body: JSON.stringify({ path: 'blocked.md', content: 'must not block', expectedRevision: null }),
+    })
+    assert.equal(fifoWrite.status, 400)
+    assert.equal((await fifoWrite.json()).code, 'UNSUPPORTED_FILE_TYPE')
+  }
+})
+
 test('trash and ZIP routes honor workspace identity, preserve hidden files, and handle collisions and limits', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-api-trash-workspace-')
   const recovery = await temporaryDirectory(t, 'standalone-editor-api-trash-recovery-')
@@ -170,7 +306,12 @@ test('trash and ZIP routes honor workspace identity, preserve hidden files, and 
     method: 'POST', headers: jsonHeaders, body: JSON.stringify({ id: trashEntry.id }),
   })
   assert.equal(restored.status, 200)
-  assert.deepEqual(await restored.json(), { success: true, path: '.project' })
+  assert.deepEqual(await restored.json(), {
+    success: true,
+    path: '.project',
+    historyReattached: 0,
+    historyOrphaned: 0,
+  })
   assert.equal(await fs.readFile(path.join(hiddenDirectory, '.private-state'), 'utf8'), 'kept')
   assert.equal(await fs.readFile(path.join(hiddenDirectory, 'note.md'), 'utf8'), '# kept')
   assert.deepEqual((await (await fetch(`${baseUrl}/api/workspace/trash`, { headers })).json()).items, [])

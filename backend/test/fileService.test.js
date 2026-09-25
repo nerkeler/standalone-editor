@@ -1,14 +1,23 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash } from 'node:crypto'
 import {
   listAll,
+  listDir,
   listTree,
   listFileHistory,
   deleteFileHistory,
+  archiveFileHistory,
+  listOrphanFileHistory,
+  deleteOrphanFileHistory,
+  readOrphanFileHistory,
+  restoreOrphanFileHistory,
+  reattachTrashFileHistory,
+  createItem,
   moveItem,
   searchWorkspace,
   writeFile,
@@ -71,6 +80,69 @@ test('uploads keep binary bytes and refuse replacement', async t => {
   assert.deepEqual(await fs.readFile(path.join(workspace, 'asset.bin')), bytes)
 })
 
+test('Markdown uploads detach stale path history before creating the new file', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'generation A')
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'generation A current', opened.revision, { root: recovery })
+  const oldHistory = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  assert.equal(oldHistory.length, 1)
+
+  // Simulate an external deletion, which leaves the path-keyed bucket behind.
+  await fs.unlink(target)
+  await uploadFile(workspace, '', {
+    originalname: 'note.md',
+    buffer: Buffer.from('generation B'),
+  }, { root: recovery })
+
+  assert.equal(await fs.readFile(target, 'utf8'), 'generation B')
+  assert.deepEqual((await listFileHistory(workspace, 'note.md', { root: recovery })).history, [])
+  const orphan = (await listOrphanFileHistory(workspace, { root: recovery })).items[0]
+  assert.equal(orphan.path, 'note.md')
+  assert.equal(orphan.reason, 'path-reused')
+  assert.equal(orphan.history[0].id, oldHistory[0].id)
+})
+
+test('trees expose regular attachments but omit special files and Markdown search includes .markdown', async t => {
+  const workspace = await temporaryWorkspace(t)
+  await fs.mkdir(path.join(workspace, 'docs'))
+  await fs.writeFile(path.join(workspace, 'docs', 'guide.markdown'), 'body has an extended-format needle')
+  await fs.writeFile(path.join(workspace, 'archive.sqlite'), Buffer.from([0x00, 0xff, 0x01]))
+
+  let fifoCreated = false
+  if (process.platform !== 'win32') {
+    try {
+      execFileSync('mkfifo', [path.join(workspace, 'blocked.md')])
+      fifoCreated = true
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+
+  const rootEntries = await listDir(workspace)
+  assert.ok(rootEntries.some(item => item.path === 'archive.sqlite' && item.type === 'file'))
+  const recursiveEntries = await listTree(workspace)
+  assert.ok(recursiveEntries.some(item => item.path === 'docs/guide.markdown'))
+  if (fifoCreated) {
+    assert.ok(!rootEntries.some(item => item.path === 'blocked.md'))
+    assert.ok(!recursiveEntries.some(item => item.path === 'blocked.md'))
+    await assert.rejects(readFile(workspace, 'blocked.md'), error => error.code === 'UNSUPPORTED_FILE_TYPE')
+  }
+
+  const results = await searchWorkspace(workspace, 'extended-format')
+  assert.equal(results.find(item => item.path === 'docs/guide.markdown')?.preview, 'body has an extended-format needle')
+  await assert.rejects(
+    writeFile(workspace, 'archive.sqlite', 'text replacement', null),
+    error => error.code === 'UNSUPPORTED_FILE_TYPE',
+  )
+  await assert.rejects(
+    writeFile(workspace, 'new.md', String.fromCharCode(0xd800), null),
+    error => error.code === 'INVALID_UTF8',
+  )
+})
+
 test('recursive tree uses the workspace-relative shape and omits hidden and symlink entries', async t => {
   const workspace = await temporaryWorkspace(t)
   const outside = await temporaryWorkspace(t)
@@ -128,7 +200,7 @@ test('workspace search keeps name and Markdown matching, previews and tree order
     if (item.name.toLowerCase().includes('needle')) {
       expectedOrder.push(item.path)
     } else if (
-      item.name.toLowerCase().endsWith('.md') &&
+      /\.(?:md|markdown)$/i.test(item.name) &&
       (await fs.readFile(path.join(workspace, item.path), 'utf8')).toLowerCase().includes('needle')
     ) {
       expectedOrder.push(item.path)
@@ -465,7 +537,7 @@ test('multi-level missing recovery roots inside the workspace are rejected on wr
   await assert.rejects(fs.lstat(recovery), error => error.code === 'ENOENT')
 })
 
-test('file move migrates history; history conflicts and injected failures roll back note and metadata paths', async t => {
+test('file moves migrate source history and preserve old destination history as an orphan', async t => {
   const workspace = await temporaryWorkspace(t)
   const recovery = await temporaryRecovery(t)
   await fs.mkdir(path.join(workspace, 'folder'))
@@ -484,25 +556,181 @@ test('file move migrates history; history conflicts and injected failures roll b
   assert.equal((await listFileHistory(workspace, 'folder/one.md', { root: recovery })).history.length, 1)
   assert.deepEqual((await listFileHistory(workspace, 'moved.md', { root: recovery })).history, [])
 
-  // A prior history chain at the destination blocks the move before either
-  // the note path or source metadata is changed.
+  // A previous occupant's history is detached from the reusable path. It no
+  // longer blocks a different file from moving there or becomes its history.
   await fs.writeFile(path.join(workspace, 'moved.md'), 'previous occupant')
   const occupant = await readFile(workspace, 'moved.md')
   await writeFile(workspace, 'moved.md', 'replaced occupant', occupant.revision, { root: recovery })
   await fs.unlink(path.join(workspace, 'moved.md'))
-  await assert.rejects(
-    moveItem(workspace, 'folder/one.md', 'moved.md', { root: recovery }),
-    error => error.code === 'HISTORY_CONFLICT',
-  )
-  assert.equal(await fs.readFile(path.join(workspace, 'folder', 'one.md'), 'utf8'), 'one updated')
-  assert.equal((await listFileHistory(workspace, 'folder/one.md', { root: recovery })).history.length, 1)
+  await moveItem(workspace, 'folder/one.md', 'moved.md', { root: recovery })
+  assert.equal(await fs.readFile(path.join(workspace, 'moved.md'), 'utf8'), 'one updated')
+  const movedHistory = (await listFileHistory(workspace, 'moved.md', { root: recovery })).history
+  assert.equal(movedHistory.length, 1)
+  assert.equal(movedHistory[0].sourcePath, 'folder/one.md')
+  const oldOccupantHistory = await listOrphanFileHistory(workspace, { root: recovery })
+  assert.equal(oldOccupantHistory.items.length, 1)
+  assert.equal(oldOccupantHistory.items[0].path, 'moved.md')
+  assert.equal(oldOccupantHistory.items[0].history.length, 1)
 
   await moveItem(workspace, 'folder', 'renamed', { root: recovery })
-  const migrated = await listFileHistory(workspace, 'renamed/one.md', { root: recovery })
+  const migrated = await listFileHistory(workspace, 'renamed/two.md', { root: recovery })
   assert.equal(migrated.history.length, 1)
-  assert.equal(migrated.history[0].sourcePath, 'folder/one.md')
-  const now = await readFile(workspace, 'renamed/one.md')
-  const restored = await restoreFileHistory(workspace, 'renamed/one.md', migrated.history[0].id, now.revision, { root: recovery })
-  assert.equal(restored.revision, one.revision)
-  assert.equal(await fs.readFile(path.join(workspace, 'renamed', 'one.md'), 'utf8'), 'one')
+  assert.equal(migrated.history[0].sourcePath, 'folder/two.md')
+  const now = await readFile(workspace, 'renamed/two.md')
+  const restored = await restoreFileHistory(workspace, 'renamed/two.md', migrated.history[0].id, now.revision, { root: recovery })
+  assert.equal(restored.revision, two.revision)
+  assert.equal(await fs.readFile(path.join(workspace, 'renamed', 'two.md'), 'utf8'), 'two')
+})
+
+test('trash history is separated from same-path files and remains restorable after path reuse', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const otherWorkspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const note = path.join(workspace, 'note.md')
+  await fs.writeFile(note, 'generation A')
+  const firstRevision = (await readFile(workspace, 'note.md')).revision
+  await writeFile(workspace, 'note.md', 'generation A current', firstRevision, { root: recovery })
+  const firstHistory = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  assert.equal(firstHistory.length, 1)
+
+  const trashId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+  const payload = path.join(recovery, 'trash-payload')
+  await fs.rename(note, payload)
+  await archiveFileHistory(workspace, 'note.md', { root: recovery, reason: 'trash', trashEntryId: trashId })
+  assert.deepEqual((await listFileHistory(workspace, 'note.md', { root: recovery })).history, [])
+  let orphans = await listOrphanFileHistory(workspace, { root: recovery })
+  assert.equal(orphans.items.length, 1)
+  assert.equal(orphans.items[0].trashEntryId, trashId)
+  assert.equal(orphans.items[0].history[0].revision, firstRevision)
+
+  // A new document starts a fresh active chain even though the old history is
+  // still available in the orphan manager.
+  await createItem(workspace, '', 'file', 'note.md', { root: recovery })
+  const empty = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'generation B', empty.revision, { root: recovery })
+  const secondHistory = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  assert.equal(secondHistory.length, 1)
+  assert.equal(secondHistory[0].revision, empty.revision)
+  assert.notEqual(secondHistory[0].revision, firstRevision)
+
+  // Moving the new file away clears the path; another historical file can
+  // then move into it without inheriting either older generation.
+  await moveItem(workspace, 'note.md', 'generation-b.md', { root: recovery })
+  await fs.writeFile(path.join(workspace, 'source.md'), 'generation C')
+  const sourceRevision = (await readFile(workspace, 'source.md')).revision
+  await writeFile(workspace, 'source.md', 'generation C current', sourceRevision, { root: recovery })
+  await moveItem(workspace, 'source.md', 'note.md', { root: recovery })
+  const thirdHistory = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  assert.equal(thirdHistory.length, 1)
+  assert.equal(thirdHistory[0].revision, sourceRevision)
+  assert.equal((await listOrphanFileHistory(workspace, { root: recovery })).items.length, 1)
+
+  await fs.rm(payload)
+  orphans = await listOrphanFileHistory(workspace, { root: recovery })
+  assert.equal(orphans.items.length, 1)
+  assert.equal((await listOrphanFileHistory(otherWorkspace, { root: recovery })).items.length, 0)
+})
+
+test('directory trash archives each Markdown history and trash restore reattaches only conflict-free paths', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const folder = path.join(workspace, 'folder')
+  await fs.mkdir(folder)
+  await fs.writeFile(path.join(folder, 'one.md'), 'one before')
+  await fs.writeFile(path.join(folder, 'two.markdown'), 'two before')
+  for (const relative of ['folder/one.md', 'folder/two.markdown']) {
+    const opened = await readFile(workspace, relative)
+    await writeFile(workspace, relative, `${relative} current`, opened.revision, { root: recovery })
+  }
+  const trashId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'
+  const payload = path.join(recovery, 'folder-payload')
+  await fs.rename(folder, payload)
+  await archiveFileHistory(workspace, 'folder', {
+    root: recovery,
+    reason: 'trash',
+    trashEntryId: trashId,
+    includeDescendants: true,
+  })
+  let orphans = await listOrphanFileHistory(workspace, { root: recovery })
+  assert.deepEqual(orphans.items.map(item => item.path).sort(), ['folder/one.md', 'folder/two.markdown'])
+  assert.deepEqual((await reattachTrashFileHistory(workspace, trashId, { root: recovery })), { reattached: 0, retained: 2 })
+
+  await fs.rename(payload, folder)
+  const reattached = await reattachTrashFileHistory(workspace, trashId, { root: recovery })
+  assert.deepEqual(reattached, { reattached: 2, retained: 0 })
+  assert.equal((await listFileHistory(workspace, 'folder/one.md', { root: recovery })).history.length, 1)
+  assert.equal((await listFileHistory(workspace, 'folder/two.markdown', { root: recovery })).history.length, 1)
+  assert.deepEqual((await listOrphanFileHistory(workspace, { root: recovery })).items, [])
+})
+
+test('deleting the final history record removes the empty active bucket', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'before')
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'after', opened.revision, { root: recovery })
+  const history = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  const workspaceKey = createHash('sha256').update(await fs.realpath(workspace)).digest('hex')
+  const fileKey = createHash('sha256').update('note.md').digest('hex')
+  const bucket = path.join(recovery, 'history', workspaceKey, fileKey)
+  await fs.access(bucket)
+
+  await deleteFileHistory(workspace, 'note.md', history[0].id, { root: recovery })
+  await assert.rejects(fs.lstat(bucket), error => error.code === 'ENOENT')
+  assert.deepEqual((await listFileHistory(workspace, 'note.md', { root: recovery })).history, [])
+})
+
+test('orphan histories preview as strict UTF-8, restore with revisions, and delete within one workspace', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const otherWorkspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'recover this text')
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'current text', opened.revision, { root: recovery })
+  const historyId = (await listFileHistory(workspace, 'note.md', { root: recovery })).history[0].id
+  const trashId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc'
+  await archiveFileHistory(workspace, 'note.md', { root: recovery, reason: 'trash', trashEntryId: trashId })
+  const orphanId = (await listOrphanFileHistory(workspace, { root: recovery })).items[0].id
+
+  const preview = await readOrphanFileHistory(workspace, orphanId, historyId, { root: recovery })
+  assert.equal(preview.content, 'recover this text')
+  assert.equal(preview.entry.revision, opened.revision)
+  await assert.rejects(
+    readOrphanFileHistory(otherWorkspace, orphanId, historyId, { root: recovery }),
+    error => error.code === 'HISTORY_NOT_FOUND',
+  )
+
+  const restored = await restoreOrphanFileHistory(
+    workspace, orphanId, historyId, 'restored.md', null, { root: recovery },
+  )
+  assert.equal(restored.revision, opened.revision)
+  assert.equal(await fs.readFile(path.join(workspace, 'restored.md'), 'utf8'), 'recover this text')
+  await assert.rejects(
+    restoreOrphanFileHistory(workspace, orphanId, historyId, 'restored.md', null, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT',
+  )
+  assert.equal((await listOrphanFileHistory(workspace, { root: recovery })).items.length, 1)
+  const removed = await deleteOrphanFileHistory(workspace, orphanId, { root: recovery })
+  assert.equal(removed.deletedHistory, 1)
+  assert.deepEqual((await listOrphanFileHistory(workspace, { root: recovery })).items, [])
+})
+
+test('failed history archive leaves active records intact for the caller to roll back', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'before')
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'after', opened.revision, { root: recovery })
+
+  await assert.rejects(
+    archiveFileHistory(workspace, 'note.md', {
+      root: recovery,
+      reason: 'trash',
+      trashEntryId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+      moveHistoryBucket: async () => { throw new Error('injected archive rename failure') },
+    }),
+    error => error.code === 'RECOVERY_STORAGE_ERROR',
+  )
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
+  assert.deepEqual((await listOrphanFileHistory(workspace, { root: recovery })).items, [])
 })

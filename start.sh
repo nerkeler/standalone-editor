@@ -69,7 +69,10 @@ wait_for_service() {
   exit 1
 }
 
-wait_for_service "http://$EDITOR_HOST_VALUE:$EDITOR_PORT_VALUE/api/workspace/check" "后端"
+# The backend can be healthy while a previously saved workspace is offline.
+# In that case /api/workspace/check intentionally returns 503 so the browser
+# can explain the problem and offer a different directory.
+wait_for_service "http://$EDITOR_HOST_VALUE:$EDITOR_PORT_VALUE/api/health" "后端"
 wait_for_service "http://127.0.0.1:$FRONTEND_PORT_VALUE/" "前端"
 
 echo "✅ 服务已启动"

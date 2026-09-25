@@ -1,42 +1,40 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react'
-import { Button, message, Modal, Breadcrumb, Spin } from 'antd'
-import { FolderOpenOutlined, EditOutlined, ArrowLeftOutlined, LoadingOutlined } from '@ant-design/icons'
-import { api, getWorkspaceContext, setWorkspaceContext } from '../api'
+import React, { useState, useCallback, useRef } from 'react'
+import { Alert, Button, Modal, Breadcrumb, Spin } from 'antd'
+import { FolderOpenOutlined, ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
+import { api, setWorkspaceContext } from '../api'
 
 const DIRS_API = '/api/dirs'
 const WS_API = '/api/workspace'
 
-export default function Welcome({ onEnter }) {
-  const [currentWorkspace, setCurrentWorkspace] = useState('')
-  const [loading, setLoading] = useState(true)
+const knownErrors = {
+  RECOVERY_ROOT_INSIDE_WORKSPACE: '恢复数据目录位于所选工作区内部。请调整恢复目录或选择其他工作区。',
+  WORKSPACE_INSIDE_RECOVERY_ROOT: '所选工作区位于恢复数据目录内部。请调整恢复目录或选择其他工作区。',
+  WORKSPACE_CONFIG_INVALID: '工作区配置无效。请重新选择一个目录。',
+  WORKSPACE_CONFIG_UNREADABLE: '无法读取工作区配置。请重新选择一个目录。',
+  SAVED_WORKSPACE_UNAVAILABLE: '上次使用的工作区当前不可访问。请重新连接磁盘后重试，或选择其他目录。',
+}
+
+function errorMessage(error, fallback) {
+  const payload = error?.response?.data || {}
+  return knownErrors[payload.code || payload.errorCode]
+    || payload.error
+    || payload.message
+    || error?.message
+    || fallback
+}
+
+export default function Welcome({ diagnostic, onRetry, onEnter }) {
   const [pickerVisible, setPickerVisible] = useState(false)
   const [pickerData, setPickerData] = useState(null)
   const [pickerLoading, setPickerLoading] = useState(false)
   const [confirming, setConfirming] = useState(false)
-  const [error, setError] = useState('')
+  const [pickerError, setPickerError] = useState('')
   const pickerRequestRef = useRef(0)
   const confirmRequestRef = useRef(0)
 
-  useEffect(() => {
-    // 每次进入都从后端取得工作空间标识，避免另一个窗口切换目录后继续使用旧状态。
-    api.get(`${WS_API}/check`)
-      .then(res => {
-        const info = res.data
-        const ws = info.workspace
-        setWorkspaceContext(info)
-        setCurrentWorkspace(ws)
-        setLoading(false)
-      })
-      .catch(() => {
-        const saved = getWorkspaceContext()
-        if (saved?.workspace) setCurrentWorkspace(saved.workspace)
-        setLoading(false)
-      })
-  }, [])
-
   const loadPickerDir = useCallback((dir = '', { fallbackToRoot = false } = {}) => {
     const requestId = ++pickerRequestRef.current
-    setError('')
+    setPickerError('')
     setPickerLoading(true)
     const url = dir ? `${DIRS_API}?path=${encodeURIComponent(dir)}` : DIRS_API
     api.get(url)
@@ -51,23 +49,21 @@ export default function Welcome({ onEnter }) {
           loadPickerDir('')
           return
         }
-        setError(String(err.response?.data?.error || err.message || 'unknown error'))
+        setPickerError(errorMessage(err, '无法读取目录'))
         setPickerData(null)
         setPickerLoading(false)
       })
   }, [])
 
   const openPicker = () => {
-    // Start at the active workspace when it is available. This keeps the
-    // picker usable when the backend allow-list is narrower than $HOME (as it
-    // is for a sandbox or a macOS volume), while the backend falls back to a
-    // legal configured root for a fresh session.
-    const start = currentWorkspace || getWorkspaceContext()?.workspace || ''
+    // No cached workspace is trusted here. /api/dirs is deliberately
+    // context-free so a picker remains available when the saved path is gone.
+    const start = ''
     pickerRequestRef.current += 1
     setPickerData(null)
-    setError('')
+    setPickerError('')
     setPickerVisible(true)
-    loadPickerDir(start, { fallbackToRoot: Boolean(start) })
+    loadPickerDir(start)
   }
 
   const enterDir = (entry) => {
@@ -90,18 +86,16 @@ export default function Welcome({ onEnter }) {
       .then(res => {
         if (requestId !== confirmRequestRef.current) return
         const info = res.data
-        const ws = info.workspace
         setWorkspaceContext(info)
-        setCurrentWorkspace(ws)
         setPickerVisible(false)
         setConfirming(false)
         setPickerLoading(false)
-        message.success(`已切换到：${ws}`)
+        // App performs /api/workspace/check before mounting the editor.
         onEnter(info)
       })
       .catch(err => {
         if (requestId !== confirmRequestRef.current) return
-        message.error(err.response?.data?.error || '切换目录失败')
+        setPickerError(errorMessage(err, '切换目录失败'))
         setConfirming(false)
         setPickerLoading(false)
       })
@@ -125,49 +119,54 @@ export default function Welcome({ onEnter }) {
         padding: '32px 40px', boxShadow: 'var(--shadow-lg)',
         display: 'flex', flexDirection: 'column', gap: 20, minWidth: 380,
       }}>
-        {loading ? (
-          <Spin indicator={<LoadingOutlined spin />} />
-        ) : (
-          <>
-            <div style={{
-              background: 'var(--color-bg-muted)', borderRadius: 10,
-              padding: '12px 16px', fontSize: 13,
-              color: 'var(--color-text-secondary)',
-              wordBreak: 'break-all',
-            }}>
-              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>
-                当前工作目录
+        {diagnostic && (
+          <Alert
+            type="warning"
+            showIcon
+            message={diagnostic.message || errorMessage({ response: { data: diagnostic } }, '工作区尚未通过校验')}
+            description={(
+              <div style={{ wordBreak: 'break-all' }}>
+                {diagnostic.workspace ? (
+                  <div>
+                    <div>上次记录的路径（当前未验证）：</div>
+                    <code>{diagnostic.workspace}</code>
+                  </div>
+                ) : diagnostic.configurationFile ? (
+                  <div>
+                    <div>无法读取的配置文件：</div>
+                    <code>{diagnostic.configurationFile}</code>
+                  </div>
+                ) : '当前没有可用且已验证的工作区。'}
+                {diagnostic.detail && diagnostic.detail !== diagnostic.message && (
+                  <div style={{ marginTop: 6 }}>后端信息：{diagnostic.detail}</div>
+                )}
               </div>
-              <div style={{ fontWeight: 600, fontFamily: 'monospace' }}>
-                {currentWorkspace || '未选择工作目录'}
-              </div>
-              <div style={{ fontSize: 11, marginTop: 6, color: 'var(--color-success)' }}>
-                已保存在此浏览器，下次打开会自动进入
-              </div>
-            </div>
-
-            <Button
-              size="large"
-              icon={<FolderOpenOutlined />}
-              onClick={openPicker}
-              block
-              style={{ height: 52, borderRadius: 10, fontSize: 15 }}
-            >
-              选择工作目录
-            </Button>
-
-            <Button
-              size="large"
-              icon={<EditOutlined />}
-              onClick={() => onEnter(getWorkspaceContext() || currentWorkspace)}
-              disabled={!currentWorkspace}
-              block
-              style={{ height: 52, borderRadius: 10, fontSize: 15 }}
-            >
-              打开当前目录
-            </Button>
-          </>
+            )}
+            action={(
+              <Button size="small" icon={<ReloadOutlined />} onClick={onRetry}>
+                重试
+              </Button>
+            )}
+          />
         )}
+
+        <div style={{
+          background: 'var(--color-bg-muted)', borderRadius: 10,
+          padding: '12px 16px', fontSize: 13,
+          color: 'var(--color-text-secondary)',
+        }}>
+          选择一个可访问的工作目录后，编辑器会先向后端确认再打开。
+        </div>
+
+        <Button
+          size="large"
+          icon={<FolderOpenOutlined />}
+          onClick={openPicker}
+          block
+          style={{ height: 52, borderRadius: 10, fontSize: 15 }}
+        >
+          选择工作目录
+        </Button>
       </div>
 
       {/* 目录选择器弹窗 */}
@@ -182,7 +181,7 @@ export default function Welcome({ onEnter }) {
         cancelText="取消"
         width={560}
       >
-        {error && <div style={{ padding: '6px 8px', fontSize: 12, color: 'var(--color-danger)', background: 'color-mix(in srgb, var(--color-danger) 12%, var(--color-bg-card))', borderRadius: 4, marginBottom: 8 }}>{error}</div>}
+        {pickerError && <div role="alert" style={{ padding: '6px 8px', fontSize: 12, color: 'var(--color-danger)', background: 'color-mix(in srgb, var(--color-danger) 12%, var(--color-bg-card))', borderRadius: 4, marginBottom: 8 }}>{pickerError}</div>}
 
         {/* Root locations come from the host. Keep the complete path in the
             tooltip and use the backend-provided path when navigating so this
