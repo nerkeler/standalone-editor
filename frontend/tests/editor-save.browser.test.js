@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -283,6 +283,56 @@ async function clickAriaButton(label, connection = cdp) {
   await connection.evaluate(`document.querySelector('button[aria-label="${label}"]')?.click()`)
 }
 
+async function clickExactAriaButton(label, connection = cdp) {
+  await waitUntil(`button with aria-label “${label}”`, () => connection.evaluate(
+    `Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === ${JSON.stringify(label)} && button.getBoundingClientRect().width > 0)`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(label)} && button.getBoundingClientRect().width > 0)?.click()`)
+}
+
+async function cancelVisibleConfirmation(connection = cdp) {
+  await waitUntil('confirmation cancel action', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && Array.from(dialog.querySelectorAll('.ant-modal-confirm-btns button')).some(button => !button.classList.contains('ant-btn-primary'));
+    })`,
+  ))
+  await connection.evaluate(`(() => {
+    const dialogs = Array.from(document.querySelectorAll('.ant-modal-confirm')).filter(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
+    });
+    const dialog = dialogs[dialogs.length - 1];
+    const cancel = Array.from(dialog?.querySelectorAll('.ant-modal-confirm-btns button') || []).find(button => !button.classList.contains('ant-btn-primary'));
+    cancel?.click();
+    return Boolean(cancel);
+  })()`)
+}
+
+async function hasVisibleConfirmation(connection = cdp) {
+  return connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+    const style = getComputedStyle(dialog);
+    return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
+  })`)
+}
+
+async function clickConfirmButton(text, connection = cdp) {
+  await waitUntil(`confirmation button “${text}”`, () => connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+    const style = getComputedStyle(dialog);
+    return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && Array.from(dialog.querySelectorAll('button')).some(button => button.innerText.trim() === ${JSON.stringify(text)} && !button.disabled);
+  })`))
+  await connection.evaluate(`(() => {
+    const dialogs = Array.from(document.querySelectorAll('.ant-modal-confirm')).filter(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
+    });
+    const dialog = dialogs[dialogs.length - 1];
+    const button = Array.from(dialog?.querySelectorAll('button') || []).find(item => item.innerText.trim() === ${JSON.stringify(text)} && !item.disabled);
+    button?.click();
+    return Boolean(button);
+  })()`)
+}
+
 async function clickMenuItem(text, connection = cdp) {
   await waitUntil(`menu item “${text}”`, () => connection.evaluate(
     `Array.from(document.querySelectorAll('[role="menuitem"]')).some(item => item.innerText.includes(${JSON.stringify(text)}))`,
@@ -292,6 +342,71 @@ async function clickMenuItem(text, connection = cdp) {
     item?.click();
     return Boolean(item);
   })()`)
+}
+
+async function moveFileToTrash(fileName, connection = cdp) {
+  await waitUntil(`${fileName} in the file tree before trashing`, () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+  ))
+  await connection.evaluate(`(() => {
+    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    node?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }));
+    return Boolean(node);
+  })()`)
+  await waitUntil(`${fileName} context menu to open`, () => connection.evaluate(`document.body.innerText.includes('删除')`))
+  await connection.evaluate(`(() => {
+    const action = Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '删除' && item.getBoundingClientRect().width > 0);
+    action?.click();
+    return Boolean(action);
+  })()`)
+  await clickVisibleButton('移入回收站', connection)
+  await waitUntil(`${fileName} to leave the workspace tree`, () => connection.evaluate(
+    `!Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+  ))
+  await waitUntil(`${fileName} move confirmation to close`, async () => !await hasVisibleConfirmation(connection))
+}
+
+async function readWorkspaceHistory(fileName, connection = cdp) {
+  return connection.evaluate(`(async () => {
+    const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
+    const url = new URL('/api/workspace/file/history', location.origin);
+    url.searchParams.set('path', ${JSON.stringify(fileName)});
+    const response = await fetch(url, { headers: {
+      'X-Workspace-Id': info?.workspaceId || '',
+      'X-Workspace-Version': String(info?.workspaceVersion ?? ''),
+    }});
+    return { status: response.status, data: await response.json() };
+  })()`)
+}
+
+async function readWorkspaceRecoveryStats(connection = cdp) {
+  return connection.evaluate(`(async () => {
+    const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
+    const response = await fetch('/api/workspace/recovery/stats', { headers: {
+      'X-Workspace-Id': info?.workspaceId || '',
+      'X-Workspace-Version': String(info?.workspaceVersion ?? ''),
+    }});
+    return { status: response.status, data: await response.json() };
+  })()`)
+}
+
+async function openTrash(connection = cdp) {
+  await clickAriaButton('更多目录操作', connection)
+  await clickMenuItem('回收站', connection)
+  await waitUntil('trash modal to open', () => connection.evaluate(`Boolean(document.querySelector('.ant-modal')?.innerText.includes('回收站'))`))
+}
+
+function formatDisplayedBytes(value) {
+  const bytes = Number(value)
+  if (bytes < 1024) return `${bytes.toLocaleString()} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let amount = bytes
+  let unitIndex = -1
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024
+    unitIndex += 1
+  }
+  return `${amount.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`
 }
 
 async function switchWorkspace(targetDirectoryName) {
@@ -314,7 +429,11 @@ async function switchWorkspace(targetDirectoryName) {
     `document.querySelector('.ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)}) && !Array.from(document.querySelectorAll('button')).find(item => item.innerText.trim() === '确认选择')?.disabled`,
   ))
   await clickVisibleButton('确认选择')
-  await waitUntil(`${targetDirectoryName} workspace to load`, () => pageIsReady(cdp), 12000)
+  await waitUntil(`${targetDirectoryName} workspace to load`, () => cdp.evaluate(`(() => {
+    const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
+    const currentName = String(info?.workspace || '').replace(/\\\\/g, '/').split('/').pop();
+    return currentName === ${JSON.stringify(targetDirectoryName)} && Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'));
+  })()`), 12000)
 }
 
 async function setupPage(connection = cdp) {
@@ -709,6 +828,276 @@ test('trash UI can restore a deleted file to its original path', async () => {
     return disk === secondSeed && inTree
   })
   assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
+})
+
+test('history dialog confirms per-version deletion without changing current documents', async () => {
+  const firstHistoryToken = `HISTORY-DELETE-${Date.now()}`
+  const secondHistoryToken = `OTHER-HISTORY-${Date.now()}`
+  await openFile(firstFile, firstSeed)
+  await insertAtSourceEnd(firstHistoryToken)
+  await waitUntil('first document edit to create a history entry', async () => {
+    const disk = await readFile(path.join(workspace, firstFile), 'utf8').catch(() => '')
+    const history = await readWorkspaceHistory(firstFile)
+    return disk.includes(firstHistoryToken) && history.status === 200 && history.data.history?.length
+  }, 10000)
+  await openFile(secondFile, secondSeed)
+  await insertAtSourceEnd(secondHistoryToken)
+  await waitUntil('second document edit to create a history entry', async () => {
+    const disk = await readFile(path.join(workspace, secondFile), 'utf8').catch(() => '')
+    const history = await readWorkspaceHistory(secondFile)
+    return disk.includes(secondHistoryToken) && history.status === 200 && history.data.history?.length
+  }, 10000)
+
+  const firstHistoryBefore = await readWorkspaceHistory(firstFile)
+  const secondHistoryBefore = await readWorkspaceHistory(secondFile)
+  assert.equal(firstHistoryBefore.status, 200)
+  assert.equal(secondHistoryBefore.status, 200)
+  const targetHistory = firstHistoryBefore.data.history[0]
+  const secondHistoryIds = secondHistoryBefore.data.history.map(item => item.id).sort()
+  const firstDocumentBeforeDelete = await readFile(path.join(workspace, firstFile), 'utf8')
+  const recoveryStatsBeforeDelete = await readWorkspaceRecoveryStats()
+  assert.equal(recoveryStatsBeforeDelete.status, 200)
+
+  await openFile(firstFile, firstHistoryToken)
+  await clickAriaButton('查看版本历史')
+  const historyDeleteLabel = `永久删除历史版本 ${firstFile} ${targetHistory.id}`
+  const beforeConfirmedHistoryDelete = cdp.networkRequests.length
+  await clickExactAriaButton(historyDeleteLabel)
+  await waitUntil('history delete confirmation to show its effect', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && dialog.innerText.includes('当前文档内容不会被删除或修改') && dialog.innerText.includes('无法从编辑器恢复');
+    })`,
+  ))
+  const beforeHistoryCancel = cdp.networkRequests.length
+  await cancelVisibleConfirmation()
+  await waitUntil('history delete confirmation to close after cancel', async () => !await hasVisibleConfirmation())
+  const canceledHistoryRequests = cdp.networkRequests.slice(beforeHistoryCancel).filter(request =>
+    request.method === 'DELETE' && new URL(request.url).pathname.endsWith('/api/workspace/file/history'),
+  )
+  assert.equal(canceledHistoryRequests.length, 0, 'canceling confirmation must not send a history delete request')
+  assert.ok(await cdp.evaluate(`Boolean(document.querySelector('button[aria-label=${JSON.stringify(historyDeleteLabel)}]'))`), 'the canceled history entry must remain available')
+
+  await clickExactAriaButton(historyDeleteLabel)
+  await clickConfirmButton('永久删除历史版本')
+  await waitUntil('history deletion confirmation to finish', async () => !await hasVisibleConfirmation())
+  await waitUntil('history entry to disappear from the browser list', () => cdp.evaluate(
+    `!Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === ${JSON.stringify(historyDeleteLabel)})`,
+  ))
+  const firstHistoryAfter = await readWorkspaceHistory(firstFile)
+  const secondHistoryAfter = await readWorkspaceHistory(secondFile)
+  assert.equal(firstHistoryAfter.status, 200)
+  assert.equal(secondHistoryAfter.status, 200)
+  assert.ok(!firstHistoryAfter.data.history.some(item => item.id === targetHistory.id), 'the confirmed item must be removed')
+  assert.deepEqual(secondHistoryAfter.data.history.map(item => item.id).sort(), secondHistoryIds, 'deleting one file history must preserve another file history')
+  assert.equal(await readFile(path.join(workspace, firstFile), 'utf8'), firstDocumentBeforeDelete, 'deleting history must not change the current document')
+  await waitUntil('successful history deletion to refresh recovery statistics', () => cdp.networkRequests.slice(beforeConfirmedHistoryDelete).some(request =>
+    request.method === 'GET' && new URL(request.url).pathname.endsWith('/api/workspace/recovery/stats'),
+  ))
+  const recoveryStatsAfterDelete = await readWorkspaceRecoveryStats()
+  assert.equal(recoveryStatsAfterDelete.data.history.items, recoveryStatsBeforeDelete.data.history.items - 1)
+})
+
+test('trash dialog reports storage and limits permanent cleanup to confirmed expired items', async () => {
+  const workspaceHistoryToken = `RECOVERY-STATS-${Date.now()}`
+  await openFile(firstFile, firstSeed)
+  await insertAtSourceEnd(workspaceHistoryToken)
+  await waitUntil('workspace history to exist for the storage display', async () => {
+    const disk = await readFile(path.join(workspace, firstFile), 'utf8').catch(() => '')
+    const history = await readWorkspaceHistory(firstFile)
+    return disk.includes(workspaceHistoryToken) && history.status === 200 && history.data.history?.length
+  }, 10000)
+
+  const expiredName = `expired-${Date.now()}.md`
+  const retainedName = `retained-${Date.now()}.md`
+  const retainedAfterFailureName = `retained-after-failure-${Date.now()}.md`
+  await writeFile(path.join(workspace, expiredName), 'expired test payload')
+  await writeFile(path.join(workspace, retainedName), 'retained test payload')
+  await writeFile(path.join(workspace, retainedAfterFailureName), 'retained test payload after failure')
+  await cdp.send('Page.reload')
+  await setupPage(cdp)
+  await Promise.all([expiredName, retainedName, retainedAfterFailureName].map(name => waitUntil(
+    `${name} to appear after reload`,
+    () => cdp.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(name)})`),
+  )))
+  await moveFileToTrash(expiredName)
+  await moveFileToTrash(retainedName)
+  await moveFileToTrash(retainedAfterFailureName)
+
+  const realWorkspace = await realpath(workspace)
+  const workspaceId = createHash('sha256').update(realWorkspace).digest('hex')
+  const trashDirectory = path.join(tempRoot, 'recovery', 'trash', workspaceId)
+  const trashEntries = await readdir(trashDirectory)
+  const manifestFor = async originalPath => {
+    for (const id of trashEntries) {
+      const manifestPath = path.join(trashDirectory, id, 'entry.json')
+      const manifest = JSON.parse(await readFile(manifestPath, 'utf8').catch(() => 'null'))
+      if (manifest?.originalPath === originalPath) return { id, manifestPath, manifest }
+    }
+    return null
+  }
+  const expiredEntry = await manifestFor(expiredName)
+  const retainedEntry = await manifestFor(retainedName)
+  const retainedAfterFailureEntry = await manifestFor(retainedAfterFailureName)
+  assert.ok(expiredEntry && retainedEntry && retainedAfterFailureEntry, 'all three test files should have isolated trash entries')
+  await writeFile(expiredEntry.manifestPath, JSON.stringify({
+    ...expiredEntry.manifest,
+    expiresAt: '2000-01-01T00:00:00.000Z',
+  }, null, 2))
+
+  await openTrash()
+  const statsResponse = await readWorkspaceRecoveryStats()
+  assert.equal(statsResponse.status, 200)
+  await waitUntil('all three recovery storage statistics to render', () => cdp.evaluate(
+    `document.querySelectorAll('.recovery-stats-card').length === 3 && Array.from(document.querySelectorAll('.recovery-stats-card')).every(card => card.innerText.includes('占用'))`,
+  ))
+  const cards = await cdp.evaluate(`Array.from(document.querySelectorAll('.recovery-stats-card')).map(card => ({
+    label: card.querySelector('.recovery-stats-label')?.innerText,
+    items: card.querySelector('strong')?.innerText,
+    bytes: card.querySelector('.recovery-stats-bytes')?.innerText,
+  }))`)
+  for (const [index, [label, section]] of [
+    ['历史版本', statsResponse.data.history],
+    ['回收站', statsResponse.data.trash],
+    ['总计', statsResponse.data.total],
+  ].entries()) {
+    assert.equal(cards[index].label, label)
+    assert.equal(cards[index].items, `${Number(section.items).toLocaleString()} 项`)
+    assert.equal(cards[index].bytes, `${formatDisplayedBytes(section.bytes)} 占用`)
+  }
+  assert.equal(statsResponse.data.trash.items, 3, 'only this temporary workspace has the three new trash fixtures')
+  assert.ok(statsResponse.data.history.items > 0, 'the source workspace should have history usage to distinguish its stats')
+
+  await clickVisibleButton('清理过期项目')
+  await waitUntil('expiry cleanup confirmation to be explicit', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && dialog.innerText.includes('只会清理已过期的项目') && dialog.innerText.includes('永久删除') && dialog.innerText.includes('未过期项目会保留');
+    })`,
+  ))
+  const beforePurgeCancel = cdp.networkRequests.length
+  await cancelVisibleConfirmation()
+  await waitUntil('expiry cleanup confirmation to close after cancel', async () => !await hasVisibleConfirmation())
+  const canceledPurgeRequests = cdp.networkRequests.slice(beforePurgeCancel).filter(request =>
+    request.method === 'POST' && new URL(request.url).pathname.endsWith('/api/workspace/trash/purge-expired'),
+  )
+  assert.equal(canceledPurgeRequests.length, 0, 'canceling cleanup confirmation must not send a purge request')
+
+  const beforePurge = cdp.networkRequests.length
+  await clickVisibleButton('清理过期项目')
+  await clickConfirmButton('确认清理过期项目')
+  await waitUntil('expiry cleanup to report success', () => cdp.evaluate(`document.body.innerText.includes('已永久清理 1 个过期项目')`))
+  await waitUntil('expiry cleanup confirmation to close after success', async () => !await hasVisibleConfirmation())
+  await waitUntil('only unexpired trash entries to remain', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
+    return modal?.innerText.includes(${JSON.stringify(retainedName)}) && modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && !modal?.innerText.includes(${JSON.stringify(expiredName)});
+  })()`))
+  await waitUntil('trash storage count to refresh after expiry cleanup', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText === '2 项'`,
+  ))
+  assert.ok(cdp.networkRequests.slice(beforePurge).some(request => request.method === 'POST' && new URL(request.url).pathname.endsWith('/api/workspace/trash/purge-expired')))
+  assert.equal(await readFile(path.join(trashDirectory, expiredEntry.id, 'entry.json')).catch(error => error.code), 'ENOENT', 'the expired test entry should be permanently removed')
+  await access(path.join(trashDirectory, retainedEntry.id, 'entry.json'))
+  await access(path.join(trashDirectory, retainedAfterFailureEntry.id, 'entry.json'))
+
+  const retainedDeleteLabel = `永久删除 ${retainedName}`
+  await clickExactAriaButton(retainedDeleteLabel)
+  await waitUntil('single trash deletion confirmation to explain irreversible effect', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
+      const style = getComputedStyle(dialog);
+      return dialog.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && dialog.innerText.includes('无法从编辑器恢复');
+    })`,
+  ))
+  const beforeTrashDeleteCancel = cdp.networkRequests.length
+  await cancelVisibleConfirmation()
+  await waitUntil('single trash deletion confirmation to close after cancel', async () => !await hasVisibleConfirmation())
+  const canceledTrashDeleteRequests = cdp.networkRequests.slice(beforeTrashDeleteCancel).filter(request =>
+    request.method === 'DELETE' && new URL(request.url).pathname.endsWith('/api/workspace/trash'),
+  )
+  assert.equal(canceledTrashDeleteRequests.length, 0, 'canceling a trash delete must not send a delete request')
+
+  const beforeTrashDelete = cdp.networkRequests.length
+  await clickExactAriaButton(retainedDeleteLabel)
+  await clickConfirmButton('永久删除')
+  await waitUntil('single trash deletion confirmation to close after success', async () => !await hasVisibleConfirmation())
+  await waitUntil('selected unexpired trash item to be removed', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
+    return !modal?.innerText.includes(${JSON.stringify(retainedName)}) && modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)});
+  })()`))
+  await waitUntil('trash statistics to refresh after the selected deletion', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText === '1 项'`,
+  ))
+  assert.ok(cdp.networkRequests.slice(beforeTrashDelete).some(request => request.method === 'DELETE' && new URL(request.url).pathname.endsWith('/api/workspace/trash')))
+  assert.equal(await readFile(path.join(trashDirectory, retainedEntry.id, 'entry.json')).catch(error => error.code), 'ENOENT')
+  await access(path.join(trashDirectory, retainedAfterFailureEntry.id, 'entry.json'))
+
+  const failedDeleteManifest = {
+    ...retainedAfterFailureEntry.manifest,
+    state: 'staging',
+  }
+  await writeFile(retainedAfterFailureEntry.manifestPath, JSON.stringify(failedDeleteManifest, null, 2))
+  const beforeFailedDelete = cdp.networkRequests.length
+  await clickExactAriaButton(`永久删除 ${retainedAfterFailureName}`)
+  await clickConfirmButton('永久删除')
+  await waitUntil('failed permanent deletion to report a clear error', () => cdp.evaluate(`document.body.innerText.includes('永久删除回收站项目失败：')`))
+  await waitUntil('trash list and stats to refresh after a failed deletion', () => {
+    const requests = cdp.networkRequests.slice(beforeFailedDelete)
+    const deleted = requests.some(request => request.method === 'DELETE' && new URL(request.url).pathname.endsWith('/api/workspace/trash'))
+    const listRefresh = requests.some(request => request.method === 'GET' && new URL(request.url).pathname.endsWith('/api/workspace/trash'))
+    const statsRefresh = requests.some(request => request.method === 'GET' && new URL(request.url).pathname.endsWith('/api/workspace/recovery/stats'))
+    return deleted && listRefresh && statsRefresh
+  })
+  await waitUntil('failed deletion confirmation to close', async () => !await hasVisibleConfirmation())
+  await waitUntil('failed deletion to leave the item listed with refreshed count', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
+    const count = Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText;
+    return modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && count === '1 项';
+  })()`))
+
+  await writeFile(retainedAfterFailureEntry.manifestPath, JSON.stringify(retainedAfterFailureEntry.manifest, null, 2))
+  await clickExactAriaButton(`永久删除 ${retainedAfterFailureName}`)
+  await clickConfirmButton('永久删除')
+  await waitUntil('final trash deletion confirmation to close', async () => !await hasVisibleConfirmation())
+  await waitUntil('final test trash item to be removed', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
+    const count = Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText;
+    return !modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && count === '0 项';
+  })()`))
+  assert.equal(await readFile(path.join(trashDirectory, retainedAfterFailureEntry.id, 'entry.json')).catch(error => error.code), 'ENOENT')
+
+  await switchWorkspace('workspace-b')
+  const workspaceBInitialView = await cdp.evaluate(`JSON.stringify({
+    workspace: JSON.parse(localStorage.getItem('editor_workspace_info') || 'null')?.workspace || '',
+    visibleTrashModals: Array.from(document.querySelectorAll('.ant-modal')).filter(modal => {
+      const style = getComputedStyle(modal);
+      return modal.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
+    }).map(modal => modal.innerText),
+    visibleTrashRows: Array.from(document.querySelectorAll('.trash-item-row')).filter(row => {
+      const style = getComputedStyle(row);
+      return row.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
+    }).map(row => row.innerText),
+    visiblePermanentDeleteButtons: Array.from(document.querySelectorAll('button')).filter(button => {
+      const style = getComputedStyle(button);
+      return button.getAttribute('aria-label')?.startsWith('永久删除') && button.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0 && !button.disabled;
+    }).map(button => button.getAttribute('aria-label')),
+  })`)
+  const initialView = JSON.parse(workspaceBInitialView)
+  assert.equal(path.basename(initialView.workspace), 'workspace-b')
+  const visibleOldTrash = [
+    ...initialView.visibleTrashModals,
+    ...initialView.visibleTrashRows,
+    ...initialView.visiblePermanentDeleteButtons,
+  ].filter(value => [expiredName, retainedName, retainedAfterFailureName].some(name => String(value).includes(name)))
+  assert.deepEqual(visibleOldTrash, [], `workspace B must not display or enable workspace A trash actions in its first view: ${workspaceBInitialView}`)
+  await openTrash()
+  await waitUntil('workspace B recovery statistics to replace workspace A statistics', () => cdp.evaluate(`Array.from(document.querySelectorAll('.recovery-stats-card')).length === 3 && Array.from(document.querySelectorAll('.recovery-stats-card')).every(card => card.querySelector('strong')?.innerText === '0 项')`))
+  const workspaceBStats = await readWorkspaceRecoveryStats()
+  assert.equal(workspaceBStats.status, 200)
+  assert.equal(workspaceBStats.data.total.items, 0, 'workspace B must not display workspace A recovery records')
+  assert.ok(!await cdp.evaluate(`document.querySelector('.ant-modal')?.innerText.includes(${JSON.stringify(firstFile)})`))
+  // Leave the isolated backend on the suite's default workspace for the next
+  // test; its startup context is deliberately refreshed from this selection.
+  await switchWorkspace('notes')
 })
 
 test('an external disk edit is detected before the browser can overwrite it', async () => {

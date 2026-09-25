@@ -91,6 +91,7 @@ standalone-editor/
 - [x] 标签页多文件编辑
 - [x] 浏览器记住当前工作目录，下次打开自动进入
 - [x] 保存冲突提示和逐文件版本历史
+- [x] 逐条恢复或永久删除历史版本，并查看当前工作区恢复空间统计
 - [x] 浏览器本地草稿快照和恢复选项
 
 ### 文件管理
@@ -99,6 +100,7 @@ standalone-editor/
 - [x] 重命名
 - [x] 拖拽移动文件
 - [x] 将文件/文件夹移入回收站，并可查看和恢复
+- [x] 逐条永久删除回收站项目，或手动清理已过期项目
 - [x] 全部折叠/展开
 
 ### 界面
@@ -117,11 +119,15 @@ standalone-editor/
 | GET | `/api/workspace/file?path=...` | 读取文件内容 |
 | GET | `/api/workspace/file/history?path=...` | 查看该文件的版本历史 |
 | POST | `/api/workspace/file/restore` | 安全恢复该文件的历史版本 |
+| DELETE | `/api/workspace/file/history?path=...&id=...` | 永久删除该文件的一条历史版本 |
 | POST | `/api/workspace` | 新建文件或目录 |
 | PUT | `/api/workspace` | 写入文件 |
 | DELETE | `/api/workspace?path=...` | 将文件或目录移入回收站 |
 | GET | `/api/workspace/trash` | 列出工作空间的回收站项目 |
 | POST | `/api/workspace/trash/restore` | 恢复回收站项目 |
+| DELETE | `/api/workspace/trash?id=...` | 永久删除一条回收站项目 |
+| POST | `/api/workspace/trash/purge-expired` | 手动永久清理已过期的回收站项目 |
+| GET | `/api/workspace/recovery/stats` | 查看当前工作区历史版本、回收站和合计的项目数及存储字节数 |
 | POST | `/api/workspace/move` | 移动/重命名 |
 | POST | `/api/workspace/upload` | 上传文件 |
 | POST | `/api/upload/assets` | 上传图片到 `assets/`（兼容别名） |
@@ -135,7 +141,9 @@ standalone-editor/
 
 读取文件会返回按文件内容计算的 SHA-256 `revision`。保存和恢复版本必须提交 `expectedRevision`：缺少时返回 HTTP `428`；磁盘文件或工作空间已变化时返回 HTTP `409`，响应会携带冲突信息，客户端应先处理冲突再保存。对尚不存在的文件，`expectedRevision: null` 表示仅在目标仍不存在时创建。每个文件最多保留最近 50 个被替换的版本；历史版本保存在工作空间之外，默认位于 `~/.standalone-editor/recovery`，可用 `EDITOR_RECOVERY_DIR` 更改。
 
-删除会把项目移到工作空间之外的回收站，目录内的内容一并保存；可在编辑器中列出并恢复。恢复时若原路径已有同名项目，会报告冲突，不会覆盖它。回收站项目有到期时间元数据，但当前不会自动清理。
+删除会把项目移到工作空间之外的回收站，目录内的内容一并保存；可在编辑器中列出并恢复。恢复时若原路径已有同名项目，会报告冲突，不会覆盖它。回收站项目默认保留 30 天并记录到期时间，但不会自动清理。只有用户在编辑器中主动选择并确认“清理过期项目”后，系统才会永久删除已过期项目；每条历史版本和回收站项目也可单独永久删除。以上永久删除操作都需要明确确认，删除后无法在编辑器中恢复；删除历史版本不会改动当前文档。
+
+`GET /api/workspace/recovery/stats` 返回当前工作区的 `history`、`trash` 和 `total`，每项包含 `items`、`bytes`，并带有 `generatedAt`。字节数按该工作区恢复存储中当前文件的实际字节长度统计，包含历史记录、回收站内容及其元数据；它表示恢复数据当前落盘占用，不是工作区原文件的总大小。
 
 未保存的编辑会定期保存在当前浏览器配置的本地存储中，重新打开工作空间时可以恢复。其他标签页遗留的草稿会作为独立恢复选项显示，不会自动覆盖当前草稿。浏览器草稿保留 7 天；浏览器清理站点数据、禁用本地存储或存储空间不足时，草稿恢复可能不可用。
 
@@ -155,7 +163,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ## 测试
 
-CI 在每次 push 和 pull request 时分别运行后端测试和前端构建。可在本地复现：
+CI 在每次 push 和 pull request 时运行后端测试、前端构建和浏览器回归测试。浏览器任务使用 Node.js 22 和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
 
 ```bash
 cd backend
@@ -164,13 +172,7 @@ npm test
 cd ../frontend
 npm ci
 npm run build
+npm run test:browser
 ```
 
-可选的浏览器交互回归测试：
-
-```bash
-cd frontend
-npm run test:interaction
-```
-
-浏览器交互测试需要安装 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试会在临时目录中创建笔记工作区和浏览器配置，并使用临时回环端口启动前后端。
+浏览器回归测试覆盖编辑器保存和 Markdown 保真。浏览器测试需要 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；本地默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。两个测试文件在 CI 中串行运行，每次运行都会用独立临时目录创建笔记工作区和 Chrome 配置，并为前后端及 Chrome DevTools 选择临时回环端口。

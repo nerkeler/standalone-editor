@@ -282,6 +282,7 @@ export async function moveItem(workspace, oldPath, newPath, options = {}) {
 }
 
 const HISTORY_RETENTION_PER_FILE = 50
+const HISTORY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 function recoveryRoot(override) {
   return path.resolve(override || process.env.EDITOR_RECOVERY_DIR || path.join(os.homedir(), '.standalone-editor', 'recovery'))
@@ -321,6 +322,52 @@ async function historyBucket(base, target, root) {
   const workspaceKey = sha256(base)
   const fileKey = sha256(relative)
   return { relative, recovery, bucket: path.join(recovery, 'history', workspaceKey, fileKey) }
+}
+
+// History lives outside the workspace, but its bucket hierarchy is still
+// mutable filesystem state. Check each component without following symlinks
+// before a destructive operation so a redirected bucket cannot target a
+// different workspace's records.
+async function historyBucketIsSafe(recovery, bucket) {
+  const relative = path.relative(recovery, bucket)
+  if (
+    !relative || relative === '..' || relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative)
+  ) {
+    throw makeError('恢复历史目录路径无效', 'RECOVERY_STORAGE_ERROR')
+  }
+
+  const components = relative.split(path.sep)
+  let current = recovery
+  for (const component of ['', ...components]) {
+    if (component) current = path.join(current, component)
+    let stat
+    try {
+      stat = await fs.lstat(current)
+    } catch (error) {
+      if (error.code === 'ENOENT') return false
+      throw makeError(`恢复历史目录不可用：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw makeError('恢复历史目录不可用：路径包含非目录或符号链接', 'RECOVERY_STORAGE_ERROR')
+    }
+  }
+  return true
+}
+
+function historyNotFound() {
+  return makeError('历史版本不存在或已过期', 'HISTORY_NOT_FOUND')
+}
+
+function historyCorrupt() {
+  return makeError('历史版本校验失败', 'HISTORY_CORRUPT')
+}
+
+function isWorkspaceRelativeHistoryPath(value) {
+  if (typeof value !== 'string' || !value || value.includes('\\') || value.includes('\0')) return false
+  if (value.startsWith('/') || path.posix.isAbsolute(value)) return false
+  const normalized = path.posix.normalize(value)
+  return normalized === value && normalized !== '.' && normalized !== '..' && !normalized.startsWith('../')
 }
 
 async function ensurePrivateDirectory(dir) {
@@ -586,6 +633,9 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
   const { base, target, parent } = location
   const existing = await readCurrent(location, reqPath, expectedRevision)
+  if (existing && existing.bytes.equals(bytes)) {
+    return { success: true, path: relativePath(base, target), revision: contentRevision(existing.bytes) }
+  }
   const name = path.basename(target)
   const relative = relativePath(base, target)
 
@@ -643,6 +693,94 @@ export async function writeFile(workspace, reqPath, content, expectedRevision, o
 export async function listFileHistory(workspace, reqPath, options = {}) {
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
   return { path: relativePath(location.base, location.target), history: await listHistory(workspace, location.base, location.target, options) }
+}
+
+// Delete exactly one validated recovery record. The current workspace file is
+// only used to resolve the bucket and is never read or changed.
+export async function deleteFileHistory(workspace, reqPath, historyId, options = {}) {
+  if (typeof historyId !== 'string' || !HISTORY_ID_PATTERN.test(historyId)) {
+    throw makeError('历史版本 ID 无效', 'INVALID_HISTORY_ID')
+  }
+
+  const location = await fileLocation(workspace, reqPath, { allowMissing: true })
+  const { relative, recovery, bucket } = await historyBucket(
+    location.base,
+    location.target,
+    options.root,
+  )
+  if (!await historyBucketIsSafe(recovery, bucket)) throw historyNotFound()
+
+  const entryPath = path.join(bucket, `${historyId}.json`)
+  let recordStat
+  let recordBytes
+  try {
+    recordStat = await fs.lstat(entryPath)
+    if (!recordStat.isFile() || recordStat.isSymbolicLink()) throw historyNotFound()
+    recordBytes = await fs.readFile(entryPath)
+  } catch (error) {
+    if (error.code === 'ENOENT') throw historyNotFound()
+    throw error
+  }
+
+  let entry
+  try {
+    entry = JSON.parse(recordBytes.toString('utf8'))
+  } catch {
+    throw historyCorrupt()
+  }
+
+  const owner = await readHistoryOwner(bucket)
+  const ownerMatches = owner.path === relative || (!owner.path && entry?.path === relative)
+  if (
+    entry?.version !== 1 || entry.id !== historyId || !ownerMatches ||
+    !isWorkspaceRelativeHistoryPath(entry.path)
+  ) {
+    throw historyNotFound()
+  }
+
+  if (
+    typeof entry.revision !== 'string' || !/^[0-9a-f]{64}$/.test(entry.revision) ||
+    typeof entry.contentBase64 !== 'string' || !Number.isSafeInteger(entry.size) || entry.size < 0 ||
+    typeof entry.savedAt !== 'string' || !Number.isFinite(Date.parse(entry.savedAt))
+  ) {
+    throw historyCorrupt()
+  }
+  const bytes = Buffer.from(entry.contentBase64, 'base64')
+  if (
+    bytes.toString('base64') !== entry.contentBase64 || bytes.byteLength !== entry.size ||
+    contentRevision(bytes) !== entry.revision
+  ) {
+    throw historyCorrupt()
+  }
+
+  // Recheck the bucket and exact record immediately before unlinking. This
+  // makes a replaced symlink or record fail closed and keeps failures from
+  // removing a different UUID's entry.
+  if (!await historyBucketIsSafe(recovery, bucket)) throw historyNotFound()
+  let currentStat
+  let currentBytes
+  try {
+    currentStat = await fs.lstat(entryPath)
+    if (
+      !currentStat.isFile() || currentStat.isSymbolicLink() ||
+      currentStat.dev !== recordStat.dev || currentStat.ino !== recordStat.ino
+    ) {
+      throw historyNotFound()
+    }
+    currentBytes = await fs.readFile(entryPath)
+  } catch (error) {
+    if (error.code === 'ENOENT') throw historyNotFound()
+    throw error
+  }
+  if (!currentBytes.equals(recordBytes)) throw historyNotFound()
+
+  try {
+    await fs.unlink(entryPath)
+  } catch (error) {
+    if (error.code === 'ENOENT') throw historyNotFound()
+    throw error
+  }
+  return { success: true, path: relative, deletedHistoryId: historyId }
 }
 
 export async function restoreFileHistory(workspace, reqPath, historyId, expectedRevision, options = {}) {

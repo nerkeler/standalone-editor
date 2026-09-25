@@ -165,6 +165,20 @@ function remapPath(pathValue, oldPath, newPath) {
   return pathValue
 }
 
+function formatRecoveryBytes(value) {
+  const bytes = Number(value)
+  if (!Number.isFinite(bytes) || bytes < 0) return '不可用'
+  if (bytes < 1024) return `${bytes.toLocaleString()} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let amount = bytes
+  let unitIndex = -1
+  while (amount >= 1024 && unitIndex < units.length - 1) {
+    amount /= 1024
+    unitIndex += 1
+  }
+  return `${amount.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`
+}
+
 // ========== 文件树工具函数 ==========
 
 function buildTree(flat) {
@@ -280,8 +294,31 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [historyModal, setHistoryModal] = useState({ open: false, path: '', entries: [], loading: false })
   const [trashModalOpen, setTrashModalOpen] = useState(false)
   const [trashItems, setTrashItems] = useState([])
-  const [trashLoading, setTrashLoading] = useState(false)
+  const [trashItemsWorkspaceKey, setTrashItemsWorkspaceKey] = useState('')
+  const [trashLoadingState, setTrashLoadingState] = useState({ workspaceKey: '', loading: false })
+  const [trashMutationBusy, setTrashMutationBusy] = useState(false)
+  const [recoveryStatsState, setRecoveryStatsState] = useState({ workspaceKey: '', stats: null, loading: false })
   const [recoveryModalOpen, setRecoveryModalOpen] = useState(false)
+  const recoveryWorkspaceKey = `${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}:${workspaceInfo?.workspace || workspace || ''}`
+  const recoveryWorkspaceKeyRef = useRef(recoveryWorkspaceKey)
+  const recoveryStatsRequestRef = useRef(0)
+  const trashRequestRef = useRef(0)
+  recoveryWorkspaceKeyRef.current = recoveryWorkspaceKey
+  const recoveryStats = recoveryStatsState.workspaceKey === recoveryWorkspaceKey ? recoveryStatsState.stats : null
+  const recoveryStatsLoading = recoveryStatsState.workspaceKey === recoveryWorkspaceKey && recoveryStatsState.loading
+  const visibleTrashItems = trashItemsWorkspaceKey === recoveryWorkspaceKey ? trashItems : []
+  const trashLoading = trashLoadingState.workspaceKey === recoveryWorkspaceKey && trashLoadingState.loading
+
+  useEffect(() => {
+    recoveryStatsRequestRef.current += 1
+    setRecoveryStatsState({ workspaceKey: recoveryWorkspaceKey, stats: null, loading: false })
+    trashRequestRef.current += 1
+    setTrashItems([])
+    setTrashItemsWorkspaceKey(recoveryWorkspaceKey)
+    setTrashLoadingState({ workspaceKey: recoveryWorkspaceKey, loading: false })
+    setTrashMutationBusy(false)
+    setTrashModalOpen(false)
+  }, [recoveryWorkspaceKey])
 
   // The editor renders one document at a time, but every open tab keeps its
   // own Markdown draft. Refs make save callbacks independent of React's
@@ -1298,6 +1335,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }
       }
       await loadTree()
+      await Promise.all([loadTrash(), loadRecoveryStats()])
       message.success(`已移入回收站：${node.path}。可从回收站恢复`)
     } catch (error) {
       message.error('移入回收站失败：' + (error.response?.data?.error || error.message))
@@ -1305,33 +1343,158 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }
 
   const loadTrash = useCallback(async () => {
-    setTrashLoading(true)
+    const requestId = ++trashRequestRef.current
+    const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
+    setTrashLoadingState({ workspaceKey: requestedWorkspaceKey, loading: true })
     try {
       const res = await axios.get(`${API}/trash`)
-      setTrashItems(Array.isArray(res.data?.items) ? res.data.items : [])
+      if (
+        trashRequestRef.current === requestId &&
+        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
+      ) {
+        setTrashItems(Array.isArray(res.data?.items) ? res.data.items : [])
+        setTrashItemsWorkspaceKey(requestedWorkspaceKey)
+      }
       return true
     } catch (error) {
-      message.error('读取回收站失败：' + (error.response?.data?.error || error.message))
+      if (
+        trashRequestRef.current === requestId &&
+        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
+      ) message.error('读取回收站失败：' + (error.response?.data?.error || error.message))
       return false
     } finally {
-      setTrashLoading(false)
+      if (
+        trashRequestRef.current === requestId &&
+        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
+      ) setTrashLoadingState({ workspaceKey: requestedWorkspaceKey, loading: false })
     }
   }, [])
 
+  const loadRecoveryStats = useCallback(async () => {
+    const requestId = ++recoveryStatsRequestRef.current
+    const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
+    setRecoveryStatsState(current => ({
+      workspaceKey: requestedWorkspaceKey,
+      stats: current.workspaceKey === requestedWorkspaceKey ? current.stats : null,
+      loading: true,
+    }))
+    try {
+      const res = await axios.get(`${API}/recovery/stats`)
+      if (
+        recoveryStatsRequestRef.current === requestId &&
+        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
+      ) {
+        setRecoveryStatsState({ workspaceKey: requestedWorkspaceKey, stats: res.data, loading: false })
+      }
+      return true
+    } catch (error) {
+      if (
+        recoveryStatsRequestRef.current === requestId &&
+        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
+      ) {
+        setRecoveryStatsState({ workspaceKey: requestedWorkspaceKey, stats: null, loading: false })
+        message.error('读取恢复数据空间统计失败：' + (error.response?.data?.error || error.message))
+      }
+      return false
+    }
+  }, [])
+
+  const refreshTrashAndRecoveryStats = useCallback(async () => {
+    await Promise.all([loadTrash(), loadRecoveryStats()])
+  }, [loadRecoveryStats, loadTrash])
+
+  const handleDeleteHistory = useCallback(entry => {
+    const path = historyModal.path
+    if (!path || !entry?.id) return
+    Modal.confirm({
+      title: '永久删除这个历史版本？',
+      content: `将永久删除「${path}」的这条历史版本，无法从编辑器恢复。当前文档内容不会被删除或修改。`,
+      okText: '永久删除历史版本',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setHistoryModal(current => current.path === path ? { ...current, loading: true } : current)
+        try {
+          await axios.delete(`${API}/file/history`, { params: { path, id: entry.id } })
+          message.success('已永久删除这条历史版本；当前文档保持不变')
+        } catch (error) {
+          message.error('删除历史版本失败：' + (error.response?.data?.error || error.message))
+        }
+        try {
+          const [updated] = await Promise.all([
+            axios.get(`${API}/file/history`, { params: { path } }),
+            loadRecoveryStats(),
+          ])
+          setHistoryModal(current => current.path === path
+            ? { ...current, entries: updated.data.history || [], loading: false }
+            : current)
+        } catch (error) {
+          setHistoryModal(current => current.path === path ? { ...current, loading: false } : current)
+          message.error('刷新版本历史失败：' + (error.response?.data?.error || error.message))
+        }
+      },
+    })
+  }, [historyModal.path, loadRecoveryStats])
+
   const handleOpenTrash = useCallback(async () => {
     setTrashModalOpen(true)
-    await loadTrash()
-  }, [loadTrash])
+    await Promise.all([loadTrash(), loadRecoveryStats()])
+  }, [loadRecoveryStats, loadTrash])
 
   const handleRestoreTrashItem = useCallback(async item => {
     try {
       await axios.post(`${API}/trash/restore`, { id: item.id })
-      await Promise.all([loadTree(), loadTrash()])
+      await Promise.all([loadTree(), loadTrash(), loadRecoveryStats()])
       message.success(`已从回收站恢复：${item.path}`)
     } catch (error) {
       message.error('恢复失败：' + (error.response?.data?.error || error.message))
     }
-  }, [loadTrash, loadTree])
+  }, [loadRecoveryStats, loadTrash, loadTree])
+
+  const handlePurgeExpiredTrash = useCallback(() => {
+    Modal.confirm({
+      title: '永久清理已过期回收站项目？',
+      content: '只会清理已过期的项目。确认后会永久删除这些数据，无法从编辑器恢复；未过期项目会保留。',
+      okText: '确认清理过期项目',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setTrashMutationBusy(true)
+        try {
+          const res = await axios.post(`${API}/trash/purge-expired`)
+          message.success(`已永久清理 ${Number(res.data?.purged || 0).toLocaleString()} 个过期项目`)
+        } catch (error) {
+          message.error('清理过期项目失败：' + (error.response?.data?.error || error.message))
+        } finally {
+          await refreshTrashAndRecoveryStats()
+          setTrashMutationBusy(false)
+        }
+      },
+    })
+  }, [refreshTrashAndRecoveryStats])
+
+  const handlePermanentlyDeleteTrashItem = useCallback(item => {
+    if (!item?.id) return
+    Modal.confirm({
+      title: `永久删除「${item.path}」？`,
+      content: `这会永久删除回收站中的「${item.path}」及其内容，无法从编辑器恢复。`,
+      okText: '永久删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        setTrashMutationBusy(true)
+        try {
+          await axios.delete(`${API}/trash`, { params: { id: item.id } })
+          message.success(`已永久删除：${item.path}`)
+        } catch (error) {
+          message.error('永久删除回收站项目失败：' + (error.response?.data?.error || error.message))
+        } finally {
+          await refreshTrashAndRecoveryStats()
+          setTrashMutationBusy(false)
+        }
+      },
+    })
+  }, [refreshTrashAndRecoveryStats])
 
   const handleMove = async (node, newParent) => {
     const parts = node.path.split('/')
@@ -1827,27 +1990,69 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       </Modal>
 
       <Modal
-        title={`回收站（${trashItems.length}）`}
+        title={`回收站（${visibleTrashItems.length}）`}
         open={trashModalOpen}
         onCancel={() => setTrashModalOpen(false)}
         footer={<Button onClick={() => setTrashModalOpen(false)}>关闭</Button>}
         width={640}
       >
+        <div className="recovery-stats-panel" aria-label="恢复数据空间统计">
+          <div className="recovery-stats-heading">恢复数据占用</div>
+          {recoveryStatsLoading ? (
+            <div role="status" className="recovery-stats-status">正在读取空间统计…</div>
+          ) : recoveryStats ? (
+            <>
+              <div className="recovery-stats-grid">
+                {[
+                  ['历史版本', recoveryStats.history],
+                  ['回收站', recoveryStats.trash],
+                  ['总计', recoveryStats.total],
+                ].map(([label, section]) => (
+                  <div className="recovery-stats-card" key={label} aria-label={`${label}占用`}>
+                    <span className="recovery-stats-label">{label}</span>
+                    <strong>{Number(section?.items || 0).toLocaleString()} 项</strong>
+                    <span className="recovery-stats-bytes">{formatRecoveryBytes(section?.bytes)} 占用</span>
+                  </div>
+                ))}
+              </div>
+              {recoveryStats.generatedAt && (
+                <div className="recovery-stats-generated">统计时间：{new Date(recoveryStats.generatedAt).toLocaleString()}</div>
+              )}
+            </>
+          ) : (
+            <div className="recovery-stats-error" role="alert">
+              <span>空间统计暂不可用，回收站列表仍可操作。</span>
+              <Button size="small" onClick={loadRecoveryStats}>重试统计</Button>
+            </div>
+          )}
+        </div>
+        <div className="trash-maintenance-row">
+          <span>只清理已过期项目；每条也可单独永久删除。</span>
+          <Button
+            danger
+            disabled={trashMutationBusy || trashLoading || visibleTrashItems.length === 0}
+            onClick={handlePurgeExpiredTrash}
+          >清理过期项目</Button>
+        </div>
         {trashLoading ? (
           <div role="status" style={{ padding: 24, textAlign: 'center' }}>正在读取回收站…</div>
-        ) : trashItems.length === 0 ? (
+        ) : visibleTrashItems.length === 0 ? (
           <div style={{ padding: 24, textAlign: 'center', color: 'var(--color-text-secondary)' }}>回收站为空</div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: '60vh', overflow: 'auto' }}>
-            {trashItems.map(item => (
-              <div key={item.id} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: 10, border: '1px solid var(--color-border)', borderRadius: 6 }}>
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={item.path}>{item.path}</div>
-                  <div style={{ marginTop: 3, color: 'var(--color-text-secondary)', fontSize: 11 }}>
+          <div className="trash-items-list">
+            {visibleTrashItems.map(item => (
+              <div key={item.id} className="trash-item-row">
+                <div className="trash-item-details">
+                  <div className="trash-item-path" title={item.path}>{item.path}</div>
+                  <div className="trash-item-meta">
                     {item.type === 'directory' ? '文件夹' : '文件'} · 移入时间：{new Date(item.createdAt).toLocaleString()}
+                    {item.expiresAt && ` · 到期时间：${new Date(item.expiresAt).toLocaleString()}`}
                   </div>
                 </div>
-                <Button size="small" type="primary" aria-label={`恢复 ${item.path}`} onClick={() => handleRestoreTrashItem(item)}>恢复</Button>
+                <div className="trash-item-actions">
+                  <Button size="small" type="primary" disabled={trashMutationBusy} aria-label={`恢复 ${item.path}`} onClick={() => handleRestoreTrashItem(item)}>恢复</Button>
+                  <Button size="small" danger disabled={trashMutationBusy} aria-label={`永久删除 ${item.path}`} onClick={() => handlePermanentlyDeleteTrashItem(item)}>永久删除</Button>
+                </div>
               </div>
             ))}
           </div>
@@ -1965,6 +2170,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   disabled={Boolean(isDirty[historyModal.path] || fileConflicts[historyModal.path])}
                   onClick={() => handleRestoreHistory(entry)}
                 >恢复</Button>
+                <Button
+                  size="small"
+                  danger
+                  disabled={historyModal.loading}
+                  aria-label={`永久删除历史版本 ${historyModal.path} ${entry.id}`}
+                  onClick={() => handleDeleteHistory(entry)}
+                >删除版本</Button>
               </div>
             ))}
           </div>

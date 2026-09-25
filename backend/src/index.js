@@ -16,11 +16,13 @@ import {
   writeFile,
   listFileHistory,
   restoreFileHistory,
+  deleteFileHistory,
   uploadFile,
   listAll,
   searchWorkspace,
 } from './fileService.js'
 import { createTrashService } from './trashService.js'
+import { getRecoveryStats } from './recoveryStatsService.js'
 import { importZip } from './zipImportService.js'
 import {
   configuredRootValues,
@@ -378,11 +380,58 @@ app.get('/api/workspace/file/history', workspaceGuard, async (req, res) => {
   } catch (error) { sendError(res, error, req) }
 })
 
+app.delete('/api/workspace/file/history', workspaceGuard, async (req, res) => {
+  try {
+    const reqPath = req.query.path
+    const historyId = req.query.id
+    if (!reqPath || !historyId) throw new Error('缺少 path 或 id 参数')
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, async () => {
+      const deleted = await deleteFileHistory(ws, reqPath, historyId)
+      const stats = await getRecoveryStats(ws)
+      return { ...deleted, stats }
+    })
+    sendData(res, result, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
 app.get('/api/workspace/trash', workspaceGuard, async (req, res) => {
   try {
     const ws = workspaceFor(req)
     const items = await createTrashService(ws).list()
     sendData(res, { items }, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.get('/api/workspace/recovery/stats', workspaceGuard, async (req, res) => {
+  try {
+    sendData(res, await getRecoveryStats(workspaceFor(req)), req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.post('/api/workspace/trash/purge-expired', workspaceGuard, async (req, res) => {
+  try {
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, async () => {
+      const purged = await createTrashService(ws).purgeExpired()
+      const stats = await getRecoveryStats(ws)
+      return { ...purged, stats }
+    })
+    sendData(res, result, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
+app.delete('/api/workspace/trash', workspaceGuard, async (req, res) => {
+  try {
+    const { id } = req.query
+    if (!id) throw new Error('缺少 id 参数')
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, async () => {
+      const deleted = await createTrashService(ws).remove(id)
+      const stats = await getRecoveryStats(ws)
+      return { ...deleted, stats }
+    })
+    sendData(res, result, req)
   } catch (error) { sendError(res, error, req) }
 })
 

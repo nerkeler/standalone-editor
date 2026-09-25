@@ -8,6 +8,7 @@ import {
   listAll,
   listTree,
   listFileHistory,
+  deleteFileHistory,
   moveItem,
   searchWorkspace,
   writeFile,
@@ -183,6 +184,38 @@ test('versioned writes reject a stale client and preserve the current disk revis
   assert.equal(history.history[0].revision, clientA.revision)
 })
 
+test('repeated versioned writes with identical bytes preserve history, mtime, and permissions', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'initial', { mode: 0o640 })
+  if (process.platform !== 'win32') await fs.chmod(notePath, 0o640)
+
+  const original = await readFile(workspace, 'note.md')
+  const firstSave = await writeFile(workspace, 'note.md', 'updated', original.revision, { root: recovery })
+  const firstHistory = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(firstHistory.history.length, 1)
+
+  // Pin the timestamp so the assertion catches an atomic replacement even on
+  // filesystems whose clock has coarse resolution.
+  await fs.utimes(notePath, new Date('2001-01-01T00:00:00Z'), new Date('2001-01-01T00:00:00Z'))
+  const beforeNoop = await fs.stat(notePath, { bigint: true })
+  const repeatedSave = await writeFile(workspace, 'note.md', 'updated', firstSave.revision, { root: recovery })
+  const afterNoop = await fs.stat(notePath, { bigint: true })
+
+  assert.deepEqual(repeatedSave, { success: true, path: 'note.md', revision: firstSave.revision })
+  assert.equal(afterNoop.mtimeNs, beforeNoop.mtimeNs)
+  if (process.platform !== 'win32') assert.equal(afterNoop.mode & 0o777n, beforeNoop.mode & 0o777n)
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
+
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'updated', original.revision, { root: recovery }),
+    error => error.code === 'FILE_CONFLICT' && error.details.currentRevision === firstSave.revision,
+  )
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
+  assert.equal((await fs.stat(notePath, { bigint: true })).mtimeNs, beforeNoop.mtimeNs)
+})
+
 test('versioned writes reject external changes and require an explicit revision', async t => {
   const workspace = await temporaryWorkspace(t)
   const recovery = await temporaryRecovery(t)
@@ -219,6 +252,127 @@ test('null revision creates only absent files; restore uses the same current-rev
     restoreFileHistory(workspace, 'note.md', history.history[0].id, saved.revision, { root: recovery }),
     error => error.code === 'FILE_CONFLICT',
   )
+})
+
+test('restoring a history entry that matches current bytes succeeds without adding history', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'version one')
+
+  const first = await readFile(workspace, 'note.md')
+  const second = await writeFile(workspace, 'note.md', 'version two', first.revision, { root: recovery })
+  const current = await writeFile(workspace, 'note.md', 'version one', second.revision, { root: recovery })
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  const matchingEntry = history.history.find(entry => entry.revision === current.revision)
+  assert.ok(matchingEntry)
+
+  await fs.utimes(notePath, new Date('2001-01-01T00:00:00Z'), new Date('2001-01-01T00:00:00Z'))
+  const beforeRestore = await fs.stat(notePath, { bigint: true })
+  const restored = await restoreFileHistory(
+    workspace,
+    'note.md',
+    matchingEntry.id,
+    current.revision,
+    { root: recovery },
+  )
+
+  assert.equal(restored.revision, current.revision)
+  assert.equal(restored.previousRevision, current.revision)
+  assert.equal(restored.restoredHistoryId, matchingEntry.id)
+  assert.equal((await fs.stat(notePath, { bigint: true })).mtimeNs, beforeRestore.mtimeNs)
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 2)
+})
+
+test('deleting one history record preserves the current file and returns not found when repeated', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'version one')
+  const first = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'version two', first.revision, { root: recovery })
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  const record = history.history[0]
+  const current = await readFile(workspace, 'note.md')
+
+  assert.deepEqual(
+    await deleteFileHistory(workspace, 'note.md', record.id, { root: recovery }),
+    { success: true, path: 'note.md', deletedHistoryId: record.id },
+  )
+  assert.deepEqual((await listFileHistory(workspace, 'note.md', { root: recovery })).history, [])
+  assert.deepEqual(await readFile(workspace, 'note.md'), current)
+  await assert.rejects(
+    deleteFileHistory(workspace, 'note.md', record.id, { root: recovery }),
+    error => error.code === 'HISTORY_NOT_FOUND',
+  )
+})
+
+test('history deletion rejects invalid paths and IDs and cannot cross file or workspace buckets', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const otherWorkspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'old')
+  await fs.writeFile(path.join(workspace, 'other.md'), 'other old')
+  await fs.writeFile(path.join(otherWorkspace, 'note.md'), 'other workspace old')
+  const opened = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'new', opened.revision, { root: recovery })
+  const record = (await listFileHistory(workspace, 'note.md', { root: recovery })).history[0]
+
+  await assert.rejects(
+    deleteFileHistory(workspace, 'note.md', 'not-a-uuid', { root: recovery }),
+    error => error.code === 'INVALID_HISTORY_ID',
+  )
+  await assert.rejects(
+    deleteFileHistory(workspace, '../note.md', record.id, { root: recovery }),
+    error => error.code === 'INVALID_PATH',
+  )
+  await assert.rejects(
+    deleteFileHistory(workspace, 'other.md', record.id, { root: recovery }),
+    error => error.code === 'HISTORY_NOT_FOUND',
+  )
+  await assert.rejects(
+    deleteFileHistory(otherWorkspace, 'note.md', record.id, { root: recovery }),
+    error => error.code === 'HISTORY_NOT_FOUND',
+  )
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
+})
+
+test('history deletion rejects corrupt records and symlinks without removing another record', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'version one')
+  const first = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'version two', first.revision, { root: recovery })
+  const second = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'version three', second.revision, { root: recovery })
+  const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+  const bucket = path.join(
+    recovery,
+    'history',
+    createHash('sha256').update(await fs.realpath(workspace)).digest('hex'),
+    createHash('sha256').update('note.md').digest('hex'),
+  )
+  const [newest, older] = history.history
+  const corruptPath = path.join(bucket, `${newest.id}.json`)
+  await fs.writeFile(corruptPath, '{broken json')
+  await assert.rejects(
+    deleteFileHistory(workspace, 'note.md', newest.id, { root: recovery }),
+    error => error.code === 'HISTORY_CORRUPT',
+  )
+  assert.equal(await fs.readFile(corruptPath, 'utf8'), '{broken json')
+
+  if (process.platform !== 'win32') {
+    const olderPath = path.join(bucket, `${older.id}.json`)
+    await fs.unlink(corruptPath)
+    await fs.symlink(olderPath, corruptPath)
+    await assert.rejects(
+      deleteFileHistory(workspace, 'note.md', newest.id, { root: recovery }),
+      error => error.code === 'HISTORY_NOT_FOUND',
+    )
+    assert.equal((await fs.lstat(corruptPath)).isSymbolicLink(), true)
+    assert.equal(JSON.parse(await fs.readFile(olderPath, 'utf8')).id, older.id)
+  }
 })
 
 test('history is private, preserves file mode, and a history storage failure aborts replacement', async t => {

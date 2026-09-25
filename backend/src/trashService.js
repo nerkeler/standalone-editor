@@ -186,6 +186,12 @@ async function writeJsonAtomic(filePath, value) {
 }
 
 async function readManifest(entryDirectory, expectedId, workspaceId) {
+  const directoryStat = await fs.lstat(entryDirectory)
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
+    throw serviceError('回收站记录无效', 'INVALID_TRASH_ENTRY')
+  }
+  const realDirectory = await fs.realpath(entryDirectory)
+  if (realDirectory !== entryDirectory) throw serviceError('回收站路径不能经过符号链接', 'INVALID_TRASH_ENTRY')
   const manifestPath = path.join(entryDirectory, MANIFEST_NAME)
   const stat = await fs.lstat(manifestPath)
   if (stat.isSymbolicLink() || !stat.isFile()) throw serviceError('回收站记录无效', 'INVALID_TRASH_ENTRY')
@@ -206,6 +212,19 @@ async function existsNoFollow(filePath) {
     if (error.code === 'ENOENT') return null
     throw error
   }
+}
+
+async function regularFileBytes(rootPath) {
+  const rootStat = await existsNoFollow(rootPath)
+  if (!rootStat || rootStat.isSymbolicLink()) return 0
+  if (rootStat.isFile()) return rootStat.size
+  if (!rootStat.isDirectory()) return 0
+
+  let bytes = 0
+  for (const name of await fs.readdir(rootPath)) {
+    bytes += await regularFileBytes(path.join(rootPath, name))
+  }
+  return bytes
 }
 
 export function createTrashService(workspace, options = {}) {
@@ -375,23 +394,52 @@ export function createTrashService(workspace, options = {}) {
     }
   }
 
+  async function remove(id) {
+    if (typeof id !== 'string' || !/^[0-9a-f-]{36}$/i.test(id)) {
+      throw serviceError('回收站项目无效', 'INVALID_TRASH_ENTRY')
+    }
+    const { workspaceId, trashDirectory } = await locations()
+    const entryDirectory = path.join(trashDirectory, id)
+    const entryStat = await existsNoFollow(entryDirectory)
+    if (!entryStat || entryStat.isSymbolicLink() || !entryStat.isDirectory()) {
+      throw serviceError('回收站项目不存在', 'ENOENT')
+    }
+
+    const manifest = await readManifest(entryDirectory, id, workspaceId)
+    if (manifest.state !== 'ready') {
+      throw serviceError('回收站项目尚未准备好，无法永久删除', 'TRASH_ENTRY_NOT_READY')
+    }
+    const payloadStat = await existsNoFollow(path.join(entryDirectory, PAYLOAD_NAME))
+    if (!payloadStat || payloadStat.isSymbolicLink() || (!payloadStat.isFile() && !payloadStat.isDirectory())) {
+      throw serviceError('回收站内容无效', 'INVALID_TRASH_ENTRY')
+    }
+
+    const bytes = await regularFileBytes(entryDirectory)
+    // fs.rm removes a symlink itself rather than traversing its target. The
+    // entry's identity and top-level directory were verified above.
+    await fs.rm(entryDirectory, { recursive: true, force: false })
+    return { success: true, id, bytes }
+  }
+
   async function purgeExpired({ at = now() } = {}) {
     const { trashDirectory, workspaceId } = await locations()
     const entries = await list()
     const expiredIds = entries.filter(item => Date.parse(item.expiresAt) <= at.getTime()).map(item => item.id)
     let purged = 0
+    let bytes = 0
     for (const id of expiredIds) {
       const entryDirectory = path.join(trashDirectory, id)
       const manifest = await readManifest(entryDirectory, id, workspaceId)
       // Expiration cleanup is an explicit maintenance operation, separate
       // from the user-facing trash and restore flows.
       if (manifest.state === 'ready' && Date.parse(manifest.expiresAt) <= at.getTime()) {
+        bytes += await regularFileBytes(entryDirectory)
         await fs.rm(entryDirectory, { recursive: true, force: false })
         purged += 1
       }
     }
-    return { purged }
+    return { purged, bytes }
   }
 
-  return { trash, list, restore, purgeExpired }
+  return { trash, list, restore, remove, purgeExpired }
 }

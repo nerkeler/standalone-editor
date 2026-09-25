@@ -163,6 +163,132 @@
   background: var(--color-primary);
 }
 
+.recovery-stats-panel {
+  padding: 12px;
+  margin-bottom: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 9px;
+  background: var(--color-bg-muted);
+}
+
+.recovery-stats-heading {
+  margin-bottom: 9px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.recovery-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.recovery-stats-card {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  background: var(--color-bg-card);
+}
+
+.recovery-stats-label,
+.recovery-stats-bytes,
+.recovery-stats-generated {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.recovery-stats-card strong {
+  color: var(--color-text);
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.recovery-stats-bytes {
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+}
+
+.recovery-stats-generated {
+  margin-top: 8px;
+  text-align: right;
+}
+
+.recovery-stats-status,
+.recovery-stats-error {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.trash-maintenance-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 12px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.trash-items-list {
+  display: flex;
+  max-height: 42vh;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+}
+
+.trash-item-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+}
+
+.trash-item-details {
+  flex: 1;
+  min-width: 0;
+}
+
+.trash-item-path {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trash-item-meta {
+  margin-top: 3px;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+}
+
+.trash-item-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+@media (max-width: 560px) {
+  .recovery-stats-grid { grid-template-columns: 1fr; }
+  .trash-maintenance-row { align-items: flex-start; flex-direction: column; }
+  .trash-item-row { align-items: flex-start; flex-direction: column; }
+  .trash-item-actions { width: 100%; justify-content: flex-end; }
+}
+
 .editor-main {
   background: var(--color-bg) !important;
 }

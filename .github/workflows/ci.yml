@@ -23,15 +23,31 @@ jobs:
         working-directory: backend
 
   frontend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+      - name: Detect Chrome on the runner
+        shell: bash
+        run: |
+          chrome_path="$(command -v google-chrome || true)"
+          if [[ -z "$chrome_path" ]]; then
+            echo "::error::Google Chrome was not found on the ubuntu-24.04 runner."
+            exit 1
+          fi
+          printf 'CHROME_PATH=%s\n' "$chrome_path" >> "$GITHUB_ENV"
+          "$chrome_path" --version
+      - run: npm ci
+        working-directory: backend
       - run: npm ci
         working-directory: frontend
       - run: npm run build
+        working-directory: frontend
+      - run: npm run test:browser
         working-directory: frontend
