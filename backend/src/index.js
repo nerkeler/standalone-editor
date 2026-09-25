@@ -93,6 +93,16 @@ function errorStatus(error) {
   return 400
 }
 
+function normalizeMultipartFilename(filename) {
+  if (typeof filename !== 'string' || [...filename].some(char => char.codePointAt(0) > 0xff)) return filename
+  const latin1Bytes = Buffer.from(filename, 'latin1')
+  const utf8 = latin1Bytes.toString('utf8')
+  // Busboy's default multipart parameter charset is Latin-1, while browsers
+  // send UTF-8 filename bytes. Decode only when those bytes form valid UTF-8;
+  // preserve genuine Latin-1 names and filenames already decoded by RFC 5987.
+  return Buffer.from(utf8, 'utf8').equals(latin1Bytes) ? utf8 : filename
+}
+
 function workspaceTrashService(ws) {
   return createTrashService(ws, { recoveryRoot: RECOVERY_ROOT })
 }
@@ -473,10 +483,12 @@ async function workspaceGuard(req, res, next) {
     return
   }
   setWorkspaceHeaders(res, info)
-  // An <img> element cannot attach custom headers. The read-only assets route
-  // accepts the same identity in its query string; every mutating route still
-  // requires request headers.
-  const allowQueryIdentity = req.method === 'GET' && req.path.startsWith('/api/workspace/assets/')
+  // An <img> element cannot attach custom headers. The read-only image routes
+  // accept the same identity in their query string; mutating routes still
+  // require request headers.
+  const allowQueryIdentity = req.method === 'GET' && (
+    req.path.startsWith('/api/workspace/assets/') || req.path.startsWith('/api/workspace/media/')
+  )
   const requestId = req.get('X-Workspace-Id') || (allowQueryIdentity ? req.query.workspaceId : null)
   const versionHeader = req.get('X-Workspace-Version')
     ?? (allowQueryIdentity ? req.query.workspaceVersion : null)
@@ -853,7 +865,8 @@ app.post('/api/workspace/move', workspaceGuard, async (req, res) => {
 async function handleWorkspaceUpload(req, res, { assetsOnly = false } = {}) {
   try {
     if (!req.file) throw new Error('缺少文件')
-    const extension = path.extname(req.file.originalname).toLowerCase().slice(1)
+    const file = { ...req.file, originalname: normalizeMultipartFilename(req.file.originalname) }
+    const extension = path.extname(file.originalname).toLowerCase().slice(1)
     if (assetsOnly && !IMAGE_EXTENSIONS.has(extension)) throw new Error('只允许上传图片文件')
     const ws = workspaceFor(req)
     const targetPath = assetsOnly ? 'assets' : (req.body?.path || '')
@@ -861,7 +874,7 @@ async function handleWorkspaceUpload(req, res, { assetsOnly = false } = {}) {
       // Image uploads always use the same assets directory, while the generic
       // endpoint can target any existing workspace directory.
       if (assetsOnly || targetPath === 'assets') await fs.mkdir(path.join(ws, 'assets'), { recursive: true })
-      return uploadFile(ws, targetPath, req.file, recoveryOptions())
+      return uploadFile(ws, targetPath, file, recoveryOptions())
     })
     sendData(res, result, req)
   } catch (error) { sendError(res, error, req) }
@@ -879,6 +892,22 @@ app.get('/api/workspace/assets/:filename', workspaceGuard, async (req, res) => {
       return res.status(404).send('Not found')
     }
     const result = await readFileBase64(workspaceFor(req), `assets/${filename}`)
+    setWorkspaceHeaders(res, workspaceInfoFor(req))
+    res.type(result.mime).send(Buffer.from(result.data, 'base64'))
+  } catch (error) {
+    if (error?.code === 'WORKSPACE_MISMATCH') return sendError(res, error, req)
+    res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
+  }
+})
+
+// Relative Markdown image references can point anywhere inside the workspace.
+// Reuse the file service's image MIME allowlist, workspace boundary checks and
+// symlink rejection rather than serving arbitrary workspace files.
+app.get('/api/workspace/media/*', workspaceGuard, async (req, res) => {
+  try {
+    const workspacePath = req.params[0]
+    if (!workspacePath) return res.status(404).send('Not found')
+    const result = await readFileBase64(workspaceFor(req), workspacePath)
     setWorkspaceHeaders(res, workspaceInfoFor(req))
     res.type(result.mime).send(Buffer.from(result.data, 'base64'))
   } catch (error) {

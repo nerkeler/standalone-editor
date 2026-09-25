@@ -83,11 +83,11 @@ standalone-editor/
 ### 编辑器
 - [x] 常用 Markdown 富文本编辑（TipTap；并非完整 Markdown 语法实现）
 - [x] 标题、列表、任务列表、引用、代码块
-- [x] 插入图片（支持拖拽上传、右键缩放）
+- [x] 插入图片（支持拖拽上传、右键缩放）；Markdown 保存相对图片路径，显示时才映射到工作区媒体接口
 - [x] 插入链接、插入表格
 - [x] 3 秒防抖自动保存
 - [x] 手动保存
-- [x] 源码模式查看/编辑；含 YAML front matter、WikiLinks、缩进列表、原始 HTML 或带额外选项的代码围栏等语法的文档会默认以源码模式打开。主动切换到富文本模式前会提示：富文本模式不能完整保留所有 Markdown 语法和元数据；需要保留原文时请继续使用源码模式。
+- [x] 源码模式查看/编辑；含 YAML front matter、WikiLinks、嵌套列表、引用式链接、脚注、转义语法、表格对齐、原始 HTML 或带额外选项的代码围栏等语法的文档会默认以源码模式打开。主动切换到富文本模式前会提示转换风险。
 - [x] 标签页多文件编辑
 - [x] 浏览器记住当前工作目录，下次打开自动进入
 - [x] 保存冲突提示和逐文件版本历史
@@ -144,6 +144,7 @@ standalone-editor/
 | POST | `/api/workspace/upload` | 上传文件 |
 | POST | `/api/upload/assets` | 上传图片到 `assets/`（兼容别名） |
 | GET | `/api/workspace/assets/:filename` | 读取图片资源（使用 `workspaceId` / `workspaceVersion` query） |
+| GET | `/api/workspace/media/*` | 按工作区相对路径读取图片，供 Markdown 相对图片引用渲染 |
 | GET | `/api/workspace/search?q=...` | 搜索文件名和 Markdown 内容 |
 | GET | `/api/workspace/export?path=...` | 导出 Markdown 文件 |
 | GET | `/api/workspace/download?path=...` | 下载普通文件的原始字节，不进行文本解码 |
@@ -151,6 +152,8 @@ standalone-editor/
 | GET | `/api/dirs?path=...` | 浏览目录；返回平台路径、面包屑、父级、可选状态和真实 `roots` 入口 |
 
 除 `/api/workspace/check`、`/api/workspace/set` 和目录浏览外，工作空间 API 需要 `X-Workspace-Id`，并建议同时发送 `X-Workspace-Version`。前端自动附带这些标识；图片 `<img>` URL 使用同名 query 参数，因为浏览器资源请求不能附加自定义请求头。
+
+Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析；上传的图片保存在工作区根目录 `assets/`，插入时写入相对当前文档的路径。旧版 `/api/workspace/assets/...` 图片引用仍可读取，并会在富文本编辑保存后转换为相对路径。外部图片 URL 保持原样；媒体接口只读取工作区内支持的图片类型，并拒绝符号链接路径。
 
 `GET /api/workspace/download?path=...` 受工作空间身份和路径校验保护，以附件形式流式返回普通文件的原始字节；它不会像 Markdown `/export` 那样将内容解码为文本。即使某个 `.md` 文件因非法 UTF-8 无法编辑，也可以用此接口无损下载。
 
@@ -182,7 +185,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ## 测试
 
-CI 在每次 push 和 pull request 时运行后端测试、前端构建和浏览器回归测试。浏览器任务使用 Node.js 22 和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
+CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。浏览器任务使用 Node.js 22 和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
 
 ```bash
 cd backend
@@ -190,8 +193,9 @@ npm ci
 npm test
 cd ../frontend
 npm ci
+npm run test:unit
 npm run build
 npm run test:browser
 ```
 
-浏览器回归测试覆盖编辑器保存、历史恢复、工作区校验和 Markdown 保真。浏览器测试需要 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；本地默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试文件在 CI 中串行运行，每次运行都会用独立临时目录创建笔记工作区和 Chrome 配置，并为前后端及 Chrome DevTools 选择临时回环端口。
+浏览器回归测试覆盖编辑器保存、历史恢复、工作区校验、Markdown 富文本支持边界和图片相对路径。浏览器测试需要 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；本地默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试文件在 CI 中串行运行，每次运行都会用独立临时目录创建笔记工作区和 Chrome 配置，并为前后端及 Chrome DevTools 选择临时回环端口。

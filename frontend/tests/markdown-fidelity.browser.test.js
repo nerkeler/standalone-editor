@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -323,4 +323,143 @@ test('source-mode edits preserve the original Markdown bytes around the edit', a
   await clickSave()
   const saved = await waitForDiskMarker(fileName, 'SOURCE_EDIT_SENTINEL')
   assert.equal(saved, `${fixture}${marker}`)
+})
+
+test('nested Markdown images render through workspace media and stay relative through editing and upload', async () => {
+  const fileName = 'docs/topic/relative-images.md'
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  await mkdir(path.join(workspace, 'docs', 'topic'), { recursive: true })
+  await mkdir(path.join(workspace, 'images'), { recursive: true })
+  await mkdir(path.join(workspace, 'assets'), { recursive: true })
+  await writeFile(path.join(workspace, 'images', '封 面.png'), imageBytes)
+  await writeFile(path.join(workspace, 'assets', 'legacy.png'), imageBytes)
+  const original = [
+    '# MARKDOWN_IMAGE_FIXTURE',
+    '',
+    '![封面](../../images/封%20面.png "封面标题")',
+    '',
+    '![旧资源](/api/workspace/assets/legacy.png?workspaceId=old&workspaceVersion=2 "旧标题")',
+    '',
+    '![外链](https://example.com/external.png)',
+    '',
+    '![内嵌](data:image/png;base64,iVBORw0KGgo=)',
+    '',
+    '![越界](../../../outside.png)',
+    '',
+    'Image fixture end.',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), original)
+  await setupPage()
+
+  await waitUntil('docs folder in tree', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === 'docs')`,
+  ))
+  await connection.evaluate(`document.querySelector('[aria-label="更多目录操作"]')?.click()`)
+  await waitUntil('directory actions menu to open', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).some(node => node.innerText.trim() === '全部展开')`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).find(node => node.innerText.trim() === '全部展开')?.click()`)
+  await waitUntil('nested Markdown file visible after expand all', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === 'relative-images.md')`,
+  ))
+  await openFile('relative-images.md', 'MARKDOWN_IMAGE_FIXTURE')
+  await waitUntil('relative image nodes in rich editor', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror img').length === 5`,
+  ))
+  const rendered = JSON.parse(await connection.evaluate(`JSON.stringify(Array.from(document.querySelectorAll('.ProseMirror img')).map(img => ({
+    src: img.getAttribute('src'),
+    markdownSrc: img.getAttribute('data-markdown-src'),
+    title: img.getAttribute('data-markdown-title'),
+  })))`))
+  const activeWorkspace = JSON.parse(await connection.evaluate(`localStorage.getItem('editor_workspace_info')`))
+  const identityQuery = `workspaceId=${encodeURIComponent(activeWorkspace.workspaceId)}&workspaceVersion=${activeWorkspace.workspaceVersion}`
+  assert.equal(rendered[0].src, `/api/workspace/media/images/%E5%B0%81%20%E9%9D%A2.png?${identityQuery}`)
+  assert.equal(rendered[0].markdownSrc, '../../images/%E5%B0%81%20%E9%9D%A2.png')
+  assert.equal(rendered[0].title, '封面标题')
+  assert.equal(rendered[1].src, `/api/workspace/media/assets/legacy.png?${identityQuery}`)
+  assert.equal(rendered[1].markdownSrc, '../../assets/legacy.png')
+  assert.equal(rendered[1].title, '旧标题')
+  assert.equal(rendered[2].src, 'https://example.com/external.png')
+  assert.equal(rendered[2].markdownSrc, null)
+  assert.equal(rendered[3].src, 'data:image/png;base64,iVBORw0KGgo=')
+  assert.equal(rendered[3].markdownSrc, null)
+  assert.equal(rendered[4].src, 'about:blank')
+  assert.equal(rendered[4].markdownSrc, '../../../outside.png')
+
+  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await waitUntil('nested source editor', () => connection.evaluate(
+    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`), original)
+  await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
+  await waitUntil('nested rich editor after source round trip', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="../../images/%E5%B0%81%20%E9%9D%A2.png"]'))`,
+  ))
+
+  const editMarker = ` IMAGE-EDIT-${Date.now()}`
+  await appendToRichEditor(editMarker)
+  await waitUntil('rich editor change to become dirty', () => connection.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('修改待保存')`,
+  ))
+  await connection.evaluate(`document.querySelector('.ProseMirror img[data-markdown-src="../../images/%E5%B0%81%20%E9%9D%A2.png"]')?.setAttribute('data-zoom', '175')`)
+  await clickSave()
+  try {
+    await waitForDiskMarker(fileName, editMarker)
+  } catch (error) {
+    const editorState = await connection.evaluate(`JSON.stringify({
+      source: document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value || null,
+      editorText: document.querySelector('.ProseMirror')?.innerText || null,
+      saveStatus: document.querySelector('.save-status')?.innerText || null,
+      saveButtonDisabled: document.querySelector('[aria-label="保存当前文件"]')?.disabled ?? null,
+      activeTab: document.querySelector('.document-tabs .active')?.innerText || null,
+    })`)
+    const diskState = await readFile(path.join(workspace, fileName), 'utf8').catch(failure => `read failed: ${failure.message}`)
+    throw new Error(`${error.message}\nEditor state: ${editorState}\nDisk state: ${diskState}`)
+  }
+  let saved = await readFile(path.join(workspace, fileName), 'utf8')
+  assert.match(saved, /!\[封面\]\(\.\.\/\.\.\/images\/%E5%B0%81%20%E9%9D%A2\.png "封面标题"\)<!-- zoom:175 -->/)
+  assert.match(saved, /!\[旧资源\]\(\.\.\/\.\.\/assets\/legacy\.png "旧标题"\)/)
+  assert.match(saved, /!\[外链\]\(https:\/\/example\.com\/external\.png\)/)
+  assert.match(saved, /!\[内嵌\]\(data:image\/png;base64,iVBORw0KGgo=\)/)
+  assert.match(saved, /!\[越界\]\(\.\.\/\.\.\/\.\.\/outside\.png\)/)
+  assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
+
+  const uploadName = '新图片.png'
+  await connection.evaluate(`(() => {
+    const input = document.querySelector('#img-up');
+    if (!input) return false;
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(${JSON.stringify([...imageBytes])})], ${JSON.stringify(uploadName)}, { type: 'image/png' }));
+    Object.defineProperty(input, 'files', { configurable: true, value: transfer.files });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`)
+  const imageInserted = await waitUntil('uploaded image inserted with a relative Markdown path', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png"]'))`,
+  ), 3000).catch(() => false)
+  if (!imageInserted) {
+    const uploadState = await connection.evaluate(`JSON.stringify({
+      inputCount: document.querySelectorAll('#img-up').length,
+      toast: document.querySelector('.ant-message')?.innerText || '',
+      images: Array.from(document.querySelectorAll('.ProseMirror img')).map(img => img.getAttribute('data-markdown-src')),
+    })`)
+    const uploadedFiles = await readdir(path.join(workspace, 'assets')).catch(() => [])
+    throw new Error(`Uploaded image was not inserted. UI: ${uploadState}; assets: ${uploadedFiles.join(', ')}`)
+  }
+  await waitUntil('uploaded image saved into the nested Markdown document', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    return content.includes('../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png') ? content : null
+  })
+  saved = await readFile(path.join(workspace, fileName), 'utf8')
+  assert.match(saved, /!\[[^\]]*\]\(\.\.\/\.\.\/assets\/%E6%96%B0%E5%9B%BE%E7%89%87\.png\)/)
+  assert.deepEqual(await readFile(path.join(workspace, 'assets', uploadName)), imageBytes)
+  assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
+
+  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await waitUntil('saved relative image Markdown in source mode', () => connection.evaluate(
+    `document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value.includes(${JSON.stringify('../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png')})`,
+  ))
+  const source = await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`)
+  assert.match(source, /\.\.\/\.\.\/images\/%E5%B0%81%20%E9%9D%A2\.png "封面标题"/)
+  assert.match(source, /\.\.\/\.\.\/assets\/legacy\.png "旧标题"/)
 })
