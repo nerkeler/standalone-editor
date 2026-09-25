@@ -22,12 +22,15 @@ let backendServer
 let chromeProcess
 let chromePort
 let chromeProfile
+let chromeTargetId
 let connection
 let logs = ''
 const state = {
+  phase: 'setup',
   checkMode: 'unavailable',
   checkCount: 0,
   editorRequests: 0,
+  editorRequestDetails: [],
   dirRequests: 0,
   setRequests: 0,
   requestOrder: [],
@@ -69,6 +72,21 @@ async function waitUntil(description, check, timeoutMs = 12000) {
     await new Promise(resolve => setTimeout(resolve, 100))
   }
   throw new Error(`Timed out waiting for ${description}${lastError ? `: ${lastError.message}` : ''}\n${logs}`)
+}
+
+async function waitForEditorRequestsToSettle(quietMs = 500, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  let previousCount = state.editorRequests
+  let quietSince = Date.now()
+  while (Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+    if (state.editorRequests !== previousCount) {
+      previousCount = state.editorRequests
+      quietSince = Date.now()
+    }
+    if (Date.now() - quietSince >= quietMs) return
+  }
+  throw new Error(`Timed out waiting for old editor requests to settle: ${JSON.stringify(state.editorRequestDetails)}`)
 }
 
 function waitForProcessExit(child, timeoutMs) {
@@ -168,6 +186,14 @@ function createFakeBackend() {
     if (url.pathname === '/api/workspace' && request.method === 'GET') {
       state.editorRequests += 1
       state.requestOrder.push('editor-tree')
+      state.editorRequestDetails.push({
+        phase: state.phase,
+        pageId: request.headers['x-test-page-target'] || null,
+        workspaceId: request.headers['x-workspace-id'] || null,
+        workspaceVersion: request.headers['x-workspace-version'] || null,
+        referer: request.headers.referer || null,
+        receivedAt: Date.now(),
+      })
       return sendJson(response, 200, [])
     }
     if (url.pathname.startsWith('/api/workspace/')) return sendJson(response, 200, [])
@@ -267,6 +293,38 @@ async function navigateWithLocalStorage() {
   ))
 }
 
+async function openBrowserTarget() {
+  const response = await fetch(`http://127.0.0.1:${chromePort}/json/new?about:blank`, { method: 'PUT' })
+  assert.equal(response.ok, true, 'Chrome should create an isolated page target')
+  const target = await response.json()
+  chromeTargetId = target.id
+  connection = await DevToolsConnection.connect(target.webSocketDebuggerUrl)
+  await connection.send('Page.enable')
+  await connection.send('Runtime.enable')
+  await connection.send('Network.enable')
+  await connection.send('Network.setExtraHTTPHeaders', {
+    headers: { 'X-Test-Page-Target': chromeTargetId },
+  })
+}
+
+function currentPageEditorRequests() {
+  return state.editorRequestDetails.filter(request => request.pageId === chromeTargetId)
+}
+
+async function closeBrowserTarget() {
+  const targetId = chromeTargetId
+  const targetConnection = connection
+  chromeTargetId = null
+  connection = null
+  if (!targetId) return
+  try {
+    const response = await fetch(`http://127.0.0.1:${chromePort}/json/close/${targetId}`)
+    assert.equal(response.ok, true, 'Chrome should close the previous test page')
+  } finally {
+    targetConnection?.close()
+  }
+}
+
 async function clickButton(label) {
   const result = await connection.evaluate(`(() => {
     const button = Array.from(document.querySelectorAll('button')).find(item => item.innerText.replace(/\\s/g, '').trim() === ${JSON.stringify(label)});
@@ -285,7 +343,7 @@ before(async () => {
   tempRoot = await mkdtemp(path.join(os.tmpdir(), 'standalone-editor-workspace-check-'))
   frontendPort = await freePort()
   backendPort = await freePort()
-  Object.assign(state, { checkMode: 'unavailable', checkCount: 0, editorRequests: 0, dirRequests: 0, setRequests: 0, requestOrder: [] })
+  Object.assign(state, { phase: 'setup', checkMode: 'unavailable', checkCount: 0, editorRequests: 0, editorRequestDetails: [], dirRequests: 0, setRequests: 0, requestOrder: [] })
 
   backendServer = createFakeBackend()
   await new Promise((resolve, reject) => {
@@ -316,12 +374,7 @@ before(async () => {
     const port = Number(contents.split('\n')[0])
     return port > 0 ? port : null
   })
-  const response = await fetch(`http://127.0.0.1:${chromePort}/json/new?about:blank`, { method: 'PUT' })
-  assert.equal(response.ok, true)
-  const target = await response.json()
-  connection = await DevToolsConnection.connect(target.webSocketDebuggerUrl)
-  await connection.send('Page.enable')
-  await connection.send('Runtime.enable')
+  await openBrowserTarget()
   await navigateWithLocalStorage()
 })
 
@@ -353,6 +406,7 @@ after(async () => {
 })
 
 test('stale browser workspace is diagnostic only and retry enters editor only after /check succeeds', async () => {
+  state.phase = 'stale-workspace'
   await waitUntil('offline path in diagnostic', () => connection.evaluate(
     `document.body.innerText.includes(${JSON.stringify(staleWorkspace)})`,
   ))
@@ -369,22 +423,30 @@ test('stale browser workspace is diagnostic only and retry enters editor only af
   state.checkMode = 'available'
   await clickButton('重试')
   await waitUntil('editor tree request after successful /check', () => state.editorRequests > 0)
+  assert.ok(currentPageEditorRequests().length > 0, `the current test page should issue its editor tree request; requests: ${JSON.stringify(state.editorRequestDetails)}`)
   const lastCheck = state.requestOrder.lastIndexOf('check')
   const editorRequest = state.requestOrder.indexOf('editor-tree')
   assert.ok(lastCheck >= 0 && editorRequest > lastCheck, 'Editor requests must happen after a successful workspace check')
 })
 
 test('invalid saved config still allows directory browsing and shows recovery-root selection errors', async () => {
+  state.phase = 'closing-previous-page'
+  await closeBrowserTarget()
+  await waitForEditorRequestsToSettle()
   state.checkMode = 'invalid'
   state.checkCount = 0
   state.editorRequests = 0
   state.dirRequests = 0
   state.setRequests = 0
   state.requestOrder = []
+  state.phase = 'invalid-config'
+  await openBrowserTarget()
   await navigateWithLocalStorage()
   await waitUntil('configuration diagnostic', () => connection.evaluate(
     `document.body.innerText.includes('工作区配置文件格式无效。') && document.body.innerText.includes('/tmp/standalone-editor-config.json')`,
   ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-sidebar'))`), false, 'invalid configuration must keep Editor unmounted')
+  assert.equal(currentPageEditorRequests().length, 0, `invalid configuration page must not request the editor tree; requests: ${JSON.stringify(state.editorRequestDetails)}`)
   assert.equal(await connection.evaluate(`document.body.innerText.includes('上次记录的路径（当前未验证）')`), false, 'a client cache must not be presented as the server-saved path for a malformed config')
 
   await clickButton('选择工作目录')
@@ -400,10 +462,11 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   await waitUntil('backend rejected invalid recovery location', () => state.setRequests === 1 && connection.evaluate(
     `Array.from(document.querySelectorAll('[role="alert"]')).some(item => item.innerText.includes('恢复数据目录位于所选工作区内部'))`,
   ))
-  assert.equal(state.editorRequests, 0, 'a rejected workspace selection must never mount Editor')
+  assert.equal(currentPageEditorRequests().length, 0, `a rejected workspace selection must never request the editor tree; requests: ${JSON.stringify(state.editorRequestDetails)}`)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-sidebar'))`), false, 'a rejected workspace selection must keep Editor unmounted')
   await clickButton('取消')
 
   state.checkMode = 'available'
   await clickButton('重试')
-  await waitUntil('valid backend check to enter the editor', () => state.editorRequests > 0)
+  await waitUntil('valid backend check to enter the editor', () => currentPageEditorRequests().length > 0)
 })
