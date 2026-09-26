@@ -2,7 +2,9 @@ import fs from 'fs/promises'
 import { constants as fsConstants } from 'node:fs'
 import path from 'path'
 import os from 'os'
+import { Readable } from 'node:stream'
 import { createHash, randomUUID } from 'crypto'
+import { extractMarkdownReferences, resolveWorkspaceReference } from './markdownMoveImpact.js'
 
 const IMAGE_MIMES = {
   jpg: 'image/jpeg',
@@ -15,6 +17,31 @@ const IMAGE_MIMES = {
   ico: 'image/x-icon',
   tiff: 'image/tiff',
   tif: 'image/tiff',
+}
+
+export const MAX_EDITABLE_MARKDOWN_BYTES = 5 * 1024 * 1024
+export const MAX_MARKDOWN_PREVIEW_BYTES = 10 * 1024 * 1024
+const MAX_EDITABLE_HISTORY_BASE64_LENGTH = Math.ceil(MAX_EDITABLE_MARKDOWN_BYTES / 3) * 4
+
+function markdownTooLarge(size) {
+  const error = makeError('Markdown 文件超过 5 MiB 可编辑上限，请下载或拆分后再编辑', 'DOCUMENT_TOO_LARGE')
+  error.details = { size, maxEditableBytes: MAX_EDITABLE_MARKDOWN_BYTES }
+  return error
+}
+
+function decodeEditableHistoryBytes(contentBase64, recordedSize) {
+  if (Number.isSafeInteger(recordedSize) && recordedSize > MAX_EDITABLE_MARKDOWN_BYTES) {
+    throw markdownTooLarge(recordedSize)
+  }
+  if (typeof contentBase64 !== 'string') throw historyCorrupt()
+  // Check before Buffer.from: legacy/corrupt history records may omit `size`,
+  // so the JSON metadata alone cannot bound the decoded allocation.
+  if (contentBase64.length > MAX_EDITABLE_HISTORY_BASE64_LENGTH) {
+    throw markdownTooLarge(Math.ceil(contentBase64.length * 3 / 4))
+  }
+  const bytes = Buffer.from(contentBase64, 'base64')
+  if (bytes.byteLength > MAX_EDITABLE_MARKDOWN_BYTES) throw markdownTooLarge(bytes.byteLength)
+  return bytes
 }
 
 function makeError(message, code = 'INVALID_PATH') {
@@ -276,12 +303,63 @@ export async function listTree(workspace) {
 export async function readFile(workspace, reqPath) {
   assertMarkdownPath(reqPath)
   const location = await fileLocation(workspace, reqPath)
-  const { target, stat } = location
+  const { stat } = location
   if (!stat) throw makeError('文件不存在', 'ENOENT')
-  const bytes = await readRegularFile(location)
-  return { content: decodeMarkdownBytes(bytes), revision: contentRevision(bytes) }
+  const handle = await openRegularFileHandle(location)
+  try {
+    const openedStat = await handle.stat()
+    const size = openedStat.size
+    const editable = size <= MAX_EDITABLE_MARKDOWN_BYTES
+    if (size > MAX_MARKDOWN_PREVIEW_BYTES) {
+      return {
+        content: null,
+        revision: null,
+        size,
+        editable: false,
+        previewAvailable: false,
+        maxEditableBytes: MAX_EDITABLE_MARKDOWN_BYTES,
+      }
+    }
+
+    // Allocate at most one byte beyond the read-only preview boundary. This
+    // detects a file that grew after lstat without allowing that race to turn
+    // a bounded preview into an unbounded read.
+    const buffer = Buffer.allocUnsafe(Math.min(size + 1, MAX_MARKDOWN_PREVIEW_BYTES + 1))
+    let bytesRead = 0
+    while (bytesRead < buffer.length) {
+      const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, bytesRead)
+      if (!result.bytesRead) break
+      bytesRead += result.bytesRead
+    }
+    const latestStat = await handle.stat()
+    if (bytesRead > MAX_MARKDOWN_PREVIEW_BYTES || latestStat.size > MAX_MARKDOWN_PREVIEW_BYTES) {
+      return {
+        content: null,
+        revision: null,
+        size: latestStat.size,
+        editable: false,
+        previewAvailable: false,
+        maxEditableBytes: MAX_EDITABLE_MARKDOWN_BYTES,
+      }
+    }
+    const bytes = buffer.subarray(0, bytesRead)
+    if (latestStat.size !== bytesRead) throw makeError('文件在读取时已变化，请重新打开', 'FILE_CHANGED')
+    return {
+      content: decodeMarkdownBytes(bytes),
+      revision: contentRevision(bytes),
+      size: bytes.byteLength,
+      editable,
+      previewAvailable: true,
+      maxEditableBytes: MAX_EDITABLE_MARKDOWN_BYTES,
+    }
+  } finally {
+    await handle.close()
+  }
 }
 
+// Compatibility for older clients of /api/workspace/image. The editor uses
+// the streaming media endpoint; this JSON shape remains available to clients
+// that still expect { mime, data, name }.
 export async function readFileBase64(workspace, reqPath) {
   const location = await existingPath(workspace, reqPath)
   const { base, full, stat } = location
@@ -296,16 +374,39 @@ export async function readFileBase64(workspace, reqPath) {
 // Open a regular workspace file as a byte stream. Workspace identity is
 // checked by the route and the path is resolved here without following a
 // symlink. Keeping the file handle open also lets the route stream large files.
-export async function openBinaryFile(workspace, reqPath) {
+export async function openBinaryFile(workspace, reqPath, { imagesOnly = false } = {}) {
   if (typeof reqPath !== 'string') throw makeError('路径必须是字符串')
   const { base, full, stat } = await existingPath(workspace, reqPath)
   if (!stat.isFile()) throw makeError('不是普通文件', 'UNSUPPORTED_FILE_TYPE')
+  const extension = path.extname(full).toLowerCase().slice(1)
+  const mime = IMAGE_MIMES[extension]
+  if (imagesOnly && !mime) throw makeError('只允许读取图片文件', 'UNSUPPORTED_FILE_TYPE')
   const handle = await openRegularFileHandle({ base, target: full, stat })
-  const openedStat = await handle.stat()
-  return {
-    stream: handle.createReadStream({ autoClose: true }),
-    size: openedStat.size,
-    name: path.basename(full),
+  try {
+    const openedStat = await handle.stat()
+    if (openedStat.size === 0) {
+      // A regular read stream with end: 0 may read a byte appended after this
+      // stat. Close the descriptor now and return a genuinely empty stream.
+      await handle.close()
+      return {
+        stream: Readable.from([]),
+        size: 0,
+        name: path.basename(full),
+        ...(imagesOnly ? { mime } : {}),
+      }
+    }
+    return {
+      // FileHandle streams use an inclusive end offset. Bound reads to the
+      // size observed on the opened descriptor so a concurrent append cannot
+      // exceed the response's Content-Length.
+      stream: handle.createReadStream({ autoClose: true, start: 0, end: openedStat.size - 1 }),
+      size: openedStat.size,
+      name: path.basename(full),
+      ...(imagesOnly ? { mime } : {}),
+    }
+  } catch (error) {
+    await handle.close().catch(() => {})
+    throw error
   }
 }
 
@@ -399,6 +500,104 @@ export async function moveItem(workspace, oldPath, newPath, options = {}) {
     throw error
   }
   return { success: true }
+}
+
+function remapMovedPath(value, oldPath, newPath) {
+  if (value === oldPath) return newPath
+  if (value.startsWith(`${oldPath}/`)) return `${newPath}${value.slice(oldPath.length)}`
+  return value
+}
+
+async function collectMarkdownPaths(workspace, directory, paths) {
+  const { base, full } = await existingPath(workspace, directory)
+  const entries = await fs.readdir(full, { withFileTypes: true })
+  for (const entry of entries) {
+    const entryPath = path.join(full, entry.name)
+    let stat
+    try {
+      stat = await fs.lstat(entryPath)
+    } catch (error) {
+      if (error.code === 'ENOENT') continue
+      throw error
+    }
+    if (stat.isSymbolicLink()) continue
+    if (stat.isDirectory()) {
+      await collectMarkdownPaths(workspace, relativePath(base, entryPath), paths)
+    } else if (stat.isFile() && isMarkdownPath(entryPath)) {
+      paths.push(relativePath(base, entryPath))
+    }
+  }
+}
+
+async function workspaceTargetExists(workspace, targetPath) {
+  try {
+    const { stat } = await existingPath(workspace, targetPath)
+    return stat.isFile() || stat.isDirectory()
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'INVALID_PATH') return false
+    throw error
+  }
+}
+
+// Read-only preflight for a move. It reports Markdown links and images whose
+// workspace-relative target changes after the move. Markdown bytes are never
+// rewritten here; callers must ask before carrying out any reported move.
+export async function getMoveReferenceImpacts(workspace, oldPath, newPath) {
+  const source = await existingPath(workspace, oldPath, { allowRoot: false })
+  const destination = await parentPath(workspace, newPath)
+  const newName = assertName(path.basename(destination.full))
+  const dest = path.join(destination.parent, newName)
+  assertInside(destination.base, dest)
+  if (dest === source.full) return { impacts: [], unscannedMarkdownFiles: [] }
+
+  const sourceRelative = path.relative(source.full, dest)
+  const destInsideSource = sourceRelative !== '' && sourceRelative !== '..' &&
+    !sourceRelative.startsWith(`..${path.sep}`) && !path.isAbsolute(sourceRelative)
+  if (source.stat.isDirectory() && destInsideSource) throw makeError('不能移动到自己的子目录')
+  await ensureDestinationDoesNotExist(dest)
+
+  const oldRelative = relativePath(source.base, source.full)
+  const newRelative = relativePath(source.base, dest)
+  const markdownPaths = []
+  await collectMarkdownPaths(workspace, '', markdownPaths)
+  markdownPaths.sort((a, b) => a < b ? -1 : a > b ? 1 : 0)
+  const impacts = []
+  const unscannedMarkdownFiles = []
+
+  for (const documentPath of markdownPaths) {
+    let content
+    try {
+      ({ content } = await readFile(workspace, documentPath))
+    } catch (error) {
+      if (error.code === 'INVALID_UTF8' || error.code === 'INVALID_TEXT_FILE') {
+        unscannedMarkdownFiles.push(documentPath)
+        continue
+      }
+      throw error
+    }
+    if (typeof content !== 'string') {
+      unscannedMarkdownFiles.push(documentPath)
+      continue
+    }
+    const documentAfterPath = remapMovedPath(documentPath, oldRelative, newRelative)
+    for (const reference of extractMarkdownReferences(content)) {
+      const targetPath = resolveWorkspaceReference(documentPath, reference.destination)
+      if (!targetPath || !(await workspaceTargetExists(workspace, targetPath))) continue
+      const expectedTargetPath = remapMovedPath(targetPath, oldRelative, newRelative)
+      const actualTargetPath = resolveWorkspaceReference(documentAfterPath, reference.destination)
+      if (actualTargetPath === expectedTargetPath) continue
+      impacts.push({
+        documentPath,
+        documentAfterPath,
+        kind: reference.kind,
+        reference: reference.destination,
+        targetPath,
+        expectedTargetPath,
+      })
+    }
+  }
+
+  return { impacts, unscannedMarkdownFiles }
 }
 
 const HISTORY_RETENTION_PER_FILE = 50
@@ -571,7 +770,7 @@ async function readHistoryEntry(workspace, base, target, historyId, { root } = {
   if (entry?.version !== 1 || entry.id !== historyId || !belongsToPath || typeof entry.contentBase64 !== 'string') {
     throw makeError('历史版本记录无效', 'HISTORY_NOT_FOUND')
   }
-  const bytes = Buffer.from(entry.contentBase64, 'base64')
+  const bytes = decodeEditableHistoryBytes(entry.contentBase64, entry.size)
   if (contentRevision(bytes) !== entry.revision) throw makeError('历史版本校验失败', 'HISTORY_CORRUPT')
   return { entry, bytes }
 }
@@ -897,7 +1096,7 @@ export async function readOrphanFileHistory(workspace, orphanId, historyId, opti
     !Number.isSafeInteger(entry.size) || entry.size < 0 ||
     typeof entry.savedAt !== 'string' || !Number.isFinite(Date.parse(entry.savedAt))
   ) throw historyNotFound()
-  const bytes = Buffer.from(entry.contentBase64, 'base64')
+  const bytes = decodeEditableHistoryBytes(entry.contentBase64, entry.size)
   if (
     bytes.toString('base64') !== entry.contentBase64 || bytes.byteLength !== entry.size ||
     contentRevision(bytes) !== entry.revision
@@ -1155,10 +1354,14 @@ async function readCurrent(location, reqPath, expectedRevision) {
 
 async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, options = {}) {
   assertMarkdownPath(reqPath)
+  if (bytes.byteLength > MAX_EDITABLE_MARKDOWN_BYTES) throw markdownTooLarge(bytes.byteLength)
   decodeMarkdownBytes(bytes)
   validateExpectedRevision(expectedRevision)
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
   const { base, target, parent } = location
+  if (location.stat && location.stat.size > MAX_EDITABLE_MARKDOWN_BYTES) {
+    throw markdownTooLarge(location.stat.size)
+  }
   const existing = await readCurrent(location, reqPath, expectedRevision)
   if (existing && existing.bytes.equals(bytes)) {
     return { success: true, path: relativePath(base, target), revision: contentRevision(existing.bytes) }
@@ -1219,6 +1422,8 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
 export async function writeFile(workspace, reqPath, content, expectedRevision, options = {}) {
   if (typeof content !== 'string') throw makeError('content 必须是字符串', 'INVALID_CONTENT')
   assertMarkdownPath(reqPath)
+  const size = Buffer.byteLength(content, 'utf8')
+  if (size > MAX_EDITABLE_MARKDOWN_BYTES) throw markdownTooLarge(size)
   return writeBytesVersioned(workspace, reqPath, encodeMarkdownContent(content), expectedRevision, options)
 }
 
@@ -1322,6 +1527,9 @@ export async function restoreFileHistory(workspace, reqPath, historyId, expected
   assertMarkdownPath(reqPath)
   validateExpectedRevision(expectedRevision)
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
+  if (location.stat && location.stat.size > MAX_EDITABLE_MARKDOWN_BYTES) {
+    throw markdownTooLarge(location.stat.size)
+  }
   const current = await readCurrent(location, reqPath, expectedRevision)
   const { bytes } = await readHistoryEntry(workspace, location.base, location.target, historyId, options)
   // Restoring uses the same optimistic check, history capture and atomic write

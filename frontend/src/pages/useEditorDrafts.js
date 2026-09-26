@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
+import { MAX_EDITABLE_MARKDOWN_BYTES, utf8ByteLength } from '../markdownSize'
 
 const API = '/api/workspace'
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif']
 const DRAFT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
 const DRAFT_SNAPSHOT_INTERVAL_MS = 500
+// Refuse pathological legacy stores before parsing them. New writes also use
+// the actual serialized size and browser quota, retaining older drafts when
+// they fit instead of imposing a small per-document recovery cap.
+const MAX_PENDING_DRAFT_STORE_CODE_UNITS = 32 * 1024 * 1024
 
 export function isImageFile(name) {
   return IMAGE_EXTS.includes(String(name || '').split('.').pop()?.toLowerCase() || '')
@@ -77,6 +82,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const fileRevisionsRef = useRef({})
   const conflictsRef = useRef({})
   const restoredDraftsRef = useRef({})
+  const saveBlockedRef = useRef(new Set())
   const snapshotTimerRef = useRef(null)
   const lastSnapshotWriteRef = useRef(0)
   const presenceChannelRef = useRef(null)
@@ -106,7 +112,12 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const legacyPendingDraftKey = `editor_pending_drafts:${encodeURIComponent(draftWorkspaceIdentity)}`
   const readDraftStore = useCallback(key => {
     try {
-      const parsed = JSON.parse(localStorage.getItem(key) || 'null')
+      const raw = localStorage.getItem(key) || ''
+      if (raw.length > MAX_PENDING_DRAFT_STORE_CODE_UNITS) {
+        setDraftStorageError('本地恢复草稿超过安全大小，未自动恢复；服务端自动保存仍会继续')
+        return {}
+      }
+      const parsed = JSON.parse(raw || 'null')
       if (!parsed || typeof parsed.drafts !== 'object' || Array.isArray(parsed.drafts)) return {}
       const savedAt = Number(parsed.savedAt) || 0
       // A draft left by a crashed/closed tab should not shadow a file forever.
@@ -116,12 +127,19 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
         localStorage.removeItem(key)
         return {}
       }
-      return Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
+      let oversizedDraft = false
+      const drafts = Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
         if (!isMarkdownFile(path)) return []
         const snapshot = normalizeDraftSnapshot(value, savedAt)
         if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
+        if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
+          oversizedDraft = true
+          return []
+        }
         return [[path, snapshot]]
       }))
+      if (oversizedDraft) setDraftStorageError('超出 5 MiB 上限的本地草稿未自动恢复')
+      return drafts
     } catch (error) {
       setDraftStorageError(error?.name === 'SecurityError'
         ? '浏览器禁止访问本地恢复存储'
@@ -132,21 +150,87 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
 
   const readPendingDrafts = useCallback(() => readDraftStore(pendingDraftKey), [pendingDraftKey, readDraftStore])
 
-  const writePendingDrafts = useCallback(drafts => {
+  const writePendingDrafts = useCallback((drafts, requiredPaths = []) => {
     try {
-      if (Object.keys(drafts).length) {
+      let skippedLargeDraft = false
+      let persistenceFailed = false
+      const requiredPathSet = new Set(requiredPaths)
+      const entries = Object.entries(drafts)
+        .map(([path, value]) => [path, normalizeDraftSnapshot(value, Date.now())])
+        .filter(([, snapshot]) => {
+          if (!snapshot) return false
+          if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
+            skippedLargeDraft = true
+            return false
+          }
+          return true
+        })
+        .sort((left, right) => {
+          const leftRequired = requiredPathSet.has(left[0])
+          const rightRequired = requiredPathSet.has(right[0])
+          if (leftRequired !== rightRequired) return leftRequired ? -1 : 1
+          return (right[1].savedAt || 0) - (left[1].savedAt || 0)
+        })
+      const persist = currentEntries => {
+        if (!currentEntries.length) {
+          localStorage.removeItem(pendingDraftKey)
+          return
+        }
         const savedAt = Date.now()
-        const normalized = Object.fromEntries(Object.entries(drafts).flatMap(([path, value]) => {
-          const snapshot = normalizeDraftSnapshot(value, savedAt)
-          return snapshot ? [[path, { ...snapshot, savedAt }]] : []
-        }))
-        localStorage.setItem(pendingDraftKey, JSON.stringify({ version: 2, savedAt, drafts: normalized }))
-      } else {
-        localStorage.removeItem(pendingDraftKey)
+        const normalized = Object.fromEntries(currentEntries.map(([path, snapshot]) => [
+          path,
+          { ...snapshot, savedAt },
+        ]))
+        const serialized = JSON.stringify({ version: 2, savedAt, drafts: normalized })
+        localStorage.setItem(pendingDraftKey, serialized)
       }
-      setDraftStorageError('')
-      lastSnapshotWriteRef.current = Date.now()
-      return true
+      if (!entries.length) {
+        localStorage.removeItem(pendingDraftKey)
+      } else {
+        try {
+          persist(entries)
+        } catch (error) {
+          if (error?.name !== 'QuotaExceededError') throw error
+          skippedLargeDraft = true
+          const retained = [...entries]
+          let saved = false
+          while (retained.length) {
+            retained.pop() // The entries are newest first, so trim older recovery items first.
+            // Never call persist([]) as a quota fallback: it removes the old
+            // store, even though setItem failures leave that data intact.
+            if (!retained.length) break
+            try {
+              persist(retained)
+              saved = true
+              break
+            } catch (retryError) {
+              if (retryError?.name !== 'QuotaExceededError') throw retryError
+            }
+          }
+          if (!saved) persistenceFailed = true
+        }
+      }
+      let requiredDraftsPersisted = true
+      if (requiredPaths.length) {
+        try {
+          const stored = JSON.parse(localStorage.getItem(pendingDraftKey) || 'null')
+          requiredDraftsPersisted = requiredPaths.every(path => (
+            typeof drafts[path]?.content === 'string' &&
+            stored?.drafts?.[path]?.content === drafts[path].content
+          ))
+        } catch {
+          requiredDraftsPersisted = false
+        }
+      }
+      setDraftStorageError(!requiredDraftsPersisted
+        ? '此文件的本地恢复草稿未能写入；为保护内容，标签页仍保持打开'
+        : persistenceFailed
+          ? '浏览器本地恢复存储已满，部分草稿未写入；既有恢复数据已保留'
+          : skippedLargeDraft
+            ? '浏览器本地恢复存储不足，已优先保留较新的草稿；服务端自动保存仍会继续'
+            : '')
+      if (!persistenceFailed) lastSnapshotWriteRef.current = Date.now()
+      return requiredPaths.length ? requiredDraftsPersisted : !persistenceFailed
     } catch (error) {
       setDraftStorageError(error?.name === 'QuotaExceededError'
         ? '浏览器存储空间已满，最近的未保存内容可能无法恢复'
@@ -192,6 +276,10 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
 
   const addRecoveryAlternative = useCallback((path, snapshot, sourceSession) => {
     if (!path || !snapshot) return
+    if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
+      setDraftStorageError('超出 5 MiB 上限的恢复草稿不可编辑')
+      return
+    }
     setRecoveryAlternatives(previous => {
       const entries = previous[path] || []
       if (entries.some(entry => (
@@ -214,6 +302,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
     const accepted = {}
     for (const [path, snapshot] of Object.entries(snapshots)) {
       if (!isMarkdownFile(path)) continue
+      if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) continue
       const current = restoredDraftsRef.current[path]
       if (current && current.content !== snapshot.content) {
         addRecoveryAlternative(path, snapshot, sourceSession)
@@ -412,10 +501,12 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
         candidates = candidates.filter((_, index) => !responses.has(candidateSessions[index]))
       }
 
-      for (const key of candidates) {
-        if (cancelled) return
+        for (const key of candidates) {
+          if (cancelled) return
         try {
-          const parsed = JSON.parse(localStorage.getItem(key) || 'null')
+          const raw = localStorage.getItem(key) || ''
+          if (raw.length > MAX_PENDING_DRAFT_STORE_CODE_UNITS) continue
+          const parsed = JSON.parse(raw || 'null')
           if (!parsed || typeof parsed.drafts !== 'object') continue
           const savedAt = Number(parsed.savedAt) || 0
           if (savedAt && Date.now() - savedAt > DRAFT_RETENTION_MS) {
@@ -426,6 +517,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
             if (!isMarkdownFile(path)) return []
             const snapshot = normalizeDraftSnapshot(value, savedAt)
             if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
+            if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) return []
             return [[path, snapshot]]
           }))
           if (!Object.keys(abandoned).length) continue
@@ -491,6 +583,10 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const applyRecoveryAlternative = useCallback((path, entry) => {
     const snapshot = entry?.snapshot
     if (!isMarkdownFile(path) || !snapshot) return
+    if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
+      setDraftStorageError('超出 5 MiB 上限的恢复草稿不可编辑')
+      return
+    }
     const currentContent = draftContentsRef.current[path]
     if (dirtyRef.current[path] && currentContent !== undefined && currentContent !== snapshot.content) {
       addRecoveryAlternative(path, {
@@ -516,11 +612,23 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
     saveTimersRef.current.delete(path)
   }, [])
 
+  const setSaveBlocked = useCallback((path, blocked) => {
+    if (!path) return
+    if (blocked) {
+      saveBlockedRef.current.add(path)
+      clearSaveTimer(path)
+    } else {
+      saveBlockedRef.current.delete(path)
+    }
+  }, [clearSaveTimer])
+
   const doSave = useCallback((path, content = draftContentsRef.current[path]) => {
     if (!isMarkdownFile(path) || content === undefined) return Promise.resolve(false)
     clearSaveTimer(path)
+    if (saveBlockedRef.current.has(path)) return Promise.resolve(false)
     const previous = saveQueuesRef.current.get(path) || Promise.resolve()
     const operation = previous.catch(() => {}).then(async () => {
+      if (saveBlockedRef.current.has(path)) return false
       if (conflictsRef.current[path]) {
         const blocked = new Error('文件存在版本冲突，处理前不会覆盖磁盘内容')
         blocked.code = 'FILE_CONFLICT'
@@ -611,6 +719,15 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
 
   const waitForPathSaves = useCallback(async paths => {
     const unique = [...new Set(paths)]
+    const blockedDraftPath = unique.find(path => (
+      saveBlockedRef.current.has(path) && dirtyRef.current[path]
+    ))
+    if (blockedDraftPath) {
+      const blocked = new Error('文件只读且保留有未保存草稿；请先下载草稿并通过关闭标签确认丢弃')
+      blocked.code = 'UNSAVED_READ_ONLY_DRAFT'
+      blocked.path = blockedDraftPath
+      throw blocked
+    }
     for (const path of unique) {
       clearSaveTimer(path)
       if (dirtyRef.current[path] && draftContentsRef.current[path] !== undefined) {
@@ -619,7 +736,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
       const pending = saveQueuesRef.current.get(path)
       if (pending) await pending
     }
-  }, [clearSaveTimer, doSave])
+  }, [clearSaveTimer, doSave, saveBlockedRef])
 
   return {
     savedContents, setSavedContents,
@@ -636,6 +753,6 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
     recoveryAlternatives, applyRecoveryAlternative,
     draftStorageError, setFileRevision, setFileConflict, clearFileConflict,
     waitForDraftRestore,
-    setDraft, clearSaveTimer, doSave, scheduleSave, waitForPathSaves,
+    setDraft, clearSaveTimer, setSaveBlocked, saveBlockedRef, doSave, scheduleSave, waitForPathSaves,
   }
 }

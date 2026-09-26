@@ -15,6 +15,7 @@ import {
   openBinaryFile,
   createItem,
   moveItem,
+  getMoveReferenceImpacts,
   writeFile,
   listFileHistory,
   restoreFileHistory,
@@ -83,13 +84,14 @@ function errorStatus(error) {
   ) return 409
   if (error?.code === 'REVISION_REQUIRED') return 428
   if (error?.code === 'ENOENT' || error?.code === 'HISTORY_NOT_FOUND') return 404
+  if (error?.code === 'DOCUMENT_TOO_LARGE' || error?.code === 'ZIP_LIMIT') return 413
+  if (error?.code === 'FILE_CHANGED') return 409
   if (
     error?.code === 'RECOVERY_STORAGE_ERROR' || error?.code === 'HISTORY_CORRUPT' ||
     error?.code === 'HISTORY_ROLLBACK_FAILED' || error?.code === 'HISTORY_ARCHIVE_ROLLBACK_FAILED' ||
     error?.code === 'MOVE_ROLLBACK_FAILED' || error?.code === 'TRASH_ROLLBACK_FAILED' ||
     error?.code === 'WORKSPACE_CONFIG_SAVE_FAILED'
   ) return 500
-  if (error?.code === 'ZIP_LIMIT') return 413
   return 400
 }
 
@@ -448,7 +450,17 @@ app.use((req, res, next) => {
   }
   next()
 })
-app.use(express.json({ limit: '10mb' }))
+// A 5 MiB UTF-8 Markdown document can expand to roughly 30 MiB in JSON when
+// its control characters are escaped. Allow that only on the Markdown write
+// route; other JSON APIs keep their existing 10 MiB parser limit.
+const defaultJsonParser = express.json({ limit: '10mb' })
+const markdownWriteJsonParser = express.json({ limit: '32mb' })
+app.use((req, res, next) => {
+  const parser = req.method === 'PUT' && req.path === '/api/workspace'
+    ? markdownWriteJsonParser
+    : defaultJsonParser
+  parser(req, res, next)
+})
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } })
 
@@ -790,6 +802,21 @@ app.post('/api/workspace/file/restore', workspaceGuard, async (req, res) => {
   } catch (error) { sendError(res, error, req) }
 })
 
+async function streamWorkspaceImage(req, res, reqPath) {
+  const file = await openBinaryFile(workspaceFor(req), reqPath, { imagesOnly: true })
+  setWorkspaceHeaders(res, workspaceInfoFor(req))
+  res.setHeader('Content-Type', file.mime)
+  res.setHeader('Content-Length', String(file.size))
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Cache-Control', 'private, no-store')
+  if (file.mime === 'image/svg+xml') {
+    // SVG can contain active content when opened as a document. Serve it with
+    // a restrictive policy while still allowing it to render as an image.
+    res.setHeader('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; img-src data:; style-src 'unsafe-inline'; sandbox")
+  }
+  await pipeline(file.stream, res)
+}
+
 app.get('/api/workspace/image', workspaceGuard, async (req, res) => {
   try {
     const reqPath = req.query.path
@@ -852,6 +879,16 @@ app.delete('/api/workspace', workspaceGuard, async (req, res) => {
   } catch (error) { sendError(res, error, req) }
 })
 
+app.post('/api/workspace/move/preflight', workspaceGuard, async (req, res) => {
+  try {
+    const { old_path: oldPath, new_path: newPath } = req.body || {}
+    if (!oldPath || !newPath) throw new Error('缺少 old_path 或 new_path')
+    const ws = workspaceFor(req)
+    const result = await withWorkspaceMutation(ws, () => getMoveReferenceImpacts(ws, oldPath, newPath))
+    sendData(res, result, req)
+  } catch (error) { sendError(res, error, req) }
+})
+
 app.post('/api/workspace/move', workspaceGuard, async (req, res) => {
   try {
     const { old_path: oldPath, new_path: newPath } = req.body || {}
@@ -891,12 +928,12 @@ app.get('/api/workspace/assets/:filename', workspaceGuard, async (req, res) => {
     if (!filename || path.basename(filename) !== filename || filename.includes('\\')) {
       return res.status(404).send('Not found')
     }
-    const result = await readFileBase64(workspaceFor(req), `assets/${filename}`)
-    setWorkspaceHeaders(res, workspaceInfoFor(req))
-    res.type(result.mime).send(Buffer.from(result.data, 'base64'))
+    await streamWorkspaceImage(req, res, `assets/${filename}`)
   } catch (error) {
     if (error?.code === 'WORKSPACE_MISMATCH') return sendError(res, error, req)
-    res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
+    if (res.headersSent || res.destroyed) {
+      if (!res.destroyed) res.destroy()
+    } else res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
   }
 })
 
@@ -907,12 +944,12 @@ app.get('/api/workspace/media/*', workspaceGuard, async (req, res) => {
   try {
     const workspacePath = req.params[0]
     if (!workspacePath) return res.status(404).send('Not found')
-    const result = await readFileBase64(workspaceFor(req), workspacePath)
-    setWorkspaceHeaders(res, workspaceInfoFor(req))
-    res.type(result.mime).send(Buffer.from(result.data, 'base64'))
+    await streamWorkspaceImage(req, res, workspacePath)
   } catch (error) {
     if (error?.code === 'WORKSPACE_MISMATCH') return sendError(res, error, req)
-    res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
+    if (res.headersSent || res.destroyed) {
+      if (!res.destroyed) res.destroy()
+    } else res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
   }
 })
 
@@ -937,12 +974,17 @@ app.get('/api/workspace/export', workspaceGuard, async (req, res) => {
   try {
     const reqPath = req.query.path
     if (!reqPath) throw new Error('缺少 path 参数')
-    const result = await readFile(workspaceFor(req), reqPath)
-    const filename = path.basename(reqPath).replace(/[\r\n"\\]/g, '_')
+    const file = await openBinaryFile(workspaceFor(req), reqPath)
     res.setHeader('Content-Type', 'text/markdown; charset=utf-8')
-    res.setHeader('Content-Disposition', contentDispositionFilename(filename))
-    res.send(result.content)
-  } catch (error) { sendError(res, error, req) }
+    res.setHeader('Content-Length', String(file.size))
+    res.setHeader('Content-Disposition', contentDispositionFilename(file.name))
+    setWorkspaceHeaders(res, workspaceInfoFor(req))
+    await pipeline(file.stream, res)
+  } catch (error) {
+    if (res.headersSent || res.destroyed) {
+      if (!res.destroyed) res.destroy()
+    } else sendError(res, error, req)
+  }
 })
 
 // Attachments are streamed as their original bytes. This route deliberately

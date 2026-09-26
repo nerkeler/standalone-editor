@@ -22,8 +22,11 @@ import {
   searchWorkspace,
   writeFile,
   readFile,
+  openBinaryFile,
   restoreFileHistory,
   uploadFile,
+  MAX_EDITABLE_MARKDOWN_BYTES,
+  MAX_MARKDOWN_PREVIEW_BYTES,
 } from '../src/fileService.js'
 import { getRecoveryStats } from '../src/recoveryStatsService.js'
 
@@ -733,4 +736,118 @@ test('failed history archive leaves active records intact for the caller to roll
   )
   assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
   assert.deepEqual((await listOrphanFileHistory(workspace, { root: recovery })).items, [])
+})
+
+test('Markdown previews become read-only above 5 MiB and stop reading above 10 MiB', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const previewPath = path.join(workspace, 'large.md')
+  const exact = 'x'.repeat(MAX_EDITABLE_MARKDOWN_BYTES)
+  const accepted = await writeFile(workspace, 'exact-limit.md', exact, null, { root: recovery })
+  assert.equal(accepted.success, true)
+  assert.equal((await fs.stat(path.join(workspace, 'exact-limit.md'))).size, MAX_EDITABLE_MARKDOWN_BYTES)
+
+  const oversizedBytes = Buffer.alloc(MAX_EDITABLE_MARKDOWN_BYTES + 1, 0x78)
+  await fs.writeFile(previewPath, oversizedBytes)
+
+  const preview = await readFile(workspace, 'large.md')
+  assert.equal(preview.editable, false)
+  assert.equal(preview.previewAvailable, true)
+  assert.equal(preview.size, oversizedBytes.byteLength)
+  assert.equal(preview.content.length, oversizedBytes.byteLength)
+  assert.match(preview.revision, /^[a-f0-9]{64}$/)
+
+  const tooLargePath = path.join(workspace, 'download-only.md')
+  await fs.writeFile(tooLargePath, '')
+  await fs.truncate(tooLargePath, MAX_MARKDOWN_PREVIEW_BYTES + 1)
+  const downloadOnly = await readFile(workspace, 'download-only.md')
+  assert.equal(downloadOnly.editable, false)
+  assert.equal(downloadOnly.previewAvailable, false)
+  assert.equal(downloadOnly.content, null)
+  assert.equal(downloadOnly.revision, null)
+  assert.equal(downloadOnly.size, MAX_MARKDOWN_PREVIEW_BYTES + 1)
+
+  await assert.rejects(
+    writeFile(workspace, 'new.md', '界'.repeat(Math.floor(MAX_EDITABLE_MARKDOWN_BYTES / 3)) + 'xxx', null, { root: recovery }),
+    error => error.code === 'DOCUMENT_TOO_LARGE' && error.details.size > MAX_EDITABLE_MARKDOWN_BYTES,
+  )
+  await assert.rejects(
+    writeFile(workspace, 'large.md', 'replacement', preview.revision, { root: recovery }),
+    error => error.code === 'DOCUMENT_TOO_LARGE',
+  )
+  await assert.rejects(
+    restoreFileHistory(workspace, 'large.md', '00000000-0000-4000-8000-000000000000', preview.revision, { root: recovery }),
+    error => error.code === 'DOCUMENT_TOO_LARGE',
+  )
+  assert.equal((await fs.stat(previewPath)).size, oversizedBytes.byteLength)
+})
+
+test('history restore bounds Base64 before decoding even when legacy size metadata is missing', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'before')
+  const opened = await readFile(workspace, 'note.md')
+  const current = await writeFile(workspace, 'note.md', 'current', opened.revision, { root: recovery })
+  const [historyEntry] = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  const bucket = path.join(
+    recovery,
+    'history',
+    createHash('sha256').update(await fs.realpath(workspace)).digest('hex'),
+    createHash('sha256').update('note.md').digest('hex'),
+  )
+  const entryPath = path.join(bucket, `${historyEntry.id}.json`)
+  const entry = JSON.parse(await fs.readFile(entryPath, 'utf8'))
+  delete entry.size
+
+  // The first payload exceeds the predecode encoded-length bound. The second
+  // is within that bound but decodes to one byte over the editable limit.
+  entry.contentBase64 = Buffer.alloc(MAX_EDITABLE_MARKDOWN_BYTES + 2).toString('base64')
+  await fs.writeFile(entryPath, JSON.stringify(entry))
+  await assert.rejects(
+    restoreFileHistory(workspace, 'note.md', historyEntry.id, current.revision, { root: recovery }),
+    error => error.code === 'DOCUMENT_TOO_LARGE' && error.details.size > MAX_EDITABLE_MARKDOWN_BYTES,
+  )
+
+  entry.contentBase64 = Buffer.alloc(MAX_EDITABLE_MARKDOWN_BYTES + 1).toString('base64')
+  await fs.writeFile(entryPath, JSON.stringify(entry))
+  await assert.rejects(
+    restoreFileHistory(workspace, 'note.md', historyEntry.id, current.revision, { root: recovery }),
+    error => error.code === 'DOCUMENT_TOO_LARGE' && error.details.size === MAX_EDITABLE_MARKDOWN_BYTES + 1,
+  )
+  assert.equal(await fs.readFile(target, 'utf8'), 'current')
+})
+
+test('binary streams enforce image types and close the opened handle on cancellation', async t => {
+  const workspace = await temporaryWorkspace(t)
+  await fs.writeFile(path.join(workspace, 'pixel.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]))
+  const opened = await openBinaryFile(workspace, 'pixel.png', { imagesOnly: true })
+  assert.equal(opened.mime, 'image/png')
+  assert.equal(opened.size, 4)
+  const closed = new Promise(resolve => opened.stream.once('close', resolve))
+  opened.stream.destroy()
+  await closed
+
+  await assert.rejects(openBinaryFile(workspace, 'missing.txt', { imagesOnly: true }), error => error.code === 'UNSUPPORTED_FILE_TYPE' || error.code === 'ENOENT')
+})
+
+test('binary streams stay within the opened size for concurrent append and empty files', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const target = path.join(workspace, 'attachment.bin')
+  await fs.writeFile(target, Buffer.from('before'))
+  const opened = await openBinaryFile(workspace, 'attachment.bin')
+  await fs.appendFile(target, Buffer.from('-after'))
+  const chunks = []
+  for await (const chunk of opened.stream) chunks.push(chunk)
+  assert.deepEqual(Buffer.concat(chunks), Buffer.from('before'))
+  assert.equal(opened.size, Buffer.byteLength('before'))
+
+  const emptyPath = path.join(workspace, 'empty.bin')
+  await fs.writeFile(emptyPath, Buffer.alloc(0))
+  const empty = await openBinaryFile(workspace, 'empty.bin')
+  await fs.writeFile(emptyPath, Buffer.from('appended after open'))
+  const emptyChunks = []
+  for await (const chunk of empty.stream) emptyChunks.push(chunk)
+  assert.equal(empty.size, 0)
+  assert.equal(Buffer.concat(emptyChunks).byteLength, 0)
 })

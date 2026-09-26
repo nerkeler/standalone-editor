@@ -7,6 +7,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { createZip } from './zipFixture.js'
+import { MAX_EDITABLE_MARKDOWN_BYTES, MAX_MARKDOWN_PREVIEW_BYTES } from '../src/fileService.js'
 
 const backendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -120,6 +121,70 @@ test('file API requires revisions, returns structured conflicts, and restores gu
   assert.equal((await duplicateCreate.json()).code, 'FILE_CONFLICT')
 })
 
+test('large Markdown stays read-only, restore and writes are blocked, and downloads stream unchanged bytes', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-large-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-large-recovery-')
+  const previewBytes = Buffer.alloc(MAX_EDITABLE_MARKDOWN_BYTES + 1, 0x78)
+  const downloadBytes = Buffer.alloc(MAX_MARKDOWN_PREVIEW_BYTES + 1, 0x79)
+  await fs.writeFile(path.join(workspace, 'large.md'), previewBytes)
+  await fs.writeFile(path.join(workspace, 'download-only.md'), downloadBytes)
+  await fs.writeFile(path.join(workspace, 'empty.md'), Buffer.alloc(0))
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const check = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Workspace-Id': check.workspaceId,
+    'X-Workspace-Version': String(check.workspaceVersion),
+  }
+
+  const previewResponse = await fetch(`${baseUrl}/api/workspace/file?path=large.md`, { headers })
+  assert.equal(previewResponse.status, 200)
+  const preview = await previewResponse.json()
+  assert.equal(preview.editable, false)
+  assert.equal(preview.previewAvailable, true)
+  assert.equal(Buffer.byteLength(preview.content), previewBytes.byteLength)
+
+  const save = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'large.md', content: 'replacement', expectedRevision: preview.revision }),
+  })
+  assert.equal(save.status, 413)
+  assert.equal((await save.json()).code, 'DOCUMENT_TOO_LARGE')
+
+  const restore = await fetch(`${baseUrl}/api/workspace/file/restore`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ path: 'large.md', historyId: '00000000-0000-4000-8000-000000000000', expectedRevision: preview.revision }),
+  })
+  assert.equal(restore.status, 413)
+  assert.equal((await restore.json()).code, 'DOCUMENT_TOO_LARGE')
+
+  // This valid 2 MiB Markdown value expands beyond the old 10 MiB JSON body
+  // limit because each control character is escaped as six JSON bytes.
+  const escapedMarkdown = '\u0001'.repeat(2 * 1024 * 1024)
+  const escapedWrite = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'escaped-control.md', content: escapedMarkdown, expectedRevision: null }),
+  })
+  assert.equal(escapedWrite.status, 200)
+  assert.equal((await fs.stat(path.join(workspace, 'escaped-control.md'))).size, Buffer.byteLength(escapedMarkdown))
+
+  const downloadOnlyResponse = await fetch(`${baseUrl}/api/workspace/file?path=download-only.md`, { headers })
+  const downloadOnly = await downloadOnlyResponse.json()
+  assert.equal(downloadOnly.editable, false)
+  assert.equal(downloadOnly.previewAvailable, false)
+  assert.equal(downloadOnly.content, null)
+
+  const exported = await fetch(`${baseUrl}/api/workspace/export?path=download-only.md`, { headers })
+  assert.equal(exported.status, 200)
+  assert.equal(Number(exported.headers.get('content-length')), downloadBytes.byteLength)
+  assert.deepEqual(Buffer.from(await exported.arrayBuffer()), downloadBytes)
+
+  const emptyExport = await fetch(`${baseUrl}/api/workspace/export?path=empty.md`, { headers })
+  assert.equal(emptyExport.status, 200)
+  assert.equal(Number(emptyExport.headers.get('content-length')), 0)
+  assert.equal((await emptyExport.arrayBuffer()).byteLength, 0)
+})
+
 test('file API confines text editing to valid Markdown and downloads attachment bytes unchanged', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-api-types-workspace-')
   const recovery = await temporaryDirectory(t, 'standalone-editor-api-types-recovery-')
@@ -128,6 +193,7 @@ test('file API confines text editing to valid Markdown and downloads attachment 
   const nulTextBytes = Buffer.from('looks textual\0but is not')
   await fs.writeFile(path.join(workspace, 'readme.markdown'), '# searchable note')
   await fs.writeFile(path.join(workspace, 'archive.bin'), attachmentBytes)
+  await fs.writeFile(path.join(workspace, 'empty.bin'), Buffer.alloc(0))
   await fs.writeFile(path.join(workspace, 'invalid.md'), invalidUtf8Bytes)
   await fs.writeFile(path.join(workspace, 'nul.markdown'), nulTextBytes)
   let fifoCreated = false
@@ -226,6 +292,10 @@ test('file API confines text editing to valid Markdown and downloads attachment 
   assert.equal(downloaded.status, 200)
   assert.match(downloaded.headers.get('content-disposition'), /archive\.bin/)
   assert.deepEqual(Buffer.from(await downloaded.arrayBuffer()), attachmentBytes)
+  const emptyDownload = await download('empty.bin')
+  assert.equal(emptyDownload.status, 200)
+  assert.equal(Number(emptyDownload.headers.get('content-length')), 0)
+  assert.equal((await emptyDownload.arrayBuffer()).byteLength, 0)
   const unguardedDownload = await fetch(`${baseUrl}/api/workspace/download?path=archive.bin`)
   assert.equal(unguardedDownload.status, 409)
   assert.equal((await unguardedDownload.json()).code, 'WORKSPACE_MISMATCH')

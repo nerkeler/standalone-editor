@@ -31,11 +31,13 @@ import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import { requiresSourceMode } from './markdownSourcePolicy'
+import { createSearchCoordinator } from '../searchCoordinator'
 import {
   createUploadedImageReference,
   isExternalImageReference,
   resolveMarkdownImageReference,
 } from '../markdownImagePaths'
+import { MAX_EDITABLE_MARKDOWN_BYTES, isEditableMarkdownSize, utf8ByteLength } from '../markdownSize'
 import DocumentTabs from './DocumentTabs'
 import { ConflictModal, HistoryModal, RecoveryAlternativesModal, TrashModal } from './EditorRecoveryModals'
 import './Editor.css'
@@ -69,6 +71,19 @@ function SaveStatus({ status, onRetry }) {
       )}
     </div>
   )
+}
+
+function downloadMarkdownDraft(filePath, content) {
+  if (!filePath || typeof content !== 'string') return
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = `${filePath.split('/').pop()}.local-draft.md`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
 }
 
 function markdownToHtml(markdown, imageIdentity, documentPath) {
@@ -294,8 +309,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [contextMenu, setContextMenu] = useState({ visible: false, node: null, x: 0, y: 0 })
   const [moveModal, setMoveModal] = useState({ open: false, node: null })
   const [moveTarget, setMoveTarget] = useState('')
+  const [moveBusy, setMoveBusy] = useState(false)
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
+  const [largeMarkdownView, setLargeMarkdownView] = useState(null)
   const [editorFullscreen, setEditorFullscreen] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const [isMobile, setIsMobile] = useState(false)
@@ -317,6 +334,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [imageZoom, setImageZoom] = useState(100)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState([])
+  const [searchLoading, setSearchLoading] = useState(false)
+  const searchCoordinatorRef = useRef(null)
   const [importModal, setImportModal] = useState(false)
   const [fileLoading, setFileLoading] = useState(false)
   const [conflictReview, setConflictReview] = useState(null)
@@ -370,13 +389,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     draftStorageError, setFileRevision, setFileConflict, clearFileConflict,
     writePendingDrafts, clearPendingDraft, collectDirtyDrafts,
     remapPendingDrafts, removePendingDrafts, waitForDraftRestore,
-    setDraft, clearSaveTimer, doSave, scheduleSave, waitForPathSaves,
+    setDraft, clearSaveTimer, setSaveBlocked, saveBlockedRef, doSave, scheduleSave, waitForPathSaves,
   } = useEditorDrafts(workspace, activeFileRef, workspaceInfo?.workspaceId)
   // renderedFileRef identifies the document currently represented by the
   // ProseMirror instance. While a file request is pending the editor still
   // contains the previous tab, so capturing it as the new tab would corrupt
   // that tab's draft.
   const renderedFileRef = useRef('')
+  const readOnlyMarkdownRef = useRef(false)
   const loadingRef = useRef(false)
   const openRequestRef = useRef(0)
   const suppressEditorUpdateRef = useRef(false)
@@ -431,7 +451,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (!editor) return
     const editable = Boolean(
       activeFile && !fileLoading && isMarkdownFile(activeFile) &&
-      renderedFileRef.current === activeFile
+      renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current
     )
     editor.setEditable(editable, false)
   }, [activeFile, editor, fileLoading])
@@ -518,14 +538,27 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     } catch {}
   }, [])
 
-  // 搜索文件
-  const handleSearch = useCallback(async q => {
+  // 搜索文件：输入立即更新，网络请求由 coordinator 防抖并忽略过期响应。
+  const handleSearch = useCallback(q => {
     setSearchQuery(q)
-    if (!q.trim()) { setSearchResults([]); return }
-    try {
-      const res = await axios.get(`${API}/search`, { params: { q } })
-      setSearchResults(res.data || [])
-    } catch { setSearchResults([]) }
+    searchCoordinatorRef.current?.query(q)
+  }, [])
+
+  useEffect(() => {
+    const coordinator = createSearchCoordinator({
+      delayMs: 250,
+      search: async q => {
+        const res = await axios.get(`${API}/search`, { params: { q } })
+        return res.data || []
+      },
+      onResults: setSearchResults,
+      onLoading: setSearchLoading,
+    })
+    searchCoordinatorRef.current = coordinator
+    return () => {
+      coordinator.dispose()
+      if (searchCoordinatorRef.current === coordinator) searchCoordinatorRef.current = null
+    }
   }, [])
 
   const handleExpand = useCallback(keys => setExpandedKeys(keys), [])
@@ -571,7 +604,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const captureCurrentDraft = useCallback(() => {
     const path = activeFileRef.current
-    if (!isMarkdownFile(path) || loadingRef.current || renderedFileRef.current !== path) return undefined
+    if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || loadingRef.current || renderedFileRef.current !== path) return undefined
     // Converting Markdown to editor HTML and back can normalize whitespace or
     // syntax even when the user has not touched the document. Keep the exact
     // loaded bytes for clean files; real edits are already marked by the
@@ -580,7 +613,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     const content = showSourceRef.current ? sourceContentRef.current : serializeCurrentEditor()
     setDraft(path, content, true)
     return content
-  }, [serializeCurrentEditor])
+  }, [saveBlockedRef, serializeCurrentEditor])
 
   // 编辑内容变化 → 将当前快照绑定到当前路径，再防抖保存。
   useEffect(() => {
@@ -588,20 +621,60 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     const handler = () => {
       if (suppressEditorUpdateRef.current) return
       const path = activeFileRef.current
-      if (!isMarkdownFile(path) || showSourceRef.current || loadingRef.current || renderedFileRef.current !== path) return
+      if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || showSourceRef.current || loadingRef.current || renderedFileRef.current !== path) return
       const content = serializeCurrentEditor()
+      if (!isEditableMarkdownSize(content)) {
+        const accepted = draftContentsRef.current[path] ?? cleanContentsRef.current[path] ?? ''
+        setEditorMarkdown(accepted, path)
+        message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
+        return
+      }
       setDraft(path, content, true)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
       scheduleSave(path, content)
     }
     editor.on('update', handler)
     return () => editor.off('update', handler)
-  }, [editor, scheduleSave, serializeCurrentEditor])
+  }, [editor, scheduleSave, serializeCurrentEditor, setDraft, setEditorMarkdown, saveBlockedRef])
 
   const loadFile = useCallback(async (path, requestId) => {
     try {
       const res = await axios.get(`${API}/file`, { params: { path } })
-      const fetched = res.data.content ?? ''
+      const payload = res.data || {}
+      const fetched = typeof payload.content === 'string' ? payload.content : ''
+      const size = Number.isSafeInteger(payload.size) ? payload.size : utf8ByteLength(fetched)
+      const editable = payload.editable !== false && size <= MAX_EDITABLE_MARKDOWN_BYTES &&
+        typeof payload.content === 'string' && isEditableMarkdownSize(fetched)
+      if (!editable) {
+        if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
+        setSaveBlocked(path, true)
+        const hasUnsavedDraft = Boolean(dirtyRef.current[path] && draftContentsRef.current[path] !== undefined)
+        if (hasUnsavedDraft) writePendingDrafts(collectDirtyDrafts())
+        readOnlyMarkdownRef.current = true
+        setLargeMarkdownView({
+          path,
+          size,
+          content: payload.previewAvailable !== false && typeof payload.content === 'string' ? payload.content : null,
+          maxEditableBytes: Number(payload.maxEditableBytes) || MAX_EDITABLE_MARKDOWN_BYTES,
+          hasUnsavedDraft,
+        })
+        renderedFileRef.current = path
+        loadingRef.current = false
+        setFileLoading(false)
+        setShowSource(false)
+        showSourceRef.current = false
+        sourceContentRef.current = ''
+        setSourceContent('')
+        setEditorMarkdown('', path)
+        editor?.setEditable(false, false)
+        setSaveStatus(hasUnsavedDraft ? 'error' : 'saved')
+        if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
+        return
+      }
+      if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
+      setSaveBlocked(path, false)
+      readOnlyMarkdownRef.current = false
+      setLargeMarkdownView(null)
       const diskRevision = res.data.revision
       const hasDirtyDraft = Boolean(dirtyRef.current[path] && draftContentsRef.current[path] !== undefined)
       const restoredSnapshot = restoredDraftsRef.current[path]
@@ -657,9 +730,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       sourceContentRef.current = ''
       setSourceContent('')
       setSaveStatus('idle')
+      readOnlyMarkdownRef.current = false
+      setLargeMarkdownView(null)
       message.error('打开文件失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyZoom, clearFileConflict, setEditorMarkdown, setDraft, setFileConflict, setFileRevision])
+  }, [applyZoom, clearFileConflict, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked])
 
   const handleFileOpen = useCallback(async node => {
     // The tab identity probe and own-tab crash recovery must finish before a
@@ -672,7 +747,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       !loadingRef.current
     ) {
       setFileLoading(false)
-      editor?.setEditable(isMarkdownFile(node.name || path), false)
+      editor?.setEditable(isMarkdownFile(node.name || path) && !readOnlyMarkdownRef.current, false)
       return
     }
     const requestId = ++openRequestRef.current
@@ -688,6 +763,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
     activeFileRef.current = path
     setActiveFile(path)
+    readOnlyMarkdownRef.current = false
+    setLargeMarkdownView(null)
     setShowSource(false)
     showSourceRef.current = false
     setImageViewer(null)
@@ -698,12 +775,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
     if (isImageFile(node.name || path)) {
       try {
-        const res = await axios.get(`${API}/image`, { params: { path } })
         if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
+        const reference = createUploadedImageReference(path, path, workspaceInfoRef.current)
+        if (!reference?.url) throw new Error('工作空间图片地址无效')
         loadingRef.current = false
         renderedFileRef.current = path
         setFileLoading(false)
-        setImageViewer({ path, url: `data:${res.data.mime};base64,${res.data.data}`, name: node.name || path.split('/').pop() })
+        setImageViewer({ path, url: reference.url, name: node.name || path.split('/').pop() })
         setImageZoom(100)
         setSaveStatus('saved')
       } catch (error) {
@@ -729,33 +807,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setSaveStatus('idle')
       return
     }
-    if (draftContentsRef.current[path] !== undefined && !restoredDraftsRef.current[path]) {
-      if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
-      const visible = draftContentsRef.current[path]
-      const zoomMap = {}
-      const withoutZoom = visible.replace(/!\[(.*?)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
-        zoomMap[src.replace(/^\//, '')] = zoom
-        return `![${_alt}](${src})`
-      })
-      zoomMapRef.current = zoomMap
-      sourceContentRef.current = visible
-      renderedFileRef.current = path
-      loadingRef.current = false
-      setFileLoading(false)
-      const keepSource = requiresSourceMode(visible)
-      showSourceRef.current = keepSource
-      setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(withoutZoom)
-      setSourceContent(visible)
-      setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
-      setTimeout(applyZoom, 0)
-    } else {
-      await loadFile(path, requestId)
-    }
-  }, [applyZoom, captureCurrentDraft, editor, loadFile, setEditorMarkdown, waitForDraftRestore])
+    await loadFile(path, requestId)
+  }, [captureCurrentDraft, collectDirtyDrafts, editor, loadFile, setSaveBlocked, waitForDraftRestore, writePendingDrafts])
 
   const removeTabState = useCallback(path => {
     clearSaveTimer(path)
+    setSaveBlocked(path, false)
     saveQueuesRef.current.delete(path)
     const nextErrors = { ...saveErrorsRef.current }
     delete nextErrors[path]
@@ -771,11 +828,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     setFileConflicts(prev => { const next = { ...prev }; delete next[path]; return next })
     setIsDirty(prev => { const next = { ...prev }; delete next[path]; return next })
     setSavedContents(prev => { const next = { ...prev }; delete next[path]; return next })
-  }, [clearSaveTimer])
+  }, [clearSaveTimer, setSaveBlocked])
 
   const pathsUnder = useCallback(path => (
-    openFilesRef.current.filter(file => file === path || file.startsWith(`${path}/`))
-  ), [])
+    [...new Set([
+      ...openFilesRef.current.filter(file => file === path || file.startsWith(`${path}/`)),
+      ...Object.entries(dirtyRef.current)
+        .filter(([file, dirty]) => dirty && saveBlockedRef.current.has(file) && (file === path || file.startsWith(`${path}/`)))
+        .map(([file]) => file),
+    ])]
+  ), [dirtyRef, saveBlockedRef])
 
   const migrateVersionState = useCallback((oldPath, newPath) => {
     const migrate = source => Object.fromEntries(
@@ -797,16 +859,24 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     paths.forEach(clearSaveTimer)
   }, [captureCurrentDraft, clearSaveTimer, waitForPathSaves])
 
-  const handleClose = useCallback(async (path, e) => {
-    e?.stopPropagation()
-    try {
-      await flushPaths([path])
-    } catch {
-      message.error('保存失败，标签页仍保持打开')
-      return
-    }
+  const downloadLocalDraft = useCallback(path => {
+    const content = draftContentsRef.current[path]
+    if (!path || content === undefined) return false
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${path.split('/').pop()}.local-draft.md`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return true
+  }, [])
+
+  const finishCloseTab = useCallback(async (path, { preserveDraft = false } = {}) => {
     const remaining = openFilesRef.current.filter(file => file !== path)
-    removeTabState(path)
+    if (!preserveDraft) removeTabState(path)
     openFilesRef.current = remaining
     setOpenFiles(remaining)
     if (activeFileRef.current === path) {
@@ -828,11 +898,44 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         setSaveStatus('idle')
       }
     }
-  }, [flushPaths, handleFileOpen, removeTabState, setEditorMarkdown])
+  }, [handleFileOpen, removeTabState, setEditorMarkdown])
+
+  const handleClose = useCallback(async (path, e) => {
+    e?.stopPropagation()
+    const hasBlockedDraft = saveBlockedRef.current.has(path) &&
+      dirtyRef.current[path] && draftContentsRef.current[path] !== undefined
+    if (hasBlockedDraft) {
+      if (!writePendingDrafts(collectDirtyDrafts(), [path])) {
+        message.error('无法确认本地恢复草稿已写入；标签页仍保持打开')
+        return
+      }
+      Modal.confirm({
+        title: '关闭含有未保存草稿的只读文档？',
+        content: '这个文件已超过可编辑上限，草稿无法保存到磁盘。继续会尝试下载草稿并关闭标签；浏览器中的恢复副本会保留，可稍后重新打开继续处理。',
+        okText: '下载草稿并关闭',
+        cancelText: '保留草稿',
+        onOk: async () => {
+          if (!downloadLocalDraft(path)) {
+            message.error('未能下载本地草稿，标签页仍保持打开')
+            throw new Error('local draft download failed')
+          }
+          await finishCloseTab(path, { preserveDraft: true })
+        },
+      })
+      return
+    }
+    try {
+      await flushPaths([path])
+    } catch {
+      message.error('保存失败，标签页仍保持打开')
+      return
+    }
+    await finishCloseTab(path)
+  }, [collectDirtyDrafts, downloadLocalDraft, finishCloseTab, flushPaths, saveBlockedRef, writePendingDrafts])
 
   const handleSave = useCallback(async () => {
     const path = activeFileRef.current
-    if (!isMarkdownFile(path)) return
+    if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path)) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
     if (conflictsRef.current[path]) {
@@ -849,19 +952,20 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         ? '文件已在磁盘上变化；本地草稿已保留，没有覆盖磁盘内容'
         : '保存失败，已保留未保存状态')
     }
-  }, [captureCurrentDraft, doSave])
+  }, [captureCurrentDraft, doSave, saveBlockedRef])
 
   const handleRetrySave = useCallback(() => {
     const path = activeFileRef.current
-    if (!isMarkdownFile(path) || conflictsRef.current[path]) return
+    if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || conflictsRef.current[path]) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
     setSaveStatus('saving')
     doSave(path, content).catch(() => {})
-  }, [captureCurrentDraft, doSave])
+  }, [captureCurrentDraft, doSave, saveBlockedRef])
 
   const handleShowConflictReview = useCallback(async (requestedPath = activeFileRef.current, suppliedConflict) => {
     const path = requestedPath
+    if (!path || saveBlockedRef.current.has(path)) return
     const conflict = suppliedConflict || conflictsRef.current[path] || fileConflicts[path]
     if (!path || !conflict) return
     try {
@@ -886,9 +990,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       })
       message.warning('无法读取当前磁盘版本；本地草稿仍已保留，可先下载备份')
     }
-  }, [fileConflicts, setFileConflict])
+  }, [fileConflicts, setFileConflict, saveBlockedRef])
 
   const handleUseRecoveryAlternative = useCallback(async (path, entry) => {
+    if (!isEditableMarkdownSize(entry?.snapshot?.content || '') || saveBlockedRef.current.has(path)) {
+      message.warning('该恢复草稿超过 5 MiB 上限或当前文档为只读，不能载入编辑器')
+      return
+    }
     try {
       clearSaveTimer(path)
       const pendingSave = saveQueuesRef.current.get(path)
@@ -911,7 +1019,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     } catch (error) {
       message.error('载入恢复草稿失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyRecoveryAlternative, clearSaveTimer, handleFileOpen, handleShowConflictReview, setEditorMarkdown])
+  }, [applyRecoveryAlternative, clearSaveTimer, handleFileOpen, handleShowConflictReview, saveBlockedRef, setEditorMarkdown])
 
   const handleSaveLocalConflict = useCallback(async () => {
     if (!conflictReview?.path || conflictReview.diskRevision == null || conflictReview.diskContent == null) return
@@ -999,20 +1107,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
   }, [clearFileConflict, clearPendingDraft, conflictReview, scheduleSave, setDraft, setFileConflict, setFileRevision])
 
-  const handleExportConflictDraft = useCallback(() => {
-    const path = conflictReview?.path || activeFileRef.current
-    const content = draftContentsRef.current[path]
-    if (!path || content === undefined) return
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = `${path.split('/').pop()}.local-draft.md`
-    document.body.appendChild(anchor)
-    anchor.click()
-    anchor.remove()
-    URL.revokeObjectURL(url)
-  }, [conflictReview])
+  const handleExportConflictDraft = useCallback(targetPath => {
+    const path = targetPath || conflictReview?.path || activeFileRef.current
+    return downloadLocalDraft(path)
+  }, [conflictReview?.path, downloadLocalDraft])
 
   const handleReloadDiskAfterConflict = useCallback(() => {
     const path = conflictReview?.path
@@ -1161,7 +1259,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleToggleSource = useCallback(() => {
     const path = activeFileRef.current
-    if (!path || loadingRef.current || renderedFileRef.current !== path) return
+    if (!path || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || loadingRef.current || renderedFileRef.current !== path) return
     if (!showSourceRef.current) {
       const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
       sourceContentRef.current = content
@@ -1196,18 +1294,21 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       return
     }
     enterRichMode()
-  }, [applyZoom, captureCurrentDraft, setEditorMarkdown])
+  }, [applyZoom, captureCurrentDraft, saveBlockedRef, setEditorMarkdown])
 
   const handleChangeWorkspace = useCallback(async () => {
     try {
-      await flushPaths(openFilesRef.current)
+      const retainedBlockedDrafts = Object.entries(dirtyRef.current)
+        .filter(([path, dirty]) => dirty && saveBlockedRef.current.has(path))
+        .map(([path]) => path)
+      await flushPaths([...new Set([...openFilesRef.current, ...retainedBlockedDrafts])])
     } catch {
       message.error('保存失败，暂不能更改目录')
       return
     }
     openRequestRef.current += 1
     onWorkspaceChange?.('')
-  }, [flushPaths, onWorkspaceChange])
+  }, [dirtyRef, flushPaths, onWorkspaceChange, saveBlockedRef])
 
   // Give the browser a last chance to transmit drafts when a tab/window is
   // closed. The confirmation keeps the page alive long enough for keepalive
@@ -1543,17 +1644,89 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     })
   }, [refreshTrashAndRecoveryStats])
 
+  const confirmMoveReferenceImpacts = async (oldPath, newPath) => {
+    const loadingKey = 'move-reference-preflight'
+    message.loading({ content: '正在检查 Markdown 相对引用…', key: loadingKey, duration: 0 })
+    let data
+    try {
+      ({ data } = await axios.post(`${API}/move/preflight`, { old_path: oldPath, new_path: newPath }))
+    } finally {
+      message.destroy(loadingKey)
+    }
+    const impacts = data.impacts || []
+    const dirtyMarkdownDrafts = Object.entries(dirtyRef.current)
+      .filter(([filePath, dirty]) => dirty && isMarkdownFile(filePath))
+      .map(([filePath]) => filePath)
+    const unscanned = Array.from(new Set([
+      ...(data.unscannedMarkdownFiles || []),
+      ...dirtyMarkdownDrafts,
+    ]))
+    if (!impacts.length && !unscanned.length) return true
+
+    return new Promise(resolve => {
+      let settled = false
+      const finish = accepted => {
+        if (settled) return
+        settled = true
+        resolve(accepted)
+      }
+      Modal.confirm({
+        title: '移动可能影响 Markdown 引用',
+        content: (
+          <div>
+            <p>预检识别标准 Markdown 行内和引用式链接、图片；HTML 标签及其他扩展语法可能无法识别。</p>
+            {impacts.length > 0 && <>
+              <p>以下相对链接或图片移动后会指向其他位置或失效：</p>
+              <ul style={{ maxHeight: 220, overflow: 'auto', paddingLeft: 20 }}>
+                {impacts.slice(0, 10).map((impact, index) => (
+                  <li key={`${impact.documentPath}-${impact.reference}-${index}`} style={{ marginBottom: 8 }}>
+                    <div>{impact.kind === 'image' ? '图片' : '链接'}：<code>{impact.reference}</code></div>
+                    <div style={{ color: 'var(--color-text-secondary)' }}>
+                      {impact.documentPath}{impact.documentAfterPath !== impact.documentPath ? ` → ${impact.documentAfterPath}` : ''}
+                    </div>
+                    <div style={{ color: 'var(--color-text-secondary)' }}>
+                      目标：{impact.targetPath} → {impact.expectedTargetPath}
+                    </div>
+                  </li>
+                ))}
+              </ul>
+              {impacts.length > 10 && <p>还有 {impacts.length - 10} 处引用未展开。</p>}
+            </>}
+            {unscanned.length > 0 && <p>
+              有 {unscanned.length} 个 Markdown 文件或未保存草稿无法检查；其中可能包含受影响的引用。
+              {unscanned.slice(0, 5).map((filePath, index) => <span key={`${filePath}-${index}`}>
+                {index === 0 ? '（' : '、'}{filePath}{index === Math.min(unscanned.length, 5) - 1 ? '）' : ''}
+              </span>)}
+              {unscanned.length > 5 ? `等 ${unscanned.length} 项` : ''}
+            </p>}
+            <p>继续移动可能需要之后手动修复引用。取消会保持文件原位，也不会先保存或移动已打开的文档。</p>
+          </div>
+        ),
+        okText: '仍然移动',
+        cancelText: '取消移动',
+        closable: false,
+        keyboard: false,
+        maskClosable: false,
+        onOk: () => finish(true),
+        onCancel: () => finish(false),
+        afterClose: () => finish(false),
+      })
+    })
+  }
+
   const handleMove = async (node, newParent) => {
     const parts = node.path.split('/')
     const oldName = parts.pop() || node.name
     const newPath = newParent ? `${newParent}/${oldName}` : oldName
-    if (node.path === newPath) return
+    if (node.path === newPath) return true
     if (node.type === 'dir' && newPath.startsWith(`${node.path}/`)) {
       message.warning('不能移动到自己的子目录')
       return
     }
     const affected = pathsUnder(node.path)
     try {
+      const confirmed = await confirmMoveReferenceImpacts(node.path, newPath)
+      if (!confirmed) return false
       await flushPaths(affected)
       await axios.post(`${API}/move`, { old_path: node.path, new_path: newPath })
       remapPendingDrafts(node.path, newPath)
@@ -1581,8 +1754,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       renderedFileRef.current = remapPath(renderedFileRef.current, node.path, newPath)
       await loadTree()
       message.success('移动成功')
+      return true
     } catch (error) {
       message.error('移动失败：' + (error.response?.data?.error || error.message))
+      return false
     }
   }
 
@@ -1623,6 +1798,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     const newPath = parent ? `${parent}/${newName}` : newName
     const affected = pathsUnder(renamingPath)
     try {
+      const confirmed = await confirmMoveReferenceImpacts(renamingPath, newPath)
+      if (!confirmed) { setRenamingPath(null); return }
       await flushPaths(affected)
       await axios.post(`${API}/move`, { old_path: renamingPath, new_path: newPath })
       remapPendingDrafts(renamingPath, newPath)
@@ -1731,9 +1908,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const moveFolderTree = moveModal.node ? collectFolders(tree, moveModal.node.path) : []
   const activeConflict = activeFile ? fileConflicts[activeFile] : null
+  const activeLargeMarkdown = largeMarkdownView?.path === activeFile ? largeMarkdownView : null
+  const tabDirtyState = isDirty
   const sourceModeRequired = showSource && requiresSourceMode(sourceContent)
   const recoveryAlternativeCount = Object.values(recoveryAlternatives).reduce((count, entries) => count + entries.length, 0)
-  const activeSaveStatus = activeFile
+  const activeSaveStatus = activeLargeMarkdown ? (activeLargeMarkdown.hasUnsavedDraft ? 'error' : 'saved') : activeFile
     ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
     : 'idle'
   const headingItems = [
@@ -1838,9 +2017,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   value={searchQuery} onChange={e => handleSearch(e.target.value)} />
               </div>
               {/* 搜索结果 */}
-              {searchQuery && (
-                <div style={{ padding: '0 8px 8px', maxHeight: 200, overflow: 'auto' }}>
-                  {searchResults.length === 0 && (
+              {searchQuery.trim() && (
+                <div style={{ padding: '0 8px 8px', maxHeight: 200, overflow: 'auto' }} aria-live="polite" aria-busy={searchLoading}>
+                  {searchLoading && searchResults.length === 0 && (
+                    <div style={{ padding: '8px 4px', fontSize: 12, color: 'var(--color-text-secondary)' }}>搜索中…</div>
+                  )}
+                  {!searchLoading && searchResults.length === 0 && (
                     <div style={{ padding: '8px 4px', fontSize: 12, color: 'var(--color-text-secondary)' }}>无结果</div>
                   )}
                   {searchResults.map(r => (
@@ -2089,7 +2271,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           files={openFiles}
           activeFile={activeFile}
           saveErrors={saveErrors}
-          isDirty={isDirty}
+          isDirty={tabDirtyState}
           isMobile={isMobile}
           showToolbar={showToolbar}
           onShowTree={() => { setSidebarView('tree'); setMobileSidebarOpen(true) }}
@@ -2159,6 +2341,26 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 </div>
               </div>
             </>
+          ) : activeLargeMarkdown ? (
+            <div role="region" aria-label="Markdown 只读预览" style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden', background: 'var(--color-bg-card)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '12px 20px', borderBottom: '1px solid var(--color-border)', color: 'var(--color-text-secondary)', fontSize: 13 }}>
+                <span style={{ flex: 1 }}>
+                  此文档为只读状态（{(activeLargeMarkdown.size / (1024 * 1024)).toFixed(1)} MiB），超过 5 MiB 可编辑上限。下载后可在其他工具中查看或拆分。
+                  {activeLargeMarkdown.hasUnsavedDraft && <strong role="alert" style={{ display: 'block', color: 'var(--color-danger)', marginTop: 4 }}>
+                    此标签保留有未保存的本地草稿，无法写入此只读文件。关闭前会提示下载并确认丢弃。
+                  </strong>}
+                </span>
+                {activeLargeMarkdown.hasUnsavedDraft && <Button aria-label="下载本地草稿" onClick={() => handleExportConflictDraft(activeFile)}>下载本地草稿</Button>}
+                <Button type="primary" aria-label="下载 Markdown" onClick={() => handleExport(activeFile)}>下载 Markdown</Button>
+              </div>
+              {typeof activeLargeMarkdown.content === 'string' ? (
+                <pre aria-label="Markdown 只读内容" style={{ flex: 1, overflow: 'auto', margin: 0, padding: '20px 32px', whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: 'monospace', fontSize: 14, lineHeight: 1.7, color: 'var(--color-text)' }}>{activeLargeMarkdown.content}</pre>
+              ) : (
+                <div style={{ flex: 1, display: 'grid', placeItems: 'center', padding: 24, color: 'var(--color-text-secondary)', textAlign: 'center' }}>
+                  文档超过 10 MiB。为避免载入超大内容，编辑器只提供原始文件下载。
+                </div>
+              )}
+            </div>
           ) : attachmentViewer ? (
             <div className="attachment-viewer" role="region" aria-label="附件只读查看">
               <FileOutlined className="empty-editor-icon" aria-hidden="true" />
@@ -2296,6 +2498,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   value={sourceContent}
                   onChange={e => {
                     const value = e.target.value
+                    if (!isEditableMarkdownSize(value)) {
+                      const accepted = draftContentsRef.current[activeFileRef.current] ?? cleanContentsRef.current[activeFileRef.current] ?? ''
+                      sourceContentRef.current = accepted
+                      setSourceContent(accepted)
+                      message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
+                      return
+                    }
                     sourceContentRef.current = value
                     setSourceContent(value)
                     const path = activeFileRef.current
@@ -2390,10 +2599,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           )}
           {draftStorageError && (
             <div role="alert" className="draft-storage-warning" style={{ padding: '6px 12px', color: 'var(--color-warning)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
-              {draftStorageError}。服务端自动保存仍会继续。
+              {draftStorageError}。{activeLargeMarkdown ? '当前文档为只读。' : '服务端自动保存仍会继续。'}
             </div>
           )}
-          {activeConflict && (
+          {activeConflict && !activeLargeMarkdown && (
             <div role="alert" className="file-conflict-banner" style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', padding: '8px 12px', color: 'var(--color-danger)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
               <WarningOutlined aria-hidden="true" />
               <span style={{ flex: '1 1 280px' }}>磁盘文件已变化；本地草稿已保留，自动保存已暂停。请比较版本后选择处理。</span>
@@ -2408,12 +2617,19 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>
             </div>
             <div className="editor-status-actions">
-              {activeFile && isMarkdownFile(activeFile) && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
-              {activeFile && isMarkdownFile(activeFile) && (
+              {activeLargeMarkdown && <span role="status">{activeLargeMarkdown.hasUnsavedDraft ? '只读预览；有未保存草稿' : '只读预览'}</span>}
+              {activeLargeMarkdown?.hasUnsavedDraft && (
+                <Button aria-label="下载本地草稿" size="small" onClick={() => handleExportConflictDraft(activeFile)}>下载草稿</Button>
+              )}
+              {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
+              {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && (
                 <Button aria-label="查看版本历史" size="small" icon={<HistoryOutlined />} onClick={() => handleOpenHistory(activeFile)}>历史</Button>
               )}
-              {activeFile && isMarkdownFile(activeFile) && (
+              {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && (
                 <Button aria-label="保存当前文件" size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
+              )}
+              {activeLargeMarkdown && (
+                <Button aria-label="下载 Markdown" size="small" icon={<ApiOutlined />} onClick={() => handleExport(activeFile)}>下载</Button>
               )}
               {attachmentViewer && (
                 <Button aria-label="下载附件" size="small" icon={<ApiOutlined />} onClick={() => handleExport(attachmentViewer.path)}>下载</Button>
@@ -2492,9 +2708,21 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
       {/* 移动 */}
       <Modal title={`移动「${moveModal.node?.name}」到...`} open={moveModal.open}
-        onOk={async () => { if (!moveModal.node) return; await handleMove(moveModal.node, moveTarget); setMoveModal({ open: false, node: null }) }}
-        onCancel={() => setMoveModal({ open: false, node: null })}
-        okText="移动" cancelText="取消">
+        onCancel={() => { if (!moveBusy) setMoveModal({ open: false, node: null }) }}
+        closable={!moveBusy}
+        maskClosable={!moveBusy}
+        footer={[
+          <Button key="cancel" disabled={moveBusy} onClick={() => setMoveModal({ open: false, node: null })}>取消</Button>,
+          <Button key="move" type="primary" loading={moveBusy} onClick={async () => {
+            if (!moveModal.node || moveBusy) return
+            setMoveBusy(true)
+            try {
+              if (await handleMove(moveModal.node, moveTarget)) setMoveModal({ open: false, node: null })
+            } finally {
+              setMoveBusy(false)
+            }
+          }}>移动</Button>,
+        ]}>
         <div style={{ border: '1px solid var(--color-border)', borderRadius: 6, padding: 8, maxHeight: 260, overflow: 'auto' }}>
           <div onClick={() => setMoveTarget('')} style={{ padding: '4px 8px', borderRadius: 4, cursor: 'pointer', background: moveTarget === '' ? 'var(--color-surface-selected)' : 'transparent', color: 'var(--color-text-secondary)', marginBottom: 4, fontSize: 13 }}>
             <FolderOpenOutlined style={{ color: 'var(--color-warning)', marginRight: 4 }} />根目录
