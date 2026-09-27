@@ -29,6 +29,20 @@ test('permission failures wrapped by workspace config retain their system cause'
   })
 })
 
+test('a genuine EPERM cause wrapped by workspace config remains a permission response', () => {
+  assert.deepEqual(permissionErrorResponse({
+    code: 'WORKSPACE_CONFIG_SAVE_FAILED',
+    details: { causeCode: 'EPERM' },
+  }), {
+    status: 403,
+    body: {
+      error: '无权限访问或修改该路径',
+      code: 'PERMISSION_DENIED',
+      systemCode: 'EPERM',
+    },
+  })
+})
+
 test('unrelated filesystem errors keep their existing handling', () => {
   assert.equal(permissionErrorResponse({ code: 'ENOENT' }), null)
   assert.equal(permissionErrorResponse({ code: 'INVALID_DIRECTORY' }), null)

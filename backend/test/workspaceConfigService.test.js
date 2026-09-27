@@ -143,6 +143,22 @@ test('failed config rename preserves the old file and removes the temporary file
   assert.deepEqual(await fs.readdir(root), ['workspace.json'])
 })
 
+test('config rename over a directory reports an invalid target independently of platform error codes', async t => {
+  const root = await temporaryDirectory(t, 'standalone-editor-workspace-config-')
+  const configFile = path.join(root, 'workspace.json')
+  await fs.mkdir(configFile)
+
+  await assert.rejects(
+    saveWorkspaceConfig(configFile, path.join(root, 'next'), { makeId: () => 'directory-target' }),
+    error => {
+      assert.equal(error.code, 'WORKSPACE_CONFIG_TARGET_IS_DIRECTORY')
+      assert.equal(error.details.configFile, configFile)
+      return true
+    },
+  )
+  assert.deepEqual(await fs.readdir(root), ['workspace.json'])
+})
+
 test('workspace and recovery roots cannot contain one another, without creating paths', async t => {
   const root = await temporaryDirectory(t, 'standalone-editor-workspace-recovery-')
   const workspace = path.join(root, 'notes')

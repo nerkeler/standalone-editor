@@ -133,7 +133,30 @@ export async function saveWorkspaceConfig(configFile, workspace, {
     await handle.sync()
     await handle.close()
     handle = null
-    await fileSystem.rename(temporaryFile, resolvedConfigFile)
+    try {
+      await fileSystem.rename(temporaryFile, resolvedConfigFile)
+    } catch (error) {
+      // Windows reports EPERM when rename targets an existing directory,
+      // which is a bad config-file target rather than a permission denial.
+      // Inspect only this rename operation so genuine EPERM failures remain
+      // distinguishable by the API's permission response.
+      if (['EPERM', 'EISDIR', 'ENOTDIR'].includes(error?.code)) {
+        let destinationStat = null
+        try {
+          destinationStat = await fileSystem.lstat(resolvedConfigFile)
+        } catch (statError) {
+          if (statError?.code !== 'ENOENT') throw error
+        }
+        if (destinationStat?.isDirectory()) {
+          throw serviceError(
+            '工作空间配置路径是目录，无法替换为配置文件',
+            'WORKSPACE_CONFIG_TARGET_IS_DIRECTORY',
+            { configFile: resolvedConfigFile },
+          )
+        }
+      }
+      throw error
+    }
     return resolvedWorkspace
   } catch (error) {
     if (handle) await handle.close().catch(() => {})
