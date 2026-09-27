@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, before } from 'node:test'
+import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = path.resolve(frontendRoot, '..')
@@ -131,17 +132,9 @@ async function findChrome() {
 async function startChrome() {
   const chrome = await findChrome()
   const chromeProfile = path.join(tempRoot, 'chrome-profile')
-  chromeProcess = spawn(chrome, [
-    '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-    '--no-first-run', '--no-default-browser-check', '--window-size=1280,900', '--remote-debugging-port=0',
-    '--user-data-dir=' + chromeProfile, 'about:blank',
-  ], { stdio: 'ignore' })
-  const activePortFile = path.join(chromeProfile, 'DevToolsActivePort')
-  chromePort = await waitUntil('isolated Chrome DevTools endpoint', async () => {
-    const contents = await readFile(activePortFile, 'utf8').catch(() => '')
-    const port = Number(contents.split('\n')[0])
-    return port > 0 ? port : null
-  })
+  const started = await startChromeProcess({ chromePath: chrome, profileDir: chromeProfile })
+  chromeProcess = started.child
+  chromePort = started.port
   const response = await fetch('http://127.0.0.1:' + chromePort + '/json/new?about:blank', { method: 'PUT' })
   assert.equal(response.ok, true, 'Chrome should create an isolated page target')
   const target = await response.json()

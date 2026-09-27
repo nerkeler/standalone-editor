@@ -1,12 +1,14 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react'
 import { basicSetup } from 'codemirror'
-import { EditorState } from '@codemirror/state'
+import { Annotation, EditorState } from '@codemirror/state'
 import { EditorView, keymap } from '@codemirror/view'
 import { markdown } from '@codemirror/lang-markdown'
 import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { linter, lintKeymap, nextDiagnostic } from '@codemirror/lint'
 import { analyzeMarkdownSource } from './markdownDiagnostics'
+
+const externalValueSync = Annotation.define()
 
 const sourceTheme = EditorView.theme({
   '&': { height: '100%', backgroundColor: 'var(--color-bg-card)', color: 'var(--color-text)' },
@@ -60,6 +62,9 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({ value, o
           })), { delay: 250 }),
           EditorView.updateListener.of(update => {
             if (!update.docChanged || revertingRef.current) return
+            if (update.transactions.every(transaction => (
+              !transaction.docChanged || transaction.annotation(externalValueSync)
+            ))) return
             if (onChangeRef.current?.(update.state.doc.toString()) === false) {
               revertingRef.current = true
               update.view.dispatch({ changes: { from: 0, to: update.state.doc.length, insert: update.startState.doc.toString() } })
@@ -76,7 +81,10 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({ value, o
   useEffect(() => {
     const view = viewRef.current
     if (!view || view.state.doc.toString() === value) return
-    view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: value } })
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: value },
+      annotations: externalValueSync.of(true),
+    })
   }, [value])
 
   return <div ref={host} className="source-editor" role="region" aria-label="Markdown 源码编辑器" />

@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, before } from 'node:test'
+import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = path.resolve(frontendRoot, '..')
@@ -137,17 +138,9 @@ async function findChrome() {
 async function startChrome() {
   const chrome = await findChrome()
   chromeProfile = path.join(tempRoot, 'chrome-profile')
-  chromeProcess = spawn(chrome, [
-    '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-    '--no-first-run', '--no-default-browser-check', '--window-size=1280,900', '--remote-debugging-port=0',
-    `--user-data-dir=${chromeProfile}`, 'about:blank',
-  ], { stdio: 'ignore' })
-  const activePortFile = path.join(chromeProfile, 'DevToolsActivePort')
-  chromePort = await waitUntil('isolated Chrome DevTools endpoint', async () => {
-    const contents = await readFile(activePortFile, 'utf8').catch(() => '')
-    const port = Number(contents.split('\n')[0])
-    return port > 0 ? port : null
-  })
+  const started = await startChromeProcess({ chromePath: chrome, profileDir: chromeProfile })
+  chromeProcess = started.child
+  chromePort = started.port
   const response = await fetch(`http://127.0.0.1:${chromePort}/json/new?about:blank`, { method: 'PUT' })
   assert.equal(response.ok, true, 'Chrome should create an isolated page target')
   const target = await response.json()
@@ -293,6 +286,48 @@ test('complex Markdown opens in source mode and rich conversion requires explici
     `Boolean(document.querySelector('.source-editor .cm-content')) && !document.querySelector('.ProseMirror')`,
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), fixture)
+})
+
+test('lossy quote, reference, and multiline HTML syntax stays byte-identical on a no-op save', async () => {
+  const fileName = 'lossy-structure-regression.md'
+  const source = [
+    '> - outer',
+    '>   - nested quote list',
+    '>',
+    '> | Left | Right |',
+    '> | :-- | --: |',
+    '> | a | b |',
+    '>',
+    '> ```js title=quote.js',
+    '> const sample = "quoted";',
+    '> ```',
+    '',
+    '[link',
+    '][ref]',
+    '',
+    '[ref]:',
+    '  https://example.com',
+    '',
+    '<img',
+    '  src="photo.png"',
+    '  data-custom="keep">',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'nested quote list')
+
+  await waitUntil('lossy Markdown source mode and diagnostics', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning')?.innerText.includes('处内容需要源码保护') && document.querySelectorAll('.cm-protected-range').length >= 6)`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false, 'lossy structures must not initialize the rich editor')
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+
+  await clickSave()
+  await waitUntil('no-op source save to settle', () => connection.evaluate(
+    `!document.querySelector('[aria-label="保存当前文件"]')?.disabled`,
+  ))
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'a no-op save must preserve every source byte')
 })
 
 test('verified simple reference link is CAS-normalized only on its first clean open', async () => {

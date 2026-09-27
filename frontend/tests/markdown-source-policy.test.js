@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
+import { marked } from 'marked'
+import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
 import { getMarkdownSourceModeReasons, requiresSourceMode } from '../src/pages/markdownSourcePolicy.js'
 
 const fixtureDirectory = new URL('./fixtures/', import.meta.url)
@@ -45,8 +47,67 @@ test('the editor-owned zoom annotation remains allowed while other HTML comments
 })
 
 test('table alignment is identified from Marked table tokens', () => {
-  const markdown = '| Left | Center | Right |\n| :--- | :---: | ---: |\n| a | b | c |'
+  const markdown = '> | Left | Right |\n> | :-- | --: |\n> | a | b |'
+  const quote = marked.lexer(markdown).find(token => token.type === 'blockquote')
+  const table = quote?.tokens?.find(token => token.type === 'table')
+  assert.deepEqual(table?.align, ['left', 'right'])
   assert.deepEqual(getMarkdownSourceModeReasons(markdown), ['tableAlignment'])
+})
+
+test('quoted lossy structures and conservative nested-list fallback require source mode', () => {
+  const cases = [
+    ['nestedLists', '> - parent\n>   - child\n'],
+    ['tableAlignment', '> | Left | Right |\n> | :-- | --: |\n> | a | b |\n'],
+    ['codeFenceMetadata', '> ```js title=sample.js\n> code\n> ```\n'],
+    ['nestedLists', '> > - parent\n> >   - child\n'],
+    // This token tree is list → blockquote → list. Protecting it also guards
+    // list indentation when the source is serialized through rich text.
+    ['nestedLists', '- outer\n  > - quoted only\n'],
+  ]
+  for (const [reason, markdown] of cases) {
+    const reasons = getMarkdownSourceModeReasons(markdown)
+    assert.ok(reasons.includes(reason), 'expected ' + reason + '; got ' + reasons.join(', '))
+    assert.equal(requiresSourceMode(markdown), analyzeMarkdownSource(markdown).length > 0)
+  }
+})
+
+test('plain blockquote structures and Markdown examples inside quote fences stay rich-safe', () => {
+  const safe = [
+    '> - first\n> - second\n',
+    '> | Left | Right |\n> | --- | --- |\n> | a | b |\n',
+    '> ```js\n> code\n> ```\n',
+    '> ~~~~md\n> - parent\n>   - child\n> | A | B |\n> | :-- | --: |\n> ```js title=sample.js\n> [[wiki]]\n> ~~~~\n',
+  ]
+  for (const markdown of safe) {
+    assert.deepEqual(getMarkdownSourceModeReasons(markdown), [])
+    assert.equal(requiresSourceMode(markdown), false)
+  }
+})
+
+test('multiline reference forms and void HTML require source mode', () => {
+  const cases = [
+    ['referenceLinks', '[link\n][ref]\n\n[ref]:\n  https://example.com\n'],
+    ['referenceLinks', '[ref]:\n  https://example.com\n'],
+    ['rawHtml', '<img\n  src="photo.png"\n  alt="photo"\n  data-custom="keep">\n'],
+    ['rawHtml', '<hr\n  data-custom="keep">\n'],
+  ]
+  for (const [reason, markdown] of cases) {
+    const reasons = getMarkdownSourceModeReasons(markdown)
+    assert.ok(reasons.includes(reason), 'expected ' + reason + '; got ' + reasons.join(', '))
+    assert.equal(requiresSourceMode(markdown), analyzeMarkdownSource(markdown).length > 0)
+  }
+})
+
+test('multiline references and void HTML inside inline or fenced code stay rich-safe', () => {
+  const examples = [
+    '~~~~md\n<img\n  src="photo.png"\n  data-custom="keep">\n[link\n][ref]\n[ref]:\n  https://example.com\n~~~~\n',
+    '`<img\n  src="photo.png"\n  data-custom="keep">`\n',
+    '`[link\n][ref]`\n',
+  ]
+  for (const markdown of examples) {
+    assert.deepEqual(getMarkdownSourceModeReasons(markdown), [])
+    assert.equal(requiresSourceMode(markdown), false)
+  }
 })
 
 test('footnote definitions and references remain in source mode', () => {

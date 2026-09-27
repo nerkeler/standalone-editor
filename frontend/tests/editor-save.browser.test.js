@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, afterEach, before, beforeEach } from 'node:test'
+import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = path.resolve(frontendRoot, '..')
@@ -185,17 +186,9 @@ class DevToolsConnection {
 async function startChrome() {
   const chrome = await findChrome()
   chromeProfile = path.join(tempRoot, 'chrome-profile')
-  chromeProcess = spawn(chrome, [
-    '--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
-    '--no-first-run', '--no-default-browser-check', '--window-size=1280,900', '--remote-debugging-port=0',
-    `--user-data-dir=${chromeProfile}`, 'about:blank',
-  ], { stdio: 'ignore' })
-  const activePortFile = path.join(chromeProfile, 'DevToolsActivePort')
-  chromeDebugPort = await waitUntil('Chrome DevTools endpoint', async () => {
-    const contents = await readFile(activePortFile, 'utf8').catch(() => '')
-    const value = Number(contents.split('\n')[0])
-    return value > 0 ? value : null
-  })
+  const started = await startChromeProcess({ chromePath: chrome, profileDir: chromeProfile })
+  chromeProcess = started.child
+  chromeDebugPort = started.port
   const response = await fetch(`http://127.0.0.1:${chromeDebugPort}/json/new?about:blank`, { method: 'PUT' })
   assert.equal(response.ok, true, 'Chrome should create an isolated page target')
   const target = await response.json()
@@ -613,6 +606,53 @@ test('an edit is persisted by the three-second autosave', async () => {
   }, 9000)
   assert.ok(Date.now() - editedAt >= 2700, 'the write should follow the three-second debounce')
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
+})
+
+test('restoring history in source mode stays clean and does not schedule another save', async () => {
+  const original = '---\ntitle: Original source version\n---\n\nOriginal body\n'
+  const changed = `HISTORY-CURRENT-${Date.now()}`
+  await writeFile(path.join(workspace, firstFile), original)
+  await openFile(firstFile, 'Original body')
+  await insertAtSourceEnd(`\n\n<!-- ${changed} -->`)
+  await clickAriaButton('保存当前文件')
+
+  await waitUntil('edited source version and its original history entry', async () => {
+    const disk = await readFile(path.join(workspace, firstFile), 'utf8')
+    const history = await readWorkspaceHistory(firstFile)
+    return disk.includes(changed) && history.status === 200 && history.data.history?.length
+  }, 10000)
+  await waitUntil('saved source version to become clean', () => cdp.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('已保存')`,
+  ))
+
+  await clickAriaButton('查看版本历史')
+  await waitUntil('source history dialog to finish loading', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes(${JSON.stringify(firstFile)}));
+    return Boolean(modal && !modal.innerText.includes('正在读取版本历史'));
+  })()`))
+  const historyState = await cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes(${JSON.stringify(firstFile)}));
+    return JSON.stringify({ title: modal?.querySelector('.ant-modal-title')?.innerText, text: modal?.innerText, buttons: Array.from(modal?.querySelectorAll('button') || []).map(button => ({ text: button.innerText.trim(), disabled: button.disabled })) });
+  })()`)
+  assert.ok(JSON.parse(historyState).buttons.some(button => button.text.replace(/\s/g, '') === '恢复' && !button.disabled), historyState)
+  const requestOffset = cdp.networkRequests.length
+  await cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes(${JSON.stringify(firstFile)}));
+    Array.from(modal?.querySelectorAll('button') || []).find(button => button.innerText.replace(/\\s/g, '') === '恢复' && !button.disabled)?.click();
+  })()`)
+  await clickConfirmButton('恢复版本')
+  await waitUntil('restored source content to reach CodeMirror', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}`,
+  ))
+  await new Promise(resolve => setTimeout(resolve, 100))
+
+  assert.equal(await cdp.evaluate(`document.querySelector('.save-status')?.innerText`), '已保存')
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  const unexpectedPuts = cdp.networkRequests.slice(requestOffset).filter(request =>
+    request.method === 'PUT' && new URL(request.url).pathname === '/api/workspace',
+  )
+  assert.deepEqual(unexpectedPuts, [], 'loading the restored value into CodeMirror must not schedule a second save')
+  assert.equal(await readFile(path.join(workspace, firstFile), 'utf8'), original)
 })
 
 test('a denied workspace write explains the permission error and keeps the draft', async t => {
