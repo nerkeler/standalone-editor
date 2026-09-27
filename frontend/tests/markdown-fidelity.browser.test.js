@@ -70,9 +70,31 @@ class DevToolsConnection {
     this.socket = socket
     this.nextId = 0
     this.pending = new Map()
+    this.networkRequests = []
+    this.pausedFetchRequests = []
+    this.pauseNextWorkspacePut = false
+    this.acceptBeforeUnload = false
     socket.addEventListener('message', event => {
       const message = JSON.parse(event.data.toString())
       if (!message.id) {
+        if (message.method === 'Page.javascriptDialogOpening' &&
+            message.params?.type === 'beforeunload' && this.acceptBeforeUnload) {
+          this.send('Page.handleJavaScriptDialog', { accept: true }).catch(error => appendLog('beforeunload dialog', error.message))
+        }
+        if (message.method === 'Network.requestWillBeSent') {
+          const request = message.params.request || {}
+          this.networkRequests.push({ method: request.method, url: request.url, postData: request.postData || '' })
+        }
+        if (message.method === 'Fetch.requestPaused') {
+          const paused = message.params
+          const request = paused.request || {}
+          if (this.pauseNextWorkspacePut && request.method === 'PUT' && request.url.includes('/api/workspace')) {
+            this.pauseNextWorkspacePut = false
+            this.pausedFetchRequests.push(paused)
+          } else {
+            this.send('Fetch.continueRequest', { requestId: paused.requestId }).catch(error => appendLog('fetch continue', error.message))
+          }
+        }
         if (message.method === 'Runtime.exceptionThrown') {
           appendLog('browser exception', message.params.exceptionDetails.exception?.description || message.params.exceptionDetails.text)
         }
@@ -102,7 +124,14 @@ class DevToolsConnection {
   send(method, params = {}) {
     const id = ++this.nextId
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
+      const timeout = setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`Timed out waiting for Chrome DevTools ${method}`))
+      }, 15000)
+      this.pending.set(id, {
+        resolve: value => { clearTimeout(timeout); resolve(value) },
+        reject: error => { clearTimeout(timeout); reject(error) },
+      })
       this.socket.send(JSON.stringify({ id, method, params }))
     })
   }
@@ -147,6 +176,7 @@ async function startChrome() {
   connection = await DevToolsConnection.connect(target.webSocketDebuggerUrl)
   await connection.send('Page.enable')
   await connection.send('Runtime.enable')
+  await connection.send('Network.enable')
   const realWorkspace = await realpath(workspace)
   const info = {
     workspace: realWorkspace,
@@ -159,7 +189,12 @@ async function startChrome() {
 }
 
 async function setupPage() {
-  await connection.send('Page.navigate', { url: `http://127.0.0.1:${frontendPort}/` })
+  connection.acceptBeforeUnload = true
+  try {
+    await connection.send('Page.navigate', { url: `http://127.0.0.1:${frontendPort}/` })
+  } finally {
+    connection.acceptBeforeUnload = false
+  }
   await waitUntil('editor application to mount', () => connection.evaluate(
     `Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'))`,
   ))
@@ -204,6 +239,38 @@ async function waitForDiskMarker(fileName, marker) {
     const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
     return content.includes(marker) ? content : null
   })
+}
+
+function workspacePutCount() {
+  return connection.networkRequests.filter(request => request.method === 'PUT' && request.url.includes('/api/workspace')).length
+}
+
+async function clickRepairAction(label) {
+  await waitUntil(`repair action “${label}”`, () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.markdown-repair-banner button')).some(button => button.innerText.trim() === ${JSON.stringify(label)} && !button.disabled)`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.markdown-repair-banner button')).find(button => button.innerText.trim() === ${JSON.stringify(label)} && !button.disabled)?.click()`)
+}
+
+async function readWorkspaceHistory(fileName) {
+  return connection.evaluate(`(async () => {
+    const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
+    const url = new URL('/api/workspace/file/history', location.origin);
+    url.searchParams.set('path', ${JSON.stringify(fileName)});
+    const response = await fetch(url, { headers: {
+      'X-Workspace-Id': info?.workspaceId || '',
+      'X-Workspace-Version': String(info?.workspaceVersion ?? ''),
+    }});
+    return { status: response.status, data: await response.json() };
+  })()`)
+}
+
+async function saveRepairScreenshot(fileName) {
+  const outputDirectory = process.env.EDITOR_REPAIR_SCREENSHOT_DIR
+  if (!outputDirectory) return
+  await mkdir(outputDirectory, { recursive: true })
+  const screenshot = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  await writeFile(path.join(outputDirectory, fileName), Buffer.from(screenshot.data, 'base64'))
 }
 
 before(async () => {
@@ -330,19 +397,206 @@ test('lossy quote, reference, and multiline HTML syntax stays byte-identical on 
   assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'a no-op save must preserve every source byte')
 })
 
-test('verified simple reference link is CAS-normalized only on its first clean open', async () => {
-  const fileName = 'safe-normalize.md'
-  await writeFile(path.join(workspace, fileName), '[guide][docs]\n\n[docs]: https://example.com\n')
+test('a titled Markdown link stays in source mode so editing cannot discard its title', async () => {
+  const fileName = 'titled-link.md'
+  const source = '[guide](https://example.com "important title")\n'
+  await writeFile(path.join(workspace, fileName), source)
   await setupPage()
   await openFile(fileName, 'guide')
-  await waitForDiskMarker(fileName, '[guide](https://example.com)')
-  const first = await stat(path.join(workspace, fileName))
+  await waitUntil('titled link to use the source editor', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.markdown-repair-banner'))`), false)
+  await clickSave()
+  await waitUntil('titled link no-op save to settle', () => connection.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('已保存')`,
+  ))
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
+})
+
+test('opening and canceling a repair proposal never writes or schedules an autosave', async () => {
+  const fileName = 'safe-normalize-cancel.md'
+  const original = '[guide][docs]\n\n[docs]: https://example.com\n'
+  await writeFile(path.join(workspace, fileName), original)
   await setupPage()
   await openFile(fileName, 'guide')
+  await waitUntil('repair proposal for a simple reference link', () => connection.evaluate(
+    `Boolean(document.querySelector('.markdown-repair-banner')?.innerText.includes('确认修复并保存'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), original)
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'opening alone must not send a workspace PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), original)
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
+
+  await clickRepairAction('暂不修复')
+  await waitUntil('repair proposal to close after cancel', () => connection.evaluate(
+    `!document.querySelector('.markdown-repair-banner')`,
+  ))
   await new Promise(resolve => setTimeout(resolve, 250))
-  const second = await stat(path.join(workspace, fileName))
-  assert.equal(second.mtimeMs, first.mtimeMs)
-  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), '[guide](https://example.com)\n')
+  assert.equal(workspacePutCount(), initialPuts, 'cancel must not send a workspace PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), original)
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
+})
+
+test('switching from a source-mode repair proposal to another file stays clean past autosave', async () => {
+  const sourceName = 'source-switch-a.md'
+  const targetName = 'source-switch-b.md'
+  const sourceA = '[guide][docs]\n\n[docs]: https://example.com\n'
+  const sourceB = 'Plain target document\n'
+  await writeFile(path.join(workspace, sourceName), sourceA)
+  await writeFile(path.join(workspace, targetName), sourceB)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+
+  await openFile(sourceName, 'guide')
+  await waitUntil('source A repair proposal to be ready', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.markdown-repair-banner'))`,
+  ))
+  await openFile(targetName, 'Plain target document')
+  await waitUntil('source B to be clean and active', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror')?.innerText.includes('Plain target document') && document.querySelector('.save-status')?.innerText.includes('已保存'))`,
+  ))
+  await new Promise(resolve => setTimeout(resolve, 3500))
+
+  assert.equal(workspacePutCount(), initialPuts, 'switching away from an untouched source document must not send a PUT')
+  assert.equal(await readFile(path.join(workspace, sourceName), 'utf8'), sourceA)
+  assert.equal(await readFile(path.join(workspace, targetName), 'utf8'), sourceB)
+  assert.equal(await connection.evaluate(`document.querySelector('.save-status')?.innerText.includes('已保存')`), true)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.markdown-repair-banner'))`), false)
+})
+
+test('confirming a repair saves once through CAS, records history, and removes the proposal', async () => {
+  const fileName = 'safe-normalize-confirm.md'
+  const original = '[guide][docs]\n\n[docs]: https://example.com\n'
+  const repaired = '[guide](https://example.com)\n'
+  await writeFile(path.join(workspace, fileName), original)
+  await writeFile(path.join(workspace, 'repair-switch.md'), 'Switch target')
+  await setupPage()
+  await openFile(fileName, 'guide')
+  await waitUntil('repair preview to show a before and after', () => connection.evaluate(
+    `Boolean(document.querySelector('.markdown-repair-example')?.innerText.includes('→') && document.querySelector('.markdown-repair-banner'))`,
+  ))
+  await saveRepairScreenshot('markdown-repair-proposal.png')
+  const initialPuts = workspacePutCount()
+  await clickRepairAction('确认修复并保存')
+  await waitUntil('confirmed repair bytes and PUT request to reach disk', async () => (
+    (await readFile(path.join(workspace, fileName), 'utf8')) === repaired && workspacePutCount() - initialPuts === 1
+  ))
+  assert.equal(workspacePutCount() - initialPuts, 1, 'confirm should perform exactly one immediate workspace PUT')
+  const repairRequest = connection.networkRequests.filter(request => request.method === 'PUT' && request.url.includes('/api/workspace')).at(-1)
+  const repairPayload = JSON.parse(repairRequest?.postData || '{}')
+  assert.equal(repairPayload.path, fileName)
+  assert.ok(repairPayload.expectedRevision, 'the save should carry the disk revision for compare-and-swap')
+  const history = await readWorkspaceHistory(fileName)
+  assert.equal(history.status, 200)
+  assert.ok(history.data.history?.length, 'the pre-repair version should remain in file history')
+
+  await openFile('repair-switch.md', 'Switch target')
+  await openFile(fileName, 'guide')
+  await waitUntil('saved repair to load in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror')?.innerText.includes('guide') && !document.querySelector('.markdown-repair-banner'))`,
+  ))
+  await saveRepairScreenshot('markdown-repair-saved.png')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), repaired)
+  assert.equal(workspacePutCount() - initialPuts, 1, 'reopening a repaired file must not save again')
+})
+
+test('a stale disk revision blocks repair and retains the confirmed candidate for conflict review', async () => {
+  const fileName = 'safe-normalize-conflict.md'
+  const original = '[guide][docs]\n\n[docs]: https://example.com\n'
+  const external = 'External update\n'
+  const repaired = '[guide](https://example.com)\n'
+  await writeFile(path.join(workspace, fileName), original)
+  await setupPage()
+  await openFile(fileName, 'guide')
+  await waitUntil('repair proposal to show before an external revision change', () => connection.evaluate(
+    `Boolean(document.querySelector('.markdown-repair-banner'))`,
+  ))
+  await writeFile(path.join(workspace, fileName), external)
+  const initialPuts = workspacePutCount()
+  await clickRepairAction('确认修复并保存')
+  await waitUntil('repair conflict to be reported', () => connection.evaluate(
+    `Boolean(document.querySelector('.file-conflict-banner') && document.querySelector('.markdown-repair-result')?.innerText.includes('磁盘版本已变化'))`,
+  ))
+  assert.equal(workspacePutCount() - initialPuts, 1, 'the candidate must use one revision-checked save attempt')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), external, 'the concurrent disk version must remain intact')
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('guide')`), true, 'the confirmed candidate should remain visible as the local draft')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.markdown-repair-banner'))`), false)
+})
+
+test('closing during an immediate repair save waits for that save without issuing a duplicate PUT', async () => {
+  const fileName = 'safe-normalize-close-in-flight.md'
+  const original = '[guide][docs]\n\n[docs]: https://example.com\n'
+  const repaired = '[guide](https://example.com)\n'
+  await writeFile(path.join(workspace, fileName), original)
+  await setupPage()
+  await openFile(fileName, 'guide')
+  await waitUntil('repair proposal before in-flight close', () => connection.evaluate(
+    `Boolean(document.querySelector('.markdown-repair-banner'))`,
+  ))
+
+  await connection.send('Fetch.enable', { patterns: [{ urlPattern: '*api/workspace*', requestStage: 'Request' }] })
+  connection.pauseNextWorkspacePut = true
+  const initialPuts = workspacePutCount()
+  await clickRepairAction('确认修复并保存')
+  const pausedPut = await waitUntil('the immediate repair PUT to pause before reaching disk', () => (
+    connection.pausedFetchRequests.find(item => item.request?.method === 'PUT' && item.request.url.includes('/api/workspace'))
+  ))
+  assert.equal(JSON.parse(pausedPut.request.postData || '{}').content, repaired)
+
+  await connection.evaluate(`Array.from(document.querySelectorAll('.tab-close')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(`关闭 ${fileName}`)})?.click()`)
+  assert.equal(await connection.evaluate(`Boolean(Array.from(document.querySelectorAll('.document-tab')).find(tab => tab.innerText.includes(${JSON.stringify(fileName)})))`), true, 'closing must wait while the confirmed save is in flight')
+  await connection.send('Fetch.continueRequest', { requestId: pausedPut.requestId })
+
+  await waitUntil('the tab to close after its repair save completes', () => connection.evaluate(
+    `!Array.from(document.querySelectorAll('.document-tab')).some(tab => tab.innerText.includes(${JSON.stringify(fileName)}))`,
+  ))
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), repaired)
+  assert.equal(workspacePutCount() - initialPuts, 1, 'the close flush must not enqueue the already in-flight repair snapshot again')
+  await connection.send('Fetch.disable')
+})
+
+test('ordinary delimiter-like text stays rich while angle autolinks get a repair diagnostic without writing', async () => {
+  const plainName = 'colon-rule-text.md'
+  const autolinkName = 'autolink-repair-smoke.md'
+  const plainText = ':--- | plain text\n'
+  const autolinkText = 'See <https://example.com>.\n'
+  await writeFile(path.join(workspace, plainName), plainText)
+  await writeFile(path.join(workspace, autolinkName), autolinkText)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+
+  await openFile(plainName, ':--- | plain text')
+  await waitUntil('delimiter-like paragraph to remain in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror')?.innerText.includes(':--- | plain text'))`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-fidelity-warning') || document.querySelector('.cm-protected-range'))`), false)
+
+  await openFile(autolinkName, 'https://example.com')
+  await waitUntil('angle autolink to be offered as a repair', () => connection.evaluate(
+    `Boolean(document.querySelector('.markdown-repair-banner')?.innerText.includes('自动链接'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.markdown-repair-banner')?.innerText.includes('原始 HTML')`), false)
+  await waitUntil('autolink diagnostic range to mount in the source editor', () => connection.evaluate(
+    `Boolean(document.querySelector('.cm-protected-range'))`,
+  ))
+  const protectedBox = await connection.evaluate(`(() => { const box = document.querySelector('.cm-protected-range')?.getBoundingClientRect(); return box && { x: box.x + 4, y: box.y + box.height / 2 } })()`)
+  assert.ok(protectedBox, 'the link source should have a focused diagnostic range')
+  await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: protectedBox.x, y: protectedBox.y })
+  await waitUntil('autolink tooltip to explain the repair', () => connection.evaluate(
+    `Boolean(document.querySelector('.cm-tooltip-lint')?.innerText.includes('自动链接') && !document.querySelector('.cm-tooltip-lint')?.innerText.includes('原始 HTML'))`,
+  ))
+
+  const before = await stat(path.join(workspace, autolinkName))
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'opening an autolink repair proposal must not send a PUT')
+  assert.equal(await readFile(path.join(workspace, plainName), 'utf8'), plainText)
+  assert.equal(await readFile(path.join(workspace, autolinkName), 'utf8'), autolinkText)
+  assert.equal((await stat(path.join(workspace, autolinkName))).mtimeMs, before.mtimeMs)
 })
 
 test('tab-indented unordered and nested ordered tasks are protected in source mode', async () => {
@@ -378,6 +632,9 @@ test('source-mode edits preserve the original Markdown bytes around the edit', a
   await connection.send('Input.insertText', { text: marker })
   await clickSave()
   const saved = await waitForDiskMarker(fileName, 'SOURCE_EDIT_SENTINEL')
+  await waitUntil('source edit save acknowledgment before navigating to the next test', () => connection.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('已保存') && !Array.from(document.querySelectorAll('.document-tab')).some(tab => tab.innerText.includes(${JSON.stringify(fileName)}) && tab.innerText.includes('未保存'))`,
+  ))
   // Chrome's Input.insertText collapses one leading newline at the final
   // CodeMirror line. The loaded prefix must still remain byte-for-byte exact.
   assert.equal(saved.slice(0, fixture.length), fixture)
@@ -403,7 +660,7 @@ test('nested Markdown images render through workspace media and stay relative th
     '',
     '![内嵌](data:image/png;base64,iVBORw0KGgo=)',
     '',
-    '![越界](../../../outside.png)',
+    '![越界](../../../outside.png "越界标题")',
     '',
     'Image fixture end.',
   ].join('\n')
@@ -444,6 +701,7 @@ test('nested Markdown images render through workspace media and stay relative th
   assert.equal(rendered[3].markdownSrc, null)
   assert.equal(rendered[4].src, 'about:blank')
   assert.equal(rendered[4].markdownSrc, '../../../outside.png')
+  assert.equal(rendered[4].title, '越界标题')
 
   await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
   await waitUntil('nested source editor', () => connection.evaluate(
@@ -479,7 +737,7 @@ test('nested Markdown images render through workspace media and stay relative th
   assert.match(saved, /!\[旧资源\]\(\.\.\/\.\.\/assets\/legacy\.png "旧标题"\)/)
   assert.match(saved, /!\[外链\]\(https:\/\/example\.com\/external\.png\)/)
   assert.match(saved, /!\[内嵌\]\(data:image\/png;base64,iVBORw0KGgo=\)/)
-  assert.match(saved, /!\[越界\]\(\.\.\/\.\.\/\.\.\/outside\.png\)/)
+  assert.match(saved, /!\[越界\]\(\.\.\/\.\.\/\.\.\/outside\.png "越界标题"\)/)
   assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
 
   const uploadName = '新图片.png'

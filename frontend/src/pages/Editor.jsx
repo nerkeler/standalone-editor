@@ -32,7 +32,7 @@ import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import { requiresSourceMode } from './markdownSourcePolicy'
 import { analyzeMarkdownSource } from './markdownDiagnostics.js'
-import { normalizeSafeMarkdown } from './safeMarkdownNormalization.js'
+import { proposeSafeMarkdownRepair } from './safeMarkdownNormalization.js'
 import { isPermissionDenied, requestErrorMessage } from '../requestErrorMessage'
 import { TableInsertButton, TableContextTools } from './TableControls'
 import { parseImagePresentationComment, formatImagePresentationComment } from './imagePresentation.js'
@@ -95,6 +95,51 @@ function downloadMarkdownDraft(filePath, content) {
   URL.revokeObjectURL(url)
 }
 
+function repairChangeLabel(change) {
+  if (typeof change === 'string') return change
+  if (!change || typeof change !== 'object') return ''
+  const directLabel = change.label || change.description || change.summary || change.message
+  if (typeof directLabel === 'string') return directLabel
+  if (['referenceLinks', 'reference-link', 'reference_link'].includes(change.reason || change.type || change.code)) {
+    return '将引用式链接改为直接链接'
+  }
+  return '修复一处 Markdown 写法'
+}
+
+function repairDiagnosticLabel(diagnostic) {
+  if (typeof diagnostic === 'string') return diagnostic
+  const directLabel = diagnostic?.message || diagnostic?.label || diagnostic?.description
+  if (directLabel) return directLabel
+  const names = {
+    frontMatter: 'YAML 元数据',
+    wikiLinks: 'WikiLinks',
+    footnotes: '脚注',
+    referenceLinks: '引用式链接',
+    escapedSyntax: '转义语法',
+    tableAlignment: '表格对齐',
+    nestedLists: '嵌套列表',
+    rawHtml: '原始 HTML',
+    codeFenceMetadata: '代码围栏附加信息',
+    unparseableMarkdown: '无法解析的 Markdown',
+  }
+  return names[diagnostic?.reason] || diagnostic?.reason || ''
+}
+
+function markdownRepairPreview(before, after) {
+  const sourceBefore = String(before || '')
+  const sourceAfter = String(after || '')
+  let changedAt = 0
+  while (changedAt < sourceBefore.length && changedAt < sourceAfter.length && sourceBefore[changedAt] === sourceAfter[changedAt]) changedAt += 1
+  const linePreview = source => {
+    const start = source.lastIndexOf('\n', Math.max(0, changedAt - 1)) + 1
+    const lineEnd = source.indexOf('\n', changedAt)
+    const end = lineEnd < 0 ? source.length : lineEnd
+    const line = source.slice(start, end).replace(/\t/g, '⇥')
+    return line.length > 110 ? `${line.slice(0, 107)}…` : line || '(空行)'
+  }
+  return { before: linePreview(sourceBefore), after: linePreview(sourceAfter) }
+}
+
 function markdownToHtml(markdown, imageIdentity, documentPath) {
   const html = marked.parse(markdown || '')
   if (typeof DOMParser === 'undefined') return html
@@ -123,7 +168,7 @@ function markdownToHtml(markdown, imageIdentity, documentPath) {
     const reference = resolveMarkdownImageReference(source, documentPath, imageIdentity)
     image.setAttribute('data-markdown-src', reference?.markdownSrc || source)
     const title = image.getAttribute('title')
-    if (reference && title) image.setAttribute('data-markdown-title', title)
+    if (title) image.setAttribute('data-markdown-title', title)
     image.setAttribute('src', reference?.url || 'about:blank')
   })
   // Metadata belongs to the immediately preceding image node, not its URL.
@@ -362,6 +407,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [moveBusy, setMoveBusy] = useState(false)
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
+  const [markdownRepairProposal, setMarkdownRepairProposal] = useState(null)
+  const [markdownRepairError, setMarkdownRepairError] = useState(null)
+  const [markdownRepairSaving, setMarkdownRepairSaving] = useState(false)
   const [, setSelectionEpoch] = useState(0)
   const [editorInteracted, setEditorInteracted] = useState(false)
   const sourceEditorRef = useRef(null)
@@ -428,6 +476,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const workspaceInfoRef = useRef(workspaceInfo)
   const showSourceRef = useRef(showSource)
   const sourceContentRef = useRef(sourceContent)
+  const markdownRepairProposalRef = useRef(null)
+  const markdownRepairOperationRef = useRef(false)
   const openFilesRef = useRef([])
   const {
     savedContents, setSavedContents,
@@ -460,6 +510,30 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   useEffect(() => { openFilesRef.current = openFiles }, [openFiles])
   useEffect(() => { showSourceRef.current = showSource }, [showSource])
   useEffect(() => { sourceContentRef.current = sourceContent }, [sourceContent])
+
+  const updateMarkdownRepairProposal = useCallback(proposal => {
+    markdownRepairProposalRef.current = proposal
+    setMarkdownRepairProposal(proposal)
+    setMarkdownRepairError(null)
+  }, [])
+
+  const clearMarkdownRepairProposal = useCallback((expectedProposal = null) => {
+    if (expectedProposal && markdownRepairProposalRef.current !== expectedProposal) return
+    markdownRepairProposalRef.current = null
+    setMarkdownRepairProposal(null)
+    setMarkdownRepairError(null)
+  }, [])
+
+  useEffect(() => {
+    const proposal = markdownRepairProposalRef.current
+    if (proposal && (
+      proposal.path !== activeFile ||
+      proposal.workspaceKey !== recoveryWorkspaceKey ||
+      proposal.diskRevision !== fileRevisions[proposal.path] ||
+      isDirty[proposal.path] ||
+      fileConflicts[proposal.path]
+    )) clearMarkdownRepairProposal(proposal)
+  }, [activeFile, clearMarkdownRepairProposal, fileConflicts, fileRevisions, isDirty, recoveryWorkspaceKey])
 
   useEffect(() => {
     if (workspaceInfo?.workspaceId) {
@@ -666,15 +740,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
         return
       }
+      clearMarkdownRepairProposal()
       setDraft(path, content, true)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
       scheduleSave(path, content)
     }
     editor.on('update', handler)
     return () => editor.off('update', handler)
-  }, [editor, scheduleSave, serializeCurrentEditor, setDraft, setEditorMarkdown, saveBlockedRef])
+  }, [clearMarkdownRepairProposal, editor, scheduleSave, serializeCurrentEditor, setDraft, setEditorMarkdown, saveBlockedRef])
 
-  const loadFile = useCallback(async (path, requestId) => {
+  const loadFile = useCallback(async (path, requestId, workspaceKeyAtOpen) => {
     try {
       const res = await axios.get(`${API}/file`, { params: { path } })
       const payload = res.data || {}
@@ -708,7 +783,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
         return
       }
-      if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
+      if (requestId !== openRequestRef.current || activeFileRef.current !== path || workspaceKeyAtOpen !== recoveryWorkspaceKeyRef.current) return
       setSaveBlocked(path, false)
       readOnlyMarkdownRef.current = false
       setLargeMarkdownView(null)
@@ -738,10 +813,31 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           setFileRevision(path, diskRevision)
         }
       }
-      if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
-      const safeCorrection = !hasDirtyDraft && diskRevision ? normalizeSafeMarkdown(fetched) : null
+      if (requestId !== openRequestRef.current || activeFileRef.current !== path || workspaceKeyAtOpen !== recoveryWorkspaceKeyRef.current) return
+      let proposedRepair = null
+      if (!hasDirtyDraft && diskRevision) {
+        try { proposedRepair = proposeSafeMarkdownRepair(fetched) } catch { proposedRepair = null }
+      }
+      const repairProposal = proposedRepair && typeof proposedRepair.content === 'string' &&
+        proposedRepair.content !== fetched && isEditableMarkdownSize(proposedRepair.content)
+        ? {
+            ...proposedRepair,
+            path,
+            workspaceKey: workspaceKeyAtOpen,
+            diskRevision,
+            requestId,
+            sourceContent: fetched,
+          }
+        : null
+      if (
+        repairProposal && requestId === openRequestRef.current &&
+        activeFileRef.current === path && workspaceKeyAtOpen === recoveryWorkspaceKeyRef.current &&
+        !dirtyRef.current[path] && !conflictsRef.current[path] &&
+        !saveTimersRef.current.has(path) && !saveQueuesRef.current.has(path)
+      ) updateMarkdownRepairProposal(repairProposal)
+      else clearMarkdownRepairProposal()
       setEditorInteracted(false)
-      const visible = draftContentsRef.current[path] ?? safeCorrection ?? fetched
+      const visible = draftContentsRef.current[path] ?? fetched
       sourceContentRef.current = visible
       renderedFileRef.current = path
       loadingRef.current = false
@@ -753,10 +849,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setSourceContent(visible)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
       if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
-      if (safeCorrection && requestId === openRequestRef.current && activeFileRef.current === path && !dirtyRef.current[path]) {
-        setDraft(path, safeCorrection, true)
-        doSave(path, safeCorrection).catch(() => {})
-      }
     } catch (error) {
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
       loadingRef.current = false
@@ -770,7 +862,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setLargeMarkdownView(null)
       message.error('打开文件失败：' + (error.response?.data?.error || error.message))
     }
-  }, [clearFileConflict, doSave, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked])
+  }, [clearFileConflict, clearMarkdownRepairProposal, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked, updateMarkdownRepairProposal])
 
   const handleFileOpen = useCallback(async node => {
     // The tab identity probe and own-tab crash recovery must finish before a
@@ -787,10 +879,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       return
     }
     const requestId = ++openRequestRef.current
+    const workspaceKeyAtOpen = recoveryWorkspaceKeyRef.current
     const previousPath = activeFileRef.current
     if (
       previousPath && previousPath !== path &&
-      !loadingRef.current && renderedFileRef.current === previousPath
+      !loadingRef.current && renderedFileRef.current === previousPath &&
+      !markdownRepairOperationRef.current
     ) captureCurrentDraft()
     setSelectedKey(path)
     if (!openFilesRef.current.includes(path)) {
@@ -799,6 +893,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
     activeFileRef.current = path
     setActiveFile(path)
+    clearMarkdownRepairProposal()
     readOnlyMarkdownRef.current = false
     setLargeMarkdownView(null)
     setShowSource(false)
@@ -843,8 +938,85 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setSaveStatus('idle')
       return
     }
-    await loadFile(path, requestId)
-  }, [captureCurrentDraft, collectDirtyDrafts, editor, loadFile, setSaveBlocked, waitForDraftRestore, writePendingDrafts])
+    await loadFile(path, requestId, workspaceKeyAtOpen)
+  }, [captureCurrentDraft, clearMarkdownRepairProposal, collectDirtyDrafts, editor, loadFile, setSaveBlocked, waitForDraftRestore, writePendingDrafts])
+
+  const handleConfirmMarkdownRepair = useCallback(async () => {
+    const proposal = markdownRepairProposalRef.current
+    if (!proposal || markdownRepairOperationRef.current) return
+    const { path } = proposal
+    const isCurrent = () => markdownRepairProposalRef.current === proposal &&
+      activeFileRef.current === path &&
+      openRequestRef.current === proposal.requestId &&
+      recoveryWorkspaceKeyRef.current === proposal.workspaceKey &&
+      renderedFileRef.current === path && !loadingRef.current &&
+      fileRevisionsRef.current[path] === proposal.diskRevision &&
+      cleanContentsRef.current[path] === proposal.sourceContent &&
+      draftContentsRef.current[path] === proposal.sourceContent &&
+      !dirtyRef.current[path] && !conflictsRef.current[path] &&
+      !saveBlockedRef.current.has(path) &&
+      !saveTimersRef.current.has(path) && !saveQueuesRef.current.has(path)
+
+    if (!isCurrent()) {
+      clearMarkdownRepairProposal(proposal)
+      message.warning('修复建议已过期，原文未修改；请重新打开文件后再试')
+      return
+    }
+
+    markdownRepairOperationRef.current = true
+    setMarkdownRepairSaving(true)
+    try {
+      setDraft(path, proposal.content, true)
+      sourceContentRef.current = proposal.content
+      setSourceContent(proposal.content)
+      const keepSource = requiresSourceMode(proposal.content)
+      showSourceRef.current = keepSource
+      setShowSource(keepSource)
+      if (!keepSource) setEditorMarkdown(proposal.content, path)
+      editor?.setEditable(!keepSource, false)
+      setSaveStatus('modified')
+      const saved = await doSave(path, proposal.content)
+      if (!saved) throw new Error('保存操作未执行')
+
+      const workspaceStillMatches = recoveryWorkspaceKeyRef.current === proposal.workspaceKey
+      const currentDraft = draftContentsRef.current[path]
+      if (workspaceStillMatches && currentDraft === proposal.content && !dirtyRef.current[path]) {
+        if (activeFileRef.current === path && openRequestRef.current === proposal.requestId && renderedFileRef.current === path) {
+          sourceContentRef.current = proposal.content
+          setSourceContent(proposal.content)
+          setSaveStatus('saved')
+        }
+        clearMarkdownRepairProposal(proposal)
+        message.success('Markdown 已修复并保存')
+      } else {
+        clearMarkdownRepairProposal(proposal)
+        if (activeFileRef.current === path) {
+          setSaveStatus('modified')
+          message.info('修复内容已保存；保存期间的新修改仍待保存')
+        }
+      }
+    } catch (error) {
+      const conflict = Boolean(conflictsRef.current[path]) ||
+        error?.response?.data?.code === 'FILE_CONFLICT' || error?.response?.data?.error === 'FILE_CONFLICT'
+      clearMarkdownRepairProposal(proposal)
+      setMarkdownRepairError({
+        path,
+        message: conflict
+          ? '磁盘版本已变化，修复没有覆盖文件；修复后的草稿仍已保留，可先比较版本。'
+          : '修复没有保存；修复后的草稿仍已保留，可检查后重试保存。',
+      })
+      if (conflict) message.warning('磁盘版本已变化；修复未写入，修复后的草稿已保留')
+      else message.error('修复未能保存；修复后的草稿已保留')
+    } finally {
+      markdownRepairOperationRef.current = false
+      setMarkdownRepairSaving(false)
+    }
+  }, [clearMarkdownRepairProposal, doSave, editor, setDraft, setEditorMarkdown])
+
+  const handleCancelMarkdownRepair = useCallback(() => {
+    const proposal = markdownRepairProposalRef.current
+    clearMarkdownRepairProposal(proposal)
+  }, [clearMarkdownRepairProposal])
 
   const removeTabState = useCallback(path => {
     clearSaveTimer(path)
@@ -887,7 +1059,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }, [setFileConflicts, setFileRevisions])
 
   const flushPaths = useCallback(async paths => {
-    if (paths.includes(activeFileRef.current)) captureCurrentDraft()
+    if (paths.includes(activeFileRef.current) && !markdownRepairOperationRef.current) captureCurrentDraft()
     await waitForPathSaves(paths)
     // A timer may have been installed by a stale render while the request was
     // being awaited. Clearing it here prevents an old path from coming back
@@ -973,6 +1145,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleSave = useCallback(async () => {
     const path = activeFileRef.current
+    if (markdownRepairOperationRef.current) return
     if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path)) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
@@ -996,6 +1169,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleRetrySave = useCallback(() => {
     const path = activeFileRef.current
+    if (markdownRepairOperationRef.current) return
     if (!isMarkdownFile(path) || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || conflictsRef.current[path]) return
     const content = showSourceRef.current ? sourceContentRef.current : captureCurrentDraft()
     if (content === undefined) return
@@ -1039,6 +1213,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
     try {
       clearSaveTimer(path)
+      if (markdownRepairProposalRef.current?.path === path) clearMarkdownRepairProposal(markdownRepairProposalRef.current)
       const pendingSave = saveQueuesRef.current.get(path)
       if (pendingSave) await pendingSave.catch(() => {})
       if (activeFileRef.current !== path) {
@@ -1058,7 +1233,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     } catch (error) {
       message.error('载入恢复草稿失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyRecoveryAlternative, clearSaveTimer, handleFileOpen, handleShowConflictReview, saveBlockedRef, setEditorMarkdown])
+  }, [applyRecoveryAlternative, clearMarkdownRepairProposal, clearSaveTimer, handleFileOpen, handleShowConflictReview, saveBlockedRef, setEditorMarkdown])
 
   const handleSaveLocalConflict = useCallback(async () => {
     if (!conflictReview?.path || conflictReview.diskRevision == null || conflictReview.diskContent == null) return
@@ -1161,6 +1336,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       cancelText: '保留本地草稿',
       okButtonProps: { danger: true },
       onOk: async () => {
+        if (markdownRepairProposalRef.current?.path === path) clearMarkdownRepairProposal(markdownRepairProposalRef.current)
         // Fetch again at confirmation time so a second external change cannot
         // leave the editor showing an older version than the current disk.
         const draftAtRequest = draftContentsRef.current[path]
@@ -1206,7 +1382,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         message.success('已载入磁盘版本')
       },
     })
-  }, [clearFileConflict, clearPendingDraft, conflictReview, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
+  }, [clearFileConflict, clearMarkdownRepairProposal, clearPendingDraft, conflictReview, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleOpenHistory = useCallback(async (path = activeFileRef.current) => {
     if (!isMarkdownFile(path)) return
@@ -1237,6 +1413,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       okText: '恢复版本',
       cancelText: '取消',
       onOk: async () => {
+        if (markdownRepairProposalRef.current?.path === path) clearMarkdownRepairProposal(markdownRepairProposalRef.current)
         try {
           const draftAtRequest = draftContentsRef.current[path]
           await axios.post(`${API}/file/restore`, { path, historyId: entry.id, expectedRevision })
@@ -1294,10 +1471,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }
       },
     })
-  }, [clearPendingDraft, historyModal.path, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
+  }, [clearMarkdownRepairProposal, clearPendingDraft, historyModal.path, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleToggleSource = useCallback(() => {
     const path = activeFileRef.current
+    if (markdownRepairOperationRef.current) return
     if (!path || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || loadingRef.current || renderedFileRef.current !== path) return
     if (!showSourceRef.current) {
       const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
@@ -1350,7 +1528,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       if (
         activeFileRef.current && !loadingRef.current &&
         renderedFileRef.current === activeFileRef.current &&
-        isMarkdownFile(activeFileRef.current)
+        isMarkdownFile(activeFileRef.current) &&
+        !markdownRepairOperationRef.current
       ) captureCurrentDraft()
 
       const pendingPaths = new Set([
@@ -1942,6 +2121,25 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const activeConflict = activeFile ? fileConflicts[activeFile] : null
   const activeLargeMarkdown = largeMarkdownView?.path === activeFile ? largeMarkdownView : null
   const tabDirtyState = isDirty
+  const activeMarkdownRepair = markdownRepairProposal?.path === activeFile &&
+    markdownRepairProposal.workspaceKey === recoveryWorkspaceKey &&
+    markdownRepairProposal.diskRevision === fileRevisions[activeFile] &&
+    !fileLoading && !activeLargeMarkdown && !activeConflict && !isDirty[activeFile]
+    ? markdownRepairProposal
+    : null
+  const markdownRepairChanges = (activeMarkdownRepair?.changes || []).map(repairChangeLabel).filter(Boolean)
+  const markdownRepairExample = activeMarkdownRepair
+    ? markdownRepairPreview(activeMarkdownRepair.sourceContent, activeMarkdownRepair.content)
+    : null
+  const markdownRepairDiagnostics = activeMarkdownRepair
+    ? (Array.isArray(activeMarkdownRepair.remainingDiagnostics)
+        ? activeMarkdownRepair.remainingDiagnostics
+        : analyzeMarkdownSource(activeMarkdownRepair.content))
+    : []
+  const markdownRepairDiagnosticLabels = [...new Set(markdownRepairDiagnostics.map(repairDiagnosticLabel).filter(Boolean))]
+  const activeMarkdownRepairError = markdownRepairError?.path === activeFile && !activeMarkdownRepair
+    ? markdownRepairError.message
+    : ''
   const sourceModeRequired = showSource && requiresSourceMode(sourceContent)
   const sourceDiagnostics = showSource ? analyzeMarkdownSource(sourceContent) : []
   const recoveryAlternativeCount = Object.values(recoveryAlternatives).reduce((count, entries) => count + entries.length, 0)
@@ -2510,6 +2708,42 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               )}
 
               {/* 编辑区 */}
+              {activeMarkdownRepair && (
+                <div className="markdown-repair-banner" role="region" aria-label="Markdown 修复建议">
+                  <div className="markdown-repair-copy">
+                    <strong>发现可自动修复的 Markdown 写法</strong>
+                    <span>查看预览后确认；文件会立即修复并保存，确认前原文保持不变。</span>
+                    {markdownRepairChanges.length > 0 && (
+                      <ul>
+                        {markdownRepairChanges.slice(0, 3).map((change, index) => <li key={`${index}-${change}`}>{change}</li>)}
+                        {markdownRepairChanges.length > 3 && <li>另有 {markdownRepairChanges.length - 3} 项</li>}
+                      </ul>
+                    )}
+                    {markdownRepairExample && (
+                      <div className="markdown-repair-example" aria-label="修复前后预览">
+                        <code>{markdownRepairExample.before}</code>
+                        <span aria-hidden="true">→</span>
+                        <code>{markdownRepairExample.after}</code>
+                      </div>
+                    )}
+                    {markdownRepairDiagnostics.length > 0 ? (
+                      <span className="markdown-repair-remaining">
+                        修复后仍有 {markdownRepairDiagnostics.length} 处暂不支持的内容，保存后继续使用源码模式。
+                        {markdownRepairDiagnosticLabels.length > 0 ? ` 包括：${markdownRepairDiagnosticLabels.slice(0, 3).join('、')}${markdownRepairDiagnosticLabels.length > 3 ? '等' : ''}。` : ''}
+                      </span>
+                    ) : (
+                      <span className="markdown-repair-remaining">修复后没有剩余的源码保护内容，可使用富文本编辑。</span>
+                    )}
+                  </div>
+                  <div className="markdown-repair-actions">
+                    <Button size="small" disabled={markdownRepairSaving} onClick={handleCancelMarkdownRepair}>暂不修复</Button>
+                    <Button size="small" type="primary" loading={markdownRepairSaving} onClick={handleConfirmMarkdownRepair}>确认修复并保存</Button>
+                  </div>
+                </div>
+              )}
+              {activeMarkdownRepairError && (
+                <div role="alert" className="markdown-repair-result">{activeMarkdownRepairError}</div>
+              )}
               {sourceModeRequired && (
                 <div role="status" className="source-fidelity-warning">
                   <span>{sourceDiagnostics.length} 处内容需要源码保护。波浪线标出具体片段；悬停可查看原因。</span>
@@ -2536,6 +2770,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                         message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
                         return false
                       }
+                      clearMarkdownRepairProposal()
                       sourceContentRef.current = value
                       setSourceContent(value)
                       const path = activeFileRef.current

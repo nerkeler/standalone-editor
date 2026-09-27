@@ -1,7 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { marked } from 'marked'
+import Turndown from 'turndown'
 import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
-import { normalizeSafeMarkdown } from '../src/pages/safeMarkdownNormalization.js'
+import { proposeSafeMarkdownRepair } from '../src/pages/safeMarkdownNormalization.js'
 
 const cases = [
   ['frontMatter', '---\ntitle: A\n---\n'],
@@ -42,6 +44,57 @@ test('blockquote diagnostics underline the original nested-list, table, and fenc
     assert.ok(diagnostic, reason + ': ' + source)
     assert.ok(source.slice(diagnostic.from, diagnostic.to).includes(excerpt), reason)
   }
+})
+
+test('aligned tables underline their actual delimiter rows, while paragraph lookalikes stay clear', () => {
+  for (const [source, expected] of [
+    ['| Left | Right |\n| :-- | --: |\n| a | b |\n', '| :-- | --: |'],
+    ['> | Left | Right |\n> | :-- | --: |\n> | a | b |\n', '> | :-- | --: |'],
+  ]) {
+    const diagnostic = analyzeMarkdownSource(source).find(item => item.reason === 'tableAlignment')
+    assert.ok(diagnostic)
+    assert.equal(source.slice(diagnostic.from, diagnostic.to), expected)
+  }
+  for (const source of [':--- | plain text\n', '> :--- | plain text\n']) {
+    assert.ok(!analyzeMarkdownSource(source).some(item => item.reason === 'tableAlignment'))
+  }
+})
+
+test('angle URL and email autolinks are reported as fixable Markdown, not raw HTML', () => {
+  for (const source of ['See <https://example.com/a?x=1>.\n', 'Mail <ada@example.com>.\n']) {
+    const diagnostics = analyzeMarkdownSource(source)
+    assert.ok(diagnostics.some(item => item.reason === 'autolinks'))
+    assert.ok(!diagnostics.some(item => item.reason === 'rawHtml'))
+  }
+})
+
+test('ordinary links with angle destinations and titles are not confused with autolinks or HTML', () => {
+  const source = '[x](<https://example.com> "title")\n'
+  const diagnostics = analyzeMarkdownSource(source)
+  assert.ok(!diagnostics.some(item => item.reason === 'autolinks'))
+  assert.ok(!diagnostics.some(item => item.reason === 'rawHtml'))
+  const title = diagnostics.find(item => item.reason === 'inlineLinkTitle')
+  assert.ok(title)
+  assert.equal(source.slice(title.from, title.to), '[x](<https://example.com> "title")')
+  assert.equal(proposeSafeMarkdownRepair(source), null)
+})
+
+test('non-autolink angle text is not classified as raw HTML or an autolink', () => {
+  for (const source of ['<x:b>\n', '<example.com>\n', '<a@b..com>\n']) {
+    const diagnostics = analyzeMarkdownSource(source)
+    assert.ok(!diagnostics.some(item => item.reason === 'autolinks'), source)
+    assert.ok(!diagnostics.some(item => item.reason === 'rawHtml'), source)
+  }
+})
+
+test('inline link titles are protected, while image titles remain supported', () => {
+  const link = '[guide](https://example.com "important title")\n'
+  const linkTitle = analyzeMarkdownSource(link).find(item => item.reason === 'inlineLinkTitle')
+  assert.ok(linkTitle)
+  assert.equal(link.slice(linkTitle.from, linkTitle.to), '[guide](https://example.com "important title")')
+
+  const image = '![photo](assets/photo.png "photo title")\n'
+  assert.ok(!analyzeMarkdownSource(image).some(item => item.reason === 'inlineLinkTitle'))
 })
 
 test('Marked fallback protects quote structures nested under list indentation', () => {
@@ -122,15 +175,96 @@ test('editor-owned image presentation comment remains rich-safe', () => {
 
 test('a single simple reference link normalizes once without changing rendered HTML', () => {
   const source = '[guide][docs]\n\n[docs]: https://example.com\n'
-  const fixed = normalizeSafeMarkdown(source)
-  assert.equal(fixed, '[guide](https://example.com)\n')
-  assert.equal(normalizeSafeMarkdown(fixed), null)
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal.content, '[guide](https://example.com)\n')
+  assert.deepEqual(proposal.remainingDiagnostics, [])
+  assert.deepEqual(proposeSafeMarkdownRepair(proposal.content), null)
 })
 
-test('mixed, titled and unsupported source remains byte-for-byte unchanged', () => {
+test('multiple simple and multiline reference links produce one byte-preserving proposal', () => {
+  const source = '[guide][docs] and [spec][api]\n\n[docs]: https://example.com\n[api]: https://example.org\n'
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal.content, '[guide](https://example.com) and [spec](https://example.org)\n')
+  assert.equal(proposal.changes[0], '将 2 处引用式链接改为普通链接')
+  assert.deepEqual(proposal.remainingDiagnostics, [])
+
+  const multiline = '[link\n][ref]\n\n[ref]:\n  https://example.com\n'
+  const multilineProposal = proposeSafeMarkdownRepair(multiline)
+  assert.equal(multilineProposal.content, '[link\n](https://example.com)\n')
+  assert.deepEqual(multilineProposal.remainingDiagnostics, [])
+})
+
+test('nested-label reference links are diagnosed and repaired only with equivalent Marked output', () => {
+  const source = '[an [inner] label][docs]\n\n[docs]: https://example.com\n'
+  const diagnostic = analyzeMarkdownSource(source).find(item => item.reason === 'referenceLinks')
+  assert.ok(diagnostic)
+  assert.equal(source.slice(diagnostic.from, diagnostic.to), '[an [inner] label][docs]')
+
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal?.content, '[an [inner] label](https://example.com)\n')
+  assert.equal(marked.parse(proposal.content), marked.parse(source))
+  assert.deepEqual(proposal.remainingDiagnostics, [])
+  assert.equal(proposeSafeMarkdownRepair(proposal.content), null)
+})
+
+test('collapsed, shortcut, image and relative references repair only resolved safe forms', () => {
+  const cases = [
+    ['[guide][]\n\n[guide]: https://example.com\n', '[guide](https://example.com)\n'],
+    ['[guide]\n\n[guide]: https://example.com\n', '[guide](https://example.com)\n'],
+    ['![diagram][img]\n\n[img]: ../assets/diagram.png\n', '![diagram](../assets/diagram.png)\n'],
+    ['[doc][id]\n\n[id]: ../docs/a.md\n', '[doc](../docs/a.md)\n'],
+  ]
+  for (const [source, expected] of cases) {
+    const proposal = proposeSafeMarkdownRepair(source)
+    assert.equal(proposal?.content, expected, source)
+    assert.deepEqual(proposal.remainingDiagnostics, [])
+  }
+})
+
+test('automatic URI and email links are proposed without changing rendered HTML', () => {
+  const source = 'See <https://example.com/a?x=1>. Mail <ada@example.com>.\n'
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal.content, 'See [https://example.com/a?x=1](<https://example.com/a?x=1>). Mail [ada@example.com](mailto:ada@example.com).\n')
+  assert.deepEqual(proposal.remainingDiagnostics, [])
+  assert.equal(proposeSafeMarkdownRepair(proposal.content), null)
+  assert.equal(proposeSafeMarkdownRepair('<ftp://example.com/file>\n'), null)
+})
+
+test('unsafe references and unused definitions keep their source bytes', () => {
   for (const source of [
-    '---\na: b\n---\n[guide][docs]\n\n[docs]: https://example.com\n',
     '[guide][docs]\n\n[docs]: https://example.com "title"\n',
-    'Hello [guide][docs]\n\n[docs]: https://example.com\n',
-  ]) assert.equal(normalizeSafeMarkdown(source), null)
+    '[guide][docs]\n\n[docs]: https://example.com/path_(section)\n',
+    '[docs]: https://example.com\n',
+  ]) assert.equal(proposeSafeMarkdownRepair(source), null)
+
+  const source = '[guide][docs]\n\n[docs]: https://example.com\n[unused]: https://unused.example/path\n'
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal.content, '[guide](https://example.com)\n\n[unused]: https://unused.example/path\n')
+  assert.ok(proposal.remainingDiagnostics.some(item => item.reason === 'referenceLinks'))
+})
+
+test('safe repairs preserve unrelated YAML and report it as a remaining diagnostic', () => {
+  const source = '---\na: b\n---\n[guide][docs]\n\n[docs]: https://example.com\n'
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.ok(proposal.content.startsWith('---\na: b\n---\n'))
+  assert.equal(proposal.content.slice('---\na: b\n---\n'.length), '[guide](https://example.com)\n')
+  assert.deepEqual(proposal.remainingDiagnostics.map(item => item.reason), ['frontMatter'])
+})
+
+test('dangling footnote-style text gets a stable escaped proposal; real definitions stay protected', () => {
+  const source = 'Text[^missing]\n'
+  const diagnostics = analyzeMarkdownSource(source)
+  assert.ok(diagnostics.some(item => item.reason === 'literalFootnoteMarker'))
+  assert.ok(!diagnostics.some(item => item.reason === 'footnotes'))
+  const proposal = proposeSafeMarkdownRepair(source)
+  assert.equal(proposal.content, 'Text\\[^missing\\]\n')
+  assert.deepEqual(proposal.remainingDiagnostics, [])
+  assert.equal(marked.parse(source), marked.parse(proposal.content))
+  const turndown = new Turndown()
+  assert.equal(turndown.turndown(marked.parse(proposal.content)), proposal.content.trimEnd())
+  assert.equal(proposeSafeMarkdownRepair(proposal.content), null)
+
+  const paired = 'Text[^note]\n\n[^note]: Footnote text.\n'
+  assert.ok(analyzeMarkdownSource(paired).some(item => item.reason === 'footnotes'))
+  assert.equal(proposeSafeMarkdownRepair(paired), null)
 })

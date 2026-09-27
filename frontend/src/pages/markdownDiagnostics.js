@@ -4,7 +4,10 @@ const MESSAGES = {
   frontMatter: 'YAML 元数据不能无损进入富文本；请在源码模式编辑。',
   wikiLinks: 'WikiLink 目标和别名可能被改写；请保留源码。',
   footnotes: '脚注引用和定义暂不支持富文本往返；请保留源码。',
+  literalFootnoteMarker: '无定义的脚注样式文本会被富文本转义；可先确认修复。',
   referenceLinks: '引用式链接会改变源文件写法；请保留源码。',
+  autolinks: '自动链接写法可能被富文本改写；支持的地址可确认修复。',
+  inlineLinkTitle: '链接标题属性不会由富文本完整保留；请保留源码。',
   escapedSyntax: '转义符可能丢失；请保留源码。',
   tableAlignment: '表格列对齐信息可能丢失；请保留源码。',
   nestedLists: '嵌套列表的缩进可能改变；请保留源码。',
@@ -35,7 +38,7 @@ function normalizeReferenceLabel(label) {
 
 function hasMultilineHtmlTag(value) {
   const source = String(value || '')
-  for (const match of source.matchAll(/<\/?[A-Za-z][\w:-]*(?=[\s/>])/g)) {
+  for (const match of source.matchAll(/<\/?[A-Za-z][A-Za-z0-9-]*(?=[\t\n\f />])/g)) {
     let quote = null
     let multiline = false
     for (let index = match.index + match[0].length; index < source.length; index += 1) {
@@ -53,6 +56,37 @@ function hasMultilineHtmlTag(value) {
     }
   }
   return false
+}
+
+function collectTitledLinkRanges(tokens, source, scopeStart, scopeEnd, output) {
+  let cursor = scopeStart
+  const visit = token => {
+    const raw = String(token.raw || '')
+    let from = raw ? source.indexOf(raw, cursor) : -1
+    if (from < scopeStart || from + raw.length > scopeEnd) from = raw ? source.indexOf(raw, scopeStart) : -1
+    const found = from >= scopeStart && from + raw.length <= scopeEnd
+        if (token.type === 'link' && token.title && found && /\]\([\s\S]*\)$/.test(raw)) {
+      output.push([from, from + raw.length])
+    }
+    if (found) cursor = Math.max(cursor, from + raw.length)
+
+    const childTokens = token.tokens || []
+    if (childTokens.length) {
+      const childStart = found ? from : scopeStart
+      const childEnd = found ? from + raw.length : scopeEnd
+      collectTitledLinkRanges(childTokens, source, childStart, childEnd, output)
+    }
+    for (const item of token.items || []) {
+      if (item.tokens?.length) {
+        const itemRaw = String(item.raw || '')
+        const itemFrom = itemRaw ? source.indexOf(itemRaw, found ? from : scopeStart) : -1
+        const itemStart = itemFrom >= 0 && itemFrom + itemRaw.length <= scopeEnd ? itemFrom : scopeStart
+        const itemEnd = itemStart === scopeStart ? scopeEnd : itemStart + itemRaw.length
+        collectTitledLinkRanges(item.tokens, source, itemStart, itemEnd, output)
+      }
+    }
+  }
+  for (const token of tokens || []) visit(token)
 }
 
 function isMultilineReferenceLink(token, links) {
@@ -78,6 +112,7 @@ export function analyzeMarkdownSource(markdown) {
     add('unparseableMarkdown', 0, Math.max(1, source.length))
     return items
   }
+  const linkDefinitions = tokens.links || Object.create(null)
   let offset = 0
   let fence = null
   let fenceStart = -1
@@ -142,32 +177,121 @@ export function analyzeMarkdownSource(markdown) {
     } else if (logical.trim() && !/^\s/.test(logical)) {
       listIndentByQuoteDepth.delete(quote.depth)
     }
-    if (/^\s*\|?\s*:?-{1,}:?\s*\|/.test(logical) && /:/.test(logical)) {
-      add('tableAlignment', offset, offset + raw.length)
-    }
     const code = [...logical.matchAll(/(`+)(.*?)\1/g)].map(match => [match.index, match.index + match[0].length])
+    const escapedLiteralFootnotes = [...logical.matchAll(/\\\[\^[^\]\n]+\\\]/g)]
+      .map(match => [match.index, match.index + match[0].length])
     const scan = (reason, regex) => {
       for (const match of logical.matchAll(regex)) {
-        if (!code.some(([start, end]) => match.index >= start && match.index < end)) {
+        const trailingLinkTitle = /^[\t ]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^\)\r\n]*\))[\t ]*\)/
+        const closesInlineLink = /^[\t ]*\)/
+        const insideLinkDestination = reason === 'autolinks' &&
+          /\]\([\t ]*$/.test(logical.slice(0, match.index)) &&
+          (closesInlineLink.test(logical.slice(match.index + match[0].length)) ||
+            trailingLinkTitle.test(logical.slice(match.index + match[0].length)))
+        if (!code.some(([start, end]) => match.index >= start && match.index < end) &&
+            !insideLinkDestination &&
+            !(reason === 'escapedSyntax' && escapedLiteralFootnotes.some(([start, end]) => match.index >= start && match.index < end)) &&
+            !(reason === 'rawHtml' && /^(?:<https?:\/\/|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@)/i.test(match[0]))) {
           add(reason, logicalStart + match.index, logicalStart + match.index + match[0].length)
         }
       }
     }
     scan('wikiLinks', /!?\[\[[^\]\n]+\]\]/g)
-    scan('footnotes', /\[\^[^\]\n]+\]/g)
-    scan('referenceLinks', /\[(?!\^)[^\]\n]+\]\[[^\]\n]+\]|^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*\S+/g)
+    scan('referenceLinks', /!?\[(?!\^)(?:\\.|[^\]\n]|\[[^\]\n]*\])+\]\[[^\]\n]*\]|^\s{0,3}\[(?!\^)[^\]\n]+\]:\s*\S+/g)
+    for (const match of logical.matchAll(/\[((?:\\.|[^\]])+)\](?:\[([^\]]*)\])?/g)) {
+      const after = logical[match.index + match[0].length]
+      const before = logical[match.index - 1]
+      if (before === ']' || after === '(' || after === ':' || after === ']') continue
+      if (match[1].startsWith('^')) continue
+      if (code.some(([start, end]) => match.index >= start && match.index < end)) continue
+      const label = normalizeReferenceLabel(match[2] || match[1])
+      if (Object.hasOwn(linkDefinitions, label)) {
+        const start = before === '!' ? match.index - 1 : match.index
+        add('referenceLinks', logicalStart + start, logicalStart + match.index + match[0].length)
+      }
+    }
+    scan('autolinks', /<[A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*>|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+>/g)
     scan('escapedSyntax', /\\[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/g)
-    scan('rawHtml', /<!--(?!(?:[ \t]*zoom:\d+[ \t]*-->|[ \t]*se-image:width=(?:2[5-9]|[3-9]\d|100);align=(?:left|center)[ \t]*-->)).*?-->|<\/?[A-Za-z][^>]*>/g)
+    scan('rawHtml', /<!--(?!(?:[ \t]*zoom:\d+[ \t]*-->|[ \t]*se-image:width=(?:2[5-9]|[3-9]\d|100);align=(?:left|center)[ \t]*-->)).*?-->|<\/?[A-Za-z][A-Za-z0-9-]*(?=[\t\n\f />])[^>]*>/g)
     offset += line.length
   }
   if (fence) fencedRanges.push([fenceStart, source.length])
   const inFence = index => fencedRanges.some(([start, end]) => index >= start && index < end)
 
+  let titledLinkOffset = 0
+  for (const token of tokens) {
+    const raw = String(token.raw || '')
+    const from = raw ? source.indexOf(raw, titledLinkOffset) : -1
+    if (from < 0) continue
+    const to = Math.min(source.length, from + raw.length)
+    const ranges = []
+    collectTitledLinkRanges([token], source, from, to, ranges)
+    for (const [start, end] of ranges) add('inlineLinkTitle', start, end)
+    titledLinkOffset = to
+  }
+
+  const footnoteDefinitions = new Set()
+  for (const line of logicalLines) {
+    if (line.sourceStart < (front?.[0].length || 0) || inFence(line.sourceStart)) continue
+    const definition = line.text.match(/^ {0,3}\[\^([^\]\n]+)\]:/)
+    if (definition) footnoteDefinitions.add(normalizeReferenceLabel(definition[1]))
+  }
+  for (const line of logicalLines) {
+    if (line.sourceStart < (front?.[0].length || 0) || inFence(line.sourceStart)) continue
+    const code = [...line.text.matchAll(/(`+)(.*?)\1/g)].map(match => [match.index, match.index + match[0].length])
+    for (const match of line.text.matchAll(/\\?\[\^([^\]\n]+)\\?\]/g)) {
+      if (code.some(([start, end]) => match.index >= start && match.index < end)) continue
+      const escapedOpen = match[0].startsWith('\\[')
+      const escapedClose = match[0].endsWith('\\]')
+      if (escapedOpen && escapedClose) continue
+      if (escapedOpen || escapedClose) continue
+      const reason = footnoteDefinitions.has(normalizeReferenceLabel(match[1]))
+        ? 'footnotes'
+        : 'literalFootnoteMarker'
+      add(reason, line.logicalStart + match.index, line.logicalStart + match.index + match[0].length)
+    }
+  }
+
+  // Marked's token tree tells us whether a delimiter-looking row is actually
+  // part of an aligned table. Use the exact delimiter row for ordinary tables
+  // and quote-contained tables; structural fallback below covers deeper
+  // container shapes where source offsets cannot be mapped narrowly.
+  const alignedTableTokens = token => {
+    const found = []
+    if (token.type === 'table' && token.align?.some(Boolean)) found.push(token)
+    for (const child of token.tokens || []) found.push(...alignedTableTokens(child))
+    for (const item of token.items || []) {
+      for (const child of item.tokens || []) found.push(...alignedTableTokens(child))
+    }
+    return found
+  }
+  let tableTokenOffset = 0
+  for (const token of tokens) {
+    const tokenRaw = String(token.raw || '')
+    const tokenStart = tokenRaw ? source.indexOf(tokenRaw, tableTokenOffset) : -1
+    if (tokenStart < 0) continue
+    const tokenEnd = Math.min(source.length, tokenStart + tokenRaw.length)
+    for (const table of alignedTableTokens(token)) {
+      const delimiter = String(table.raw || '').split(/\r?\n/)[1]?.trim()
+      if (!delimiter) continue
+      let lineStart = tokenStart
+      while (lineStart < tokenEnd) {
+        let lineEnd = source.indexOf('\n', lineStart)
+        if (lineEnd < 0 || lineEnd > tokenEnd) lineEnd = tokenEnd
+        const rawLine = source.slice(lineStart, lineEnd).replace(/\r$/, '')
+        if (stripBlockquotePrefixes(rawLine).text.trim() === delimiter && !inFence(lineStart)) {
+          add('tableAlignment', lineStart, lineStart + rawLine.length)
+        }
+        lineStart = lineEnd + 1
+      }
+    }
+    tableTokenOffset = Math.max(tableTokenOffset, tokenEnd)
+  }
+
   // Marked consumes reference definitions into its links table instead of
   // exposing them as block tokens. Match a source definition whose destination
   // starts on the following line against that table so unused definitions are
   // still protected from being dropped during rich-text serialization.
-  const linkDefinitions = tokens.links || Object.create(null)
   const normalizedLinkDefinitions = new Map()
   for (const [key, value] of Object.entries(linkDefinitions)) {
     const label = normalizeReferenceLabel(key)
@@ -194,7 +318,7 @@ export function analyzeMarkdownSource(markdown) {
   const collectQuotedLossyReasons = (token, inBlockquote = false, listDepth = 0) => {
     const reasons = new Set()
     const insideQuote = inBlockquote || token.type === 'blockquote'
-    if (token.type === 'table' && insideQuote && token.align?.some(Boolean)) reasons.add('tableAlignment')
+    if (token.type === 'table' && token.align?.some(Boolean)) reasons.add('tableAlignment')
     if (token.type === 'code' && insideQuote && token.lang?.trim() && !/^[\w.+#-]+$/.test(token.lang.trim())) {
       reasons.add('codeFenceMetadata')
     }

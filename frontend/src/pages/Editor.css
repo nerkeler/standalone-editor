@@ -708,6 +708,18 @@
 .source-fidelity-warning { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 16px; border-bottom: 1px solid var(--color-border); background: var(--color-bg-muted); color: var(--color-text-secondary); font-size: 12px; }
 .source-fidelity-warning .ant-btn { min-height: 28px; color: var(--color-text) !important; background: var(--color-surface-selected) !important; border: 1px solid var(--color-border) !important; font-size: 12px; font-weight: 600; }
 .source-fidelity-warning .ant-btn > span { color: var(--color-text) !important; -webkit-text-fill-color: var(--color-text); }
+.markdown-repair-banner { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--color-border); background: var(--color-bg-muted); color: var(--color-text-secondary); font-size: 12px; }
+.markdown-repair-copy { display: flex; min-width: 0; flex-direction: column; gap: 4px; }
+.markdown-repair-copy strong { color: var(--color-text); font-size: 12px; }
+.markdown-repair-copy ul { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 1px 0; padding-left: 17px; }
+.markdown-repair-copy li { color: var(--color-text); }
+.markdown-repair-example { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.markdown-repair-example code { max-width: min(44vw, 520px); overflow: hidden; padding: 2px 5px; border: 1px solid var(--color-border); border-radius: 4px; background: var(--color-bg-card); color: var(--color-text); text-overflow: ellipsis; white-space: nowrap; }
+.markdown-repair-example > span { color: var(--color-text-tertiary); }
+.markdown-repair-remaining { color: var(--color-text-tertiary); }
+.markdown-repair-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; }
+.markdown-repair-actions .ant-btn { min-height: 28px; }
+.markdown-repair-result { padding: 8px 16px; border-bottom: 1px solid var(--color-border); background: var(--color-bg-muted); color: var(--color-danger); font-size: 12px; }
 .table-insert-panel { display: flex; flex-direction: column; gap: 10px; min-width: 210px; }
 .table-insert-title { font-size: 12px; font-weight: 600; }
 .table-size-grid { display: grid; grid-template-columns: repeat(8, 19px); gap: 3px; }
@@ -919,6 +931,8 @@
   #editor-root .prose-column .ProseMirror h2 { margin-top: 30px !important; font-size: 24px !important; }
   .source-editor .cm-content { padding: 20px 16px 64px !important; }
   .editor-statusbar { min-height: 44px; padding-inline: 12px; }
+  .markdown-repair-banner { flex-direction: column; gap: 8px; padding-inline: 12px; }
+  .markdown-repair-actions { align-self: flex-end; }
   .editor-status-actions { gap: 7px; }
   .editor-file-location { max-width: 45%; }
   .mobile-outline-list {

@@ -734,11 +734,25 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
     }
     for (const path of unique) {
       clearSaveTimer(path)
-      if (dirtyRef.current[path] && draftContentsRef.current[path] !== undefined) {
-        await doSave(path, draftContentsRef.current[path])
+      // A throttled autosave can enter the queue while an earlier request is
+      // in flight. Drain every queued snapshot before reading dirty state;
+      // otherwise this flush could enqueue the same latest draft once more.
+      while (saveQueuesRef.current.has(path)) {
+        const pending = saveQueuesRef.current.get(path)
+        if (!pending) break
+        await pending
+        clearSaveTimer(path)
       }
-      const pending = saveQueuesRef.current.get(path)
-      if (pending) await pending
+      // An in-flight save may have acknowledged the current draft while this
+      // flush was waiting. Recheck only after that queue item settles so close,
+      // workspace changes, and other flushes do not enqueue the same snapshot
+      // a second time. A newer edit made during the wait stays dirty and is
+      // saved from the latest ref value below.
+      clearSaveTimer(path)
+      const latestDraft = draftContentsRef.current[path]
+      if (dirtyRef.current[path] && latestDraft !== undefined) {
+        await doSave(path, latestDraft)
+      }
     }
   }, [clearSaveTimer, doSave, saveBlockedRef])
 
