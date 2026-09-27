@@ -864,6 +864,53 @@ test('table picker chooses dimensions and contextual tools add rows and columns'
   })
 })
 
+test('mobile directory keeps long nested filenames inside its frame', async () => {
+  const folder = 'a-very-long-folder-name-that-needs-to-stay-inside-the-mobile-directory'
+  const fileName = 'a-very-long-markdown-filename-that-should-not-escape-the-directory-panel.md'
+  await mkdir(path.join(workspace, folder), { recursive: true })
+  await writeFile(path.join(workspace, folder, fileName), '# Long mobile filename\n')
+  await Promise.all(Array.from({ length: 24 }, (_, index) => writeFile(path.join(workspace, `zz-mobile-list-${index}.md`), '# Mobile list fixture\n')))
+  await connection.send('Emulation.setDeviceMetricsOverride', { width: 1195, height: 751, deviceScaleFactor: 1, mobile: false })
+  await setupPage()
+  try {
+    await connection.send('Emulation.setDeviceMetricsOverride', { width: 320, height: 700, deviceScaleFactor: 1, mobile: true })
+    await waitUntil('mobile editor layout', () => connection.evaluate(`!document.querySelector('.workspace-sidebar') && Boolean(document.querySelector('.empty-editor [aria-label="打开目录"]'))`))
+    await connection.evaluate(`document.querySelector('.empty-editor [aria-label="打开目录"]')?.click()`)
+    await waitUntil('mobile directory panel', () => connection.evaluate(`Boolean(document.querySelector('.mobile-workspace-modal .ant-modal-body'))`))
+    await waitUntil('long folder in mobile directory', () => connection.evaluate(`document.querySelector('.mobile-workspace-modal .ant-tree')?.innerText.includes(${JSON.stringify(folder)})`))
+    await connection.evaluate(`document.querySelector('.mobile-workspace-modal [aria-label="全部展开"]')?.click()`)
+    await waitUntil('nested mobile file row', () => connection.evaluate(`document.querySelector('.mobile-workspace-modal .ant-tree')?.innerText.includes(${JSON.stringify(fileName)})`))
+    await new Promise(resolve => setTimeout(resolve, 300))
+    const layout = await connection.evaluate(`(() => {
+      const panel = document.querySelector('.mobile-workspace-modal .ant-modal-body');
+      const tree = panel?.querySelector('.ant-tree');
+      const rows = Array.from(tree?.querySelectorAll('.ant-tree-treenode') || []);
+      const edge = panel.getBoundingClientRect().right;
+      return {
+        panelWidth: panel.clientWidth,
+        panelRight: edge,
+        treeScrollWidth: tree.scrollWidth,
+        treeClientWidth: tree.clientWidth,
+        treeScrollHeight: tree.scrollHeight,
+        treeClientHeight: tree.clientHeight,
+        maxRowRight: Math.max(...rows.map(row => row.getBoundingClientRect().right)),
+      };
+    })()`)
+    if (process.env.EDITOR_MOBILE_OVERFLOW_DIR) {
+      await mkdir(process.env.EDITOR_MOBILE_OVERFLOW_DIR, { recursive: true })
+      const frame = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+      await writeFile(path.join(process.env.EDITOR_MOBILE_OVERFLOW_DIR, 'mobile-directory-320.png'), Buffer.from(frame.data, 'base64'))
+    }
+    assert.ok(layout.maxRowRight <= layout.panelRight + 1, `directory rows must stay inside the mobile panel: ${JSON.stringify(layout)}`)
+    assert.ok(layout.treeScrollWidth <= layout.treeClientWidth + 1, `tree content overflows: ${JSON.stringify(layout)}`)
+    assert.ok(layout.treeScrollHeight > layout.treeClientHeight, 'long directory should scroll inside the modal')
+  } finally {
+    await connection.send('Emulation.setDeviceMetricsOverride', { width: 1195, height: 751, deviceScaleFactor: 1, mobile: false })
+    await rm(path.join(workspace, folder), { recursive: true, force: true })
+    await Promise.all(Array.from({ length: 24 }, (_, index) => rm(path.join(workspace, `zz-mobile-list-${index}.md`), { force: true })))
+  }
+})
+
 test('mobile image action opens the same file input', async () => {
   const fileName = 'mobile-image.md'
   await writeFile(path.join(workspace, fileName), '# Mobile image fixture\n')
@@ -879,7 +926,7 @@ test('mobile image action opens the same file input', async () => {
 
 test('visual review snapshots on isolated workspace', { skip: !process.env.EDITOR_REVIEW_DIR }, async () => {
   const fileName = 'visual-review.md'
-  await writeFile(path.join(workspace, fileName), '# Quiet writing workspace\n\nA focused paragraph with **emphasis** and a [link](https://example.com).\n\n## Document structure\n\n- First idea\n- Second idea\n\n| Column | Detail |\n| --- | --- |\n| One | Two |\n')
+  await writeFile(path.join(workspace, fileName), '# Quiet writing workspace\n\nA focused paragraph with **emphasis** and a [link](https://example.com).\n\n```js\nconst note = "A quiet place to think"\nconsole.log(note)\n```\n\n## Document structure\n\n- First idea\n- Second idea\n\n| Column | Detail |\n| --- | --- |\n| One | Two |\n')
   await mkdir(process.env.EDITOR_REVIEW_DIR, { recursive: true })
   await setupPage()
   await openFile(fileName, 'Quiet writing workspace')

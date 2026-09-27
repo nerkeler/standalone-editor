@@ -131,6 +131,45 @@
   overflow: hidden;
 }
 
+.mobile-workspace-modal .ant-modal-body,
+.mobile-workspace-modal .ant-modal-body > div,
+.mobile-workspace-modal .ant-tree {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mobile-workspace-modal .ant-tree {
+  overflow-x: hidden;
+  overflow-y: auto;
+  max-height: min(55dvh, 480px);
+  overscroll-behavior: contain;
+}
+
+.mobile-workspace-modal .ant-tree-list-holder-inner {
+  min-width: 0;
+  max-width: 100%;
+  align-items: stretch;
+}
+
+.mobile-workspace-modal .ant-tree-treenode {
+  box-sizing: border-box;
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.mobile-workspace-modal .ant-tree-node-content-wrapper {
+  flex: 1 1 0%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.mobile-workspace-modal .ant-tree-title {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+}
+
 .workspace-status {
   min-height: 28px;
   border-top: 1px solid var(--color-border) !important;
@@ -673,8 +712,46 @@
 #editor-root .prose-column .ProseMirror ul,
 #editor-root .prose-column .ProseMirror ol { margin: 0 0 16px; padding-inline-start: 1.55em; }
 #editor-root .prose-column .ProseMirror li { margin: 0 0 5px; }
-#editor-root .prose-column .ProseMirror pre { margin: 22px 0; padding: 16px 18px; overflow: auto; border: 1px solid var(--color-border); border-radius: 6px; background: var(--color-bg-muted); }
-#editor-root .prose-column .ProseMirror pre code { background: none; padding: 0; }
+#editor-root .prose-column .ProseMirror pre {
+  margin: 24px 0;
+  padding: 20px 22px;
+  max-width: 100%;
+  overflow: auto;
+  border: 1px solid var(--color-code-block-border);
+  border-radius: 12px;
+  background: var(--color-code-block);
+  box-shadow: var(--shadow-code-block);
+  color: var(--color-text);
+  font-size: 14px;
+  line-height: 1.65;
+  tab-size: 2;
+}
+#editor-root .prose-column .ProseMirror pre code { background: none; padding: 0; color: inherit; }
+#editor-root .prose-column .ProseMirror pre .hljs-comment,
+#editor-root .prose-column .ProseMirror pre .hljs-quote { color: var(--color-syntax-comment); }
+#editor-root .prose-column .ProseMirror pre .hljs-doctag,
+#editor-root .prose-column .ProseMirror pre .hljs-keyword,
+#editor-root .prose-column .ProseMirror pre .hljs-formula { color: var(--color-syntax-keyword); }
+#editor-root .prose-column .ProseMirror pre .hljs-section,
+#editor-root .prose-column .ProseMirror pre .hljs-name,
+#editor-root .prose-column .ProseMirror pre .hljs-selector-tag,
+#editor-root .prose-column .ProseMirror pre .hljs-deletion,
+#editor-root .prose-column .ProseMirror pre .hljs-subst { color: var(--color-syntax-name); }
+#editor-root .prose-column .ProseMirror pre .hljs-string,
+#editor-root .prose-column .ProseMirror pre .hljs-regexp,
+#editor-root .prose-column .ProseMirror pre .hljs-addition { color: var(--color-syntax-string); }
+#editor-root .prose-column .ProseMirror pre .hljs-attr,
+#editor-root .prose-column .ProseMirror pre .hljs-attribute,
+#editor-root .prose-column .ProseMirror pre .hljs-variable,
+#editor-root .prose-column .ProseMirror pre .hljs-template-variable,
+#editor-root .prose-column .ProseMirror pre .hljs-type,
+#editor-root .prose-column .ProseMirror pre .hljs-number { color: var(--color-syntax-attribute); }
+#editor-root .prose-column .ProseMirror pre .hljs-symbol,
+#editor-root .prose-column .ProseMirror pre .hljs-link,
+#editor-root .prose-column .ProseMirror pre .hljs-meta,
+#editor-root .prose-column .ProseMirror pre .hljs-title { color: var(--color-syntax-title); }
+#editor-root .prose-column .ProseMirror pre .hljs-built_in,
+#editor-root .prose-column .ProseMirror pre .hljs-title.class_ { color: var(--color-syntax-built-in); }
 #editor-root .prose-column .ProseMirror img { max-width: 100%; height: auto; border-radius: 4px; }
 #editor-root .prose-column .ProseMirror table { width: 100%; border-collapse: collapse; margin: 20px 0 24px; }
 #editor-root .prose-column .ProseMirror th,
@@ -929,6 +1006,7 @@
     font-size: 30px !important;
   }
   #editor-root .prose-column .ProseMirror h2 { margin-top: 30px !important; font-size: 24px !important; }
+  #editor-root .prose-column .ProseMirror pre { padding: 16px 18px; }
   .source-editor .cm-content { padding: 20px 16px 64px !important; }
   .editor-statusbar { min-height: 44px; padding-inline: 12px; }
   .markdown-repair-banner { flex-direction: column; gap: 8px; padding-inline: 12px; }

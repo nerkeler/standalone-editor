@@ -2092,7 +2092,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
         >
           {node.type === 'dir' ? <FolderOpenOutlined style={{ color: 'var(--color-warning)' }} /> : <FileOutlined style={{ color: 'var(--color-file)' }} />}
-          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
+          <span title={node.name} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
           <span
             className="tree-node-more"
             onClick={e => { e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
