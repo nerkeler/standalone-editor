@@ -71,7 +71,7 @@ test('atomic writes honor a read-only file even when its parent directory is wri
 
   await assert.rejects(
     writeFile(workspace, 'read-only.md', 'replacement', revision('original'), { root: recovery }),
-    error => error.code === 'EACCES',
+    error => ['EACCES', 'EPERM'].includes(error.code),
   )
   assert.equal(await fs.readFile(filePath, 'utf8'), 'original')
 })

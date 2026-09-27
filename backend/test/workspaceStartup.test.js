@@ -372,8 +372,17 @@ test('failed config rename does not switch the active workspace or version', asy
   await fs.rename(configFile, backupConfig)
   await fs.mkdir(configFile)
   const failed = await postWorkspace(baseUrl, selectedWorkspace)
-  assert.equal(failed.status, 500)
-  assert.equal((await failed.json()).code, 'WORKSPACE_CONFIG_SAVE_FAILED')
+  const failure = await failed.json()
+  // Windows reports EPERM when renaming over a directory. The API maps that
+  // filesystem error to its normal permission response; POSIX reports a
+  // non-permission config-save failure for the same invalid target.
+  if (process.platform === 'win32') {
+    assert.equal(failed.status, 403)
+    assert.equal(failure.code, 'PERMISSION_DENIED')
+  } else {
+    assert.equal(failed.status, 500)
+    assert.equal(failure.code, 'WORKSPACE_CONFIG_SAVE_FAILED')
+  }
 
   const after = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
   assert.equal(after.workspace, before.workspace)
