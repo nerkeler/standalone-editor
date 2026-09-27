@@ -8,6 +8,8 @@ function envPort(name, fallback) {
 
 const frontendPort = envPort('FRONTEND_PORT', 5558)
 const backendPort = envPort('EDITOR_PORT', 5557)
+const allowedHosts = (process.env.FRONTEND_ALLOWED_HOSTS || '')
+  .split(',').map(host => host.trim()).filter(Boolean)
 
 export default defineConfig({
   plugins: [react()],
@@ -15,6 +17,7 @@ export default defineConfig({
     host: '127.0.0.1',
     port: frontendPort,
     strictPort: true,
+    allowedHosts,
     proxy: {
       '/api': {
         target: `http://127.0.0.1:${backendPort}`,

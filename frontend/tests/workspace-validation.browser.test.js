@@ -388,6 +388,7 @@ before(async () => {
     ...process.env,
     FRONTEND_PORT: String(frontendPort),
     EDITOR_PORT: String(backendPort),
+    FRONTEND_ALLOWED_HOSTS: 'notes.example.test',
   }, frontendRoot)
 
   await waitUntil('Vite to start', async () => {
@@ -448,6 +449,24 @@ test('Vite preserves the browser-facing Host and Origin for the backend', async 
   })
   assert.equal(response.status, 200)
   assert.deepEqual(await response.json(), { host, origin })
+
+  const domainHost = `notes.example.test:${frontendPort}`
+  const domainOrigin = `https://${domainHost}`
+  const forwarded = await new Promise((resolve, reject) => {
+    const request = http.request(`http://127.0.0.1:${frontendPort}/api/proxy-origin-check`, {
+      method: 'POST',
+      headers: { Host: domainHost, Origin: domainOrigin },
+    }, incoming => {
+      let body = ''
+      incoming.setEncoding('utf8').on('data', chunk => { body += chunk })
+      incoming.on('end', () => resolve({ status: incoming.statusCode, body }))
+      incoming.on('error', reject)
+    })
+    request.on('error', reject)
+    request.end()
+  })
+  assert.equal(forwarded.status, 200)
+  assert.deepEqual(JSON.parse(forwarded.body), { host: domainHost, origin: domainOrigin })
 })
 
 test('stale browser workspace is diagnostic only and retry enters editor only after /check succeeds', async () => {

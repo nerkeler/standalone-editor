@@ -62,7 +62,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。不要把监听地址改为局域网或公网可访问的地址，也不要把它当作多用户服务部署。
 
-前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未经认证时，仅应在可信网络内开放服务。
+前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。Vite 默认接受 IP 和 localhost；使用自定义域名运行 Vite 时，以 `FRONTEND_ALLOWED_HOSTS=editor.example.com` 配置允许的主机名（多个名称用逗号分隔）。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未经认证时，仅应在可信网络内开放服务。
 
 ### 跨平台目录选择
 
