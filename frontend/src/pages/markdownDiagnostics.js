@@ -97,6 +97,47 @@ function isMultilineReferenceLink(token, links) {
   return Boolean(shortcut && Object.hasOwn(links, normalizeReferenceLabel(shortcut[1])))
 }
 
+function collectListItemMarkers(tokens, output = [], parentItem = null, insideBlockquote = false, simpleBulletPath = true) {
+  for (const token of tokens || []) {
+    if (token.type === 'list') {
+      const simpleBulletList = token.ordered === false
+      for (const item of token.items || []) {
+        const firstLine = String(item.raw || '').split(/\r?\n/, 1)[0].trimStart().trimEnd()
+        output.push({
+          firstLine,
+          safeLooseNestedBullet: Boolean(
+            parentItem &&
+            !insideBlockquote &&
+            simpleBulletPath &&
+            simpleBulletList &&
+            parentItem.loose === true &&
+            token.loose === true &&
+            !parentItem.task &&
+            !item.task &&
+            item.loose === true
+          ),
+        })
+        collectListItemMarkers(
+          item.tokens,
+          output,
+          item,
+          insideBlockquote,
+          simpleBulletPath && simpleBulletList && !item.task,
+        )
+      }
+      continue
+    }
+    collectListItemMarkers(
+      token.tokens,
+      output,
+      parentItem,
+      insideBlockquote || token.type === 'blockquote',
+      simpleBulletPath,
+    )
+  }
+  return output
+}
+
 export function analyzeMarkdownSource(markdown) {
   const source = String(markdown || '')
   const items = []
@@ -217,6 +258,37 @@ export function analyzeMarkdownSource(markdown) {
   }
   if (fence) fencedRanges.push([fenceStart, source.length])
   const inFence = index => fencedRanges.some(([start, end]) => index >= start && index < end)
+
+  // The editor preserves ordinary unordered sublists when both the parent
+  // item and child-list items are already paragraphs. Tight items gain or lose
+  // paragraph spacing when serialized; ordered/task and quote nesting remain
+  // protected until their round-trip behavior is verified separately.
+  const safeLooseNestedBulletOffsets = new Set()
+  let listTokenOffset = 0
+  let markerLineCursor = 0
+  for (const token of tokens) {
+    const tokenRaw = String(token.raw || '')
+    const tokenStart = tokenRaw ? source.indexOf(tokenRaw, listTokenOffset) : -1
+    if (tokenStart < 0) continue
+    const tokenEnd = Math.min(source.length, tokenStart + tokenRaw.length)
+    for (const marker of collectListItemMarkers([token])) {
+      if (!marker.firstLine) continue
+      for (let index = markerLineCursor; index < logicalLines.length; index += 1) {
+        const line = logicalLines[index]
+        if (line.sourceStart < tokenStart) continue
+        if (line.sourceStart >= tokenEnd) break
+        if (line.sourceStart < (front?.[0].length || 0) || inFence(line.sourceStart)) continue
+        if (line.text.trimStart().trimEnd() !== marker.firstLine) continue
+        if (marker.safeLooseNestedBullet) {
+          const indentLength = line.text.length - line.text.trimStart().length
+          safeLooseNestedBulletOffsets.add(line.logicalStart + indentLength)
+        }
+        markerLineCursor = index + 1
+        break
+      }
+    }
+    listTokenOffset = tokenEnd
+  }
 
   let titledLinkOffset = 0
   for (const token of tokens) {
@@ -359,5 +431,7 @@ export function analyzeMarkdownSource(markdown) {
     if (/^<!--[ \t]*se-image:width=(?:2[5-9]|[3-9]\d|100);align=(?:left|center)[ \t]*-->$/.test(match[0])) continue
     add('rawHtml', match.index, match.index + match[0].length)
   }
-  return items.sort((a, b) => a.from - b.from || a.to - b.to)
+  return items
+    .filter(item => !(item.reason === 'nestedLists' && safeLooseNestedBulletOffsets.has(item.from)))
+    .sort((a, b) => a.from - b.from || a.to - b.to)
 }

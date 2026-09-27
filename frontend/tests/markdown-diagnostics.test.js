@@ -46,6 +46,48 @@ test('blockquote diagnostics underline the original nested-list, table, and fenc
   }
 })
 
+test('loose ordinary unordered sublists stay rich-safe while lossy nesting stays protected', () => {
+  const screenshotList = [
+    '-   **模型**:',
+    '',
+    '    -   qwen2.5:3b (1.9 GB) – 本地 LLM',
+    '        ',
+    '    -   nomic-embed-text (274 MB) – Embedding 模型',
+    '        ',
+    '',
+  ].join('\n')
+  assert.deepEqual(analyzeMarkdownSource(screenshotList), [])
+  assert.equal(proposeSafeMarkdownRepair(screenshotList), null)
+
+  const tight = '- parent\n  - child\n'
+  assert.ok(analyzeMarkdownSource(tight).some(item => item.reason === 'nestedLists'))
+
+  for (const source of [
+    '1. parent\n\n   1. child\n',
+    '- [ ] parent\n\n  - [ ] child\n',
+    '- parent\n\n  - child\n  - sibling\n',
+    '> - parent\n>   - child\n',
+    '- outer\n  > - quoted only\n',
+    '- parent\n\n  - child\n    - grandchild\n',
+  ]) {
+    assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'nestedLists'), source)
+  }
+})
+
+test('loose-list markers are matched inside their own top-level token after indented code', () => {
+  const source = [
+    '    - parent',
+    '    - child',
+    '',
+    '- parent',
+    '',
+    '  - child',
+    '',
+    '  - sibling',
+  ].join('\n')
+  assert.deepEqual(analyzeMarkdownSource(source), [])
+})
+
 test('aligned tables underline their actual delimiter rows, while paragraph lookalikes stay clear', () => {
   for (const [source, expected] of [
     ['| Left | Right |\n| :-- | --: |\n| a | b |\n', '| :-- | --: |'],

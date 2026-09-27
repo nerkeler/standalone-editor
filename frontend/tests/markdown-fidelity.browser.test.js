@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, before } from 'node:test'
+import { marked } from 'marked'
 import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -353,6 +354,48 @@ test('complex Markdown opens in source mode and rich conversion requires explici
     `Boolean(document.querySelector('.source-editor .cm-content')) && !document.querySelector('.ProseMirror')`,
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), fixture)
+})
+
+test('ordinary nested model bullets open in rich mode and keep their hierarchy after editing', async () => {
+  const fileName = 'nested-model-list.md'
+  const source = [
+    '### Ollama',
+    '',
+    '-   **端口**: `11434`',
+    '    ',
+    '-   **模型**:',
+    '    ',
+    '    -   qwen2.5:3b (1.9 GB) — 本地 LLM',
+    '        ',
+    '    -   nomic-embed-text (274 MB) — Embedding 模型',
+    '        ',
+    '',
+    '### Open-WebUI',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  await openFile(fileName, 'qwen2.5:3b')
+
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-fidelity-warning'))`), false, 'ordinary nested list must open without source protection')
+  await waitUntil('ordinary nested bullets to load in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror ul li ul li'))`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.markdown-repair-banner'))`), false, 'valid nested Markdown needs no file repair')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening valid Markdown must not rewrite it')
+  assert.equal(workspacePutCount(), initialPuts, 'opening valid Markdown must not send a repair save')
+  await appendToRichEditor(' verified')
+  await clickSave()
+  const saved = await waitForDiskMarker(fileName, 'verified')
+  const outer = marked.lexer(saved).find(token => token.type === 'list')
+  const nested = outer?.items?.[1]?.tokens?.find(token => token.type === 'list')
+  assert.equal(nested?.items?.length, 2, 'rich editing must keep both nested items under the model heading')
+  assert.match(saved, /nomic-embed-text/)
+  await setupPage()
+  await openFile(fileName, 'verified')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning'))`), true, 'saved nested list should reopen without source protection')
+  await saveRepairScreenshot('nested-list-rich.png')
 })
 
 test('lossy quote, reference, and multiline HTML syntax stays byte-identical on a no-op save', async () => {
