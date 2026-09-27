@@ -18,7 +18,9 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: `http://127.0.0.1:${backendPort}`,
-        changeOrigin: true,
+        // Preserve the browser-facing Host so the backend can validate the
+        // same-origin request even when accessed by a LAN IP or domain.
+        changeOrigin: false,
       },
     },
   },

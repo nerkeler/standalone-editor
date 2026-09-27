@@ -484,24 +484,41 @@ async function ensureCurrentWorkspaceAccessible(previous = workspace) {
 await initializeWorkspace()
 
 const app = express()
-const configuredOrigins = (process.env.CORS_ORIGINS || process.env.EDITOR_CORS_ORIGINS || '')
-  .split(',').map(item => item.trim()).filter(Boolean)
+const configuredOrigins = new Set((process.env.CORS_ORIGINS || process.env.EDITOR_CORS_ORIGINS || '')
+  .split(',').map(item => item.trim()).filter(Boolean))
 const defaultOrigins = new Set([
   `http://localhost:${process.env.FRONTEND_PORT || 5558}`,
   `http://127.0.0.1:${process.env.FRONTEND_PORT || 5558}`,
   `http://localhost:${PORT}`,
   `http://127.0.0.1:${PORT}`,
 ])
+const localBackendHosts = new Set([
+  `localhost:${PORT}`,
+  `127.0.0.1:${PORT}`,
+])
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || configuredOrigins.includes('*') || configuredOrigins.includes(origin) || defaultOrigins.has(origin)) {
-      callback(null, true)
-    } else {
-      callback(new Error('请求来源不被允许'))
-    }
-  },
-}))
+function allowedRequestOrigin(origin, requestHost) {
+  if (!origin || configuredOrigins.has('*') || configuredOrigins.has(origin)) return true
+  if (defaultOrigins.has(origin) && localBackendHosts.has(String(requestHost || '').toLowerCase())) return true
+  try {
+    const parsed = new URL(origin)
+    // A same-origin frontend proxy keeps the browser's Host header. This
+    // accepts any LAN address or domain without trusting arbitrary origins.
+    return (parsed.protocol === 'http:' || parsed.protocol === 'https:')
+      && parsed.origin === origin
+      && parsed.host.toLowerCase() === String(requestHost || '').toLowerCase()
+  } catch {
+    return false
+  }
+}
+
+app.use((req, res, next) => {
+  if (!allowedRequestOrigin(req.get('origin'), req.get('host'))) {
+    return res.status(403).json({ error: '请求来源不被允许', code: 'ORIGIN_NOT_ALLOWED' })
+  }
+  next()
+})
+app.use(cors({ origin: true }))
 app.use((req, res, next) => {
   if (workspace) setWorkspaceHeaders(res)
   if (req.path.startsWith('/assets/') || req.path === '/') {

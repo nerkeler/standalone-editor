@@ -62,6 +62,8 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。不要把监听地址改为局域网或公网可访问的地址，也不要把它当作多用户服务部署。
 
+前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未经认证时，仅应在可信网络内开放服务。
+
 ### 跨平台目录选择
 
 目录选择器由后端主机决定路径规则。`/api/dirs` 返回 `platform`、当前 `path`、`parent`、`canGoUp`、`canSelect`、`breadcrumb`、受策略限制的 `roots`、便于快速跳转的 `locations` 和 `entries`；条目和面包屑中的 `path` 都是完整的主机路径，前端应原样传回接口，不自行拼接 `/`、`\\` 或驱动器路径。Windows 的盘符根（例如 `C:\\`）和 UNC 根（例如 `\\\\server\\share\\`）也遵循同一规则。

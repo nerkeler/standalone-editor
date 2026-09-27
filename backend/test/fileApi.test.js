@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -17,7 +18,7 @@ async function temporaryDirectory(t, prefix) {
   return directory
 }
 
-async function startBackend(t, workspace, recovery) {
+async function startBackend(t, workspace, recovery, envOverrides = {}) {
   const source = `import { server } from './src/index.js'; server.once('listening', () => process.send({ port: server.address().port }));`
   const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
     cwd: backendRoot,
@@ -29,6 +30,7 @@ async function startBackend(t, workspace, recovery) {
       EDITOR_RECOVERY_DIR: recovery,
       WORKSPACE_CONFIG_FILE: path.join(recovery, 'test-workspace.json'),
       ALLOW_ANY_WORKSPACE: '1',
+      ...envOverrides,
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   })
@@ -55,6 +57,77 @@ async function startBackend(t, workspace, recovery) {
   })
   return `http://127.0.0.1:${port}`
 }
+
+async function requestWithHost(baseUrl, pathname, { method, headers, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(new URL(pathname, baseUrl), { method, headers }, response => {
+      const chunks = []
+      response.on('data', chunk => chunks.push(chunk))
+      response.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        resolve({ status: response.statusCode, headers: response.headers, json: () => JSON.parse(text) })
+      })
+      response.on('error', reject)
+    })
+    request.on('error', reject)
+    request.end(body)
+  })
+}
+
+test('CORS accepts the proxy request host on any frontend address and rejects another origin', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-origin-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-origin-recovery-')
+  const baseUrl = await startBackend(t, workspace, recovery, {
+    CORS_ORIGINS: '', EDITOR_CORS_ORIGINS: '',
+  })
+  const host = 'notes.example.test:8742'
+  const origin = `https://${host}`
+  const preflight = await requestWithHost(baseUrl, '/api/workspace/set', {
+    method: 'OPTIONS',
+    headers: { Host: host, Origin: origin, 'Access-Control-Request-Method': 'POST' },
+  })
+  assert.equal(preflight.status, 204)
+  assert.equal(preflight.headers['access-control-allow-origin'], origin)
+
+  const selected = await requestWithHost(baseUrl, '/api/workspace/set', {
+    method: 'POST',
+    headers: { Host: host, Origin: origin, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: workspace }),
+  })
+  assert.equal(selected.status, 200)
+  assert.equal(selected.json().workspace, await fs.realpath(workspace))
+
+  const foreign = await requestWithHost(baseUrl, '/api/workspace/set', {
+    method: 'OPTIONS',
+    headers: { Host: host, Origin: 'https://other.example.test:8742', 'Access-Control-Request-Method': 'POST' },
+  })
+  assert.equal(foreign.status, 403)
+  assert.equal(foreign.json().code, 'ORIGIN_NOT_ALLOWED')
+  assert.equal(foreign.headers['access-control-allow-origin'], undefined)
+
+  const unrelatedLocalhost = await requestWithHost(baseUrl, '/api/workspace/set', {
+    method: 'OPTIONS',
+    headers: { Host: host, Origin: 'http://localhost:5558', 'Access-Control-Request-Method': 'POST' },
+  })
+  assert.equal(unrelatedLocalhost.status, 403)
+})
+
+test('CORS accepts an explicitly configured cross-origin frontend', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-cors-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-cors-recovery-')
+  const origin = 'https://editor.example.test'
+  const baseUrl = await startBackend(t, workspace, recovery, { CORS_ORIGINS: origin })
+  const response = await requestWithHost(baseUrl, '/api/workspace/set', {
+    method: 'OPTIONS',
+    headers: {
+      Host: 'api.example.test',
+      Origin: origin,
+      'Access-Control-Request-Method': 'POST',
+    },
+  })
+  assert.equal(response.status, 204)
+  assert.equal(response.headers['access-control-allow-origin'], origin)
+})
 
 test('file API requires revisions, returns structured conflicts, and restores guarded history', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-api-workspace-')

@@ -135,6 +135,12 @@ function workspaceInfo(workspace = selectedWorkspace) {
 function createFakeBackend() {
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, `http://127.0.0.1:${backendPort}`)
+    if (url.pathname === '/api/proxy-origin-check' && request.method === 'POST') {
+      return sendJson(response, 200, {
+        host: request.headers.host,
+        origin: request.headers.origin,
+      })
+    }
     if (url.pathname === '/api/workspace/check' && request.method === 'GET') {
       state.checkCount += 1
       state.requestOrder.push('check')
@@ -431,6 +437,17 @@ after(async () => {
     }
   }
   if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Browser test cleanup failed')
+})
+
+test('Vite preserves the browser-facing Host and Origin for the backend', async () => {
+  const host = `127.0.0.1:${frontendPort}`
+  const origin = `http://${host}`
+  const response = await fetch(`${origin}/api/proxy-origin-check`, {
+    method: 'POST',
+    headers: { Origin: origin },
+  })
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { host, origin })
 })
 
 test('stale browser workspace is diagnostic only and retry enters editor only after /check succeeds', async () => {
