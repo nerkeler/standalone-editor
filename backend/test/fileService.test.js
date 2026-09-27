@@ -60,6 +60,22 @@ test('atomic writes preserve private file permissions', async t => {
   assert.equal(await fs.readFile(path.join(workspace, 'private.md'), 'utf8'), 'new')
 })
 
+test('atomic writes honor a read-only file even when its parent directory is writable', async t => {
+  if (process.getuid?.() === 0) return t.skip('root bypasses POSIX file permission bits')
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const filePath = path.join(workspace, 'read-only.md')
+  await fs.writeFile(filePath, 'original')
+  t.after(() => fs.chmod(filePath, 0o600).catch(() => {}))
+  await fs.chmod(filePath, 0o444)
+
+  await assert.rejects(
+    writeFile(workspace, 'read-only.md', 'replacement', revision('original'), { root: recovery }),
+    error => error.code === 'EACCES',
+  )
+  assert.equal(await fs.readFile(filePath, 'utf8'), 'original')
+})
+
 test('new atomic writes default to owner-only permissions', async t => {
   const workspace = await temporaryWorkspace(t)
 

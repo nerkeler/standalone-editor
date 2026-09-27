@@ -14,11 +14,25 @@ async function temporaryDirectory(t, prefix) {
   return directory
 }
 
+async function temporaryLinuxDirectoryOutsideDefaultRoots(t, prefix) {
+  const directory = await fs.mkdtemp(path.join('/var/tmp', prefix))
+  t.after(() => fs.rm(directory, { recursive: true, force: true }))
+  const realDirectory = await fs.realpath(directory)
+  assert.ok(
+    realDirectory !== '/tmp' && !realDirectory.startsWith('/tmp/'),
+    '/var/tmp must resolve outside /tmp to reproduce the old Linux allow-list',
+  )
+  return realDirectory
+}
+
 async function startBackend(t, {
   configFile,
   recoveryRoot,
   defaultWorkspace,
   cliWorkspace,
+  homeDirectory,
+  allowAnyWorkspace = true,
+  directoryRoots,
 } = {}) {
   const source = `import { server } from './src/index.js'; server.once('listening', () => process.send({ port: server.address().port }));`
   const args = ['--input-type=module', '-e', source]
@@ -29,8 +43,12 @@ async function startBackend(t, {
     HOST: '127.0.0.1',
     WORKSPACE_CONFIG_FILE: configFile,
     EDITOR_RECOVERY_DIR: recoveryRoot,
-    ALLOW_ANY_WORKSPACE: '1',
+    ALLOW_ANY_WORKSPACE: allowAnyWorkspace ? '1' : '0',
   }
+  delete env.EDITOR_DIRECTORY_ROOTS
+  delete env.DIRECTORY_ROOTS
+  if (directoryRoots !== undefined) env.EDITOR_DIRECTORY_ROOTS = directoryRoots
+  if (homeDirectory) env.HOME = homeDirectory
   delete env.EDITOR_RECOVERY_ROOT
   delete env.STANDALONE_EDITOR_RECOVERY_ROOT
   if (defaultWorkspace) env.EDITOR_DEFAULT_WORKSPACE = defaultWorkspace
@@ -94,6 +112,108 @@ test('first launch creates and persists the default workspace only when config i
   assert.deepEqual(JSON.parse(await fs.readFile(configFile, 'utf8')), { workspace: info.workspace })
   assert.ok((await fs.stat(defaultWorkspace)).isDirectory())
   await assert.rejects(fs.stat(recoveryRoot), error => error.code === 'ENOENT')
+})
+
+test('Linux default picker reaches arbitrary accessible paths and reports recovery overlap on filesystem root', async t => {
+  if (process.platform !== 'linux') return t.skip('Linux-only default picker policy')
+  const root = await temporaryLinuxDirectoryOutsideDefaultRoots(t, 'standalone-editor-picker-default-')
+  const configFile = path.join(root, 'config', 'workspace.json')
+  const recoveryRoot = await temporaryDirectory(t, 'standalone-editor-picker-default-recovery-')
+  const defaultWorkspace = path.join(root, 'startup-default')
+  const homeDirectory = path.join(root, 'home')
+  const workspace = path.join(root, 'notes')
+  await fs.mkdir(homeDirectory)
+  await fs.mkdir(workspace)
+  const baseUrl = await startBackend(t, {
+    configFile,
+    recoveryRoot,
+    defaultWorkspace,
+    homeDirectory,
+    allowAnyWorkspace: false,
+  })
+
+  const filesystemRoot = await fetch(`${baseUrl}/api/dirs?path=%2F`)
+  assert.equal(filesystemRoot.status, 200)
+  const rootListing = await filesystemRoot.json()
+  const realHomeDirectory = await fs.realpath(homeDirectory)
+  assert.deepEqual(rootListing.rootPaths, ['/'])
+  assert.equal(rootListing.canSelect, false)
+  assert.equal(rootListing.roots[0].canSelect, false)
+  assert.ok(rootListing.locations.some(location => location.path === '/'))
+  assert.ok(rootListing.locations.some(location => location.path === realHomeDirectory))
+
+  const arbitraryDirectory = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(root)}`)
+  assert.equal(arbitraryDirectory.status, 200)
+  const arbitraryInfo = await arbitraryDirectory.json()
+  assert.equal(arbitraryInfo.path, root)
+  assert.equal(arbitraryInfo.canSelect, true)
+
+  const rootSelection = await postWorkspace(baseUrl, '/')
+  assert.equal(rootSelection.status, 400)
+  assert.equal((await rootSelection.json()).code, 'RECOVERY_ROOT_INSIDE_WORKSPACE')
+
+  const selected = await postWorkspace(baseUrl, workspace)
+  assert.equal(selected.status, 200)
+  assert.equal((await selected.json()).workspace, workspace)
+})
+
+test('an explicitly allowed POSIX filesystem root is nonselectable when it contains recovery data', async t => {
+  if (process.platform === 'win32') return t.skip('POSIX directory picker policy')
+  const root = await temporaryDirectory(t, 'standalone-editor-picker-root-overlap-')
+  const configFile = path.join(root, 'config', 'workspace.json')
+  const recoveryRoot = path.join(root, 'recovery')
+  const defaultWorkspace = path.join(root, 'startup-default')
+  const baseUrl = await startBackend(t, {
+    configFile,
+    recoveryRoot,
+    defaultWorkspace,
+    allowAnyWorkspace: false,
+    directoryRoots: path.parse(root).root,
+  })
+
+  const listing = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(path.parse(root).root)}`)
+  assert.equal(listing.status, 200)
+  const body = await listing.json()
+  assert.equal(body.roots[0].path, path.parse(root).root)
+  assert.equal(body.roots[0].canSelect, false)
+  assert.equal(body.canSelect, false)
+
+  const selection = await postWorkspace(baseUrl, path.parse(root).root)
+  assert.equal(selection.status, 400)
+  assert.equal((await selection.json()).code, 'RECOVERY_ROOT_INSIDE_WORKSPACE')
+})
+
+test('explicit Linux directory roots still restrict picker browsing and workspace selection', async t => {
+  if (process.platform !== 'linux') return t.skip('Linux-only directory picker policy')
+  const allowedContainer = await temporaryDirectory(t, 'standalone-editor-picker-allowed-')
+  const allowedRoot = path.join(allowedContainer, 'allowed')
+  const allowedWorkspace = path.join(allowedRoot, 'notes')
+  await fs.mkdir(allowedWorkspace, { recursive: true })
+  const outsideRoot = await temporaryLinuxDirectoryOutsideDefaultRoots(t, 'standalone-editor-picker-outside-')
+  const outsideWorkspace = path.join(outsideRoot, 'notes')
+  await fs.mkdir(outsideWorkspace)
+  const configFile = path.join(allowedContainer, 'config', 'workspace.json')
+  const recoveryRoot = path.join(allowedContainer, 'recovery')
+  const defaultWorkspace = path.join(allowedContainer, 'startup-default')
+  const baseUrl = await startBackend(t, {
+    configFile,
+    recoveryRoot,
+    defaultWorkspace,
+    allowAnyWorkspace: false,
+    directoryRoots: allowedRoot,
+  })
+
+  const allowed = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(allowedWorkspace)}`)
+  assert.equal(allowed.status, 200)
+  assert.equal((await allowed.json()).canSelect, true)
+
+  const outsideBrowse = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(outsideWorkspace)}`)
+  assert.equal(outsideBrowse.status, 400)
+  assert.equal((await outsideBrowse.json()).code, 'INVALID_DIRECTORY')
+
+  const outsideSelection = await postWorkspace(baseUrl, outsideWorkspace)
+  assert.equal(outsideSelection.status, 400)
+  assert.equal((await outsideSelection.json()).code, 'INVALID_DIRECTORY')
 })
 
 test('explicit CLI workspace can create a new directory after recovery preflight', async t => {

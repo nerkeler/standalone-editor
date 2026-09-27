@@ -132,4 +132,70 @@ test('workspace media route serves nested images safely and preserves the legacy
   const uploadedImage = await fetch(`${baseUrl}/api/workspace/media/assets/%E6%96%B0%E5%9B%BE%E7%89%87.png?workspaceId=${check.workspaceId}&workspaceVersion=${check.workspaceVersion}`)
   assert.equal(uploadedImage.status, 200)
   assert.deepEqual(Buffer.from(await uploadedImage.arrayBuffer()), imageBytes)
+
+  await fs.writeFile(path.join(workspace, '资料', 'note.md'), '# note\n')
+  const adjacentForm = () => {
+    const form = new FormData()
+    form.append('file', new Blob([imageBytes]), 'adjacent.png')
+    form.append('documentPath', '资料/note.md')
+    return form
+  }
+  const adjacent = await fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: adjacentForm() })
+  assert.equal(adjacent.status, 200)
+  assert.equal((await adjacent.json()).path, '资料/assets/adjacent.png')
+  assert.deepEqual(await fs.readFile(path.join(workspace, '资料', 'assets', 'adjacent.png')), imageBytes)
+  const duplicate = await fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: adjacentForm() })
+  assert.equal(duplicate.status, 409)
+  const missingForm = new FormData()
+  missingForm.append('file', new Blob([imageBytes]), 'missing.png')
+  missingForm.append('documentPath', '资料/missing.md')
+  const missing = await fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: missingForm })
+  assert.notEqual(missing.status, 200)
+  if (process.platform !== 'win32') {
+    await fs.mkdir(path.join(workspace, 'linked'))
+    await fs.writeFile(path.join(workspace, 'linked', 'note.md'), '# linked\n')
+    const outside = await temporaryDirectory(t, 'standalone-editor-outside-assets-')
+    await fs.symlink(outside, path.join(workspace, 'linked', 'assets'))
+    const unsafeForm = new FormData()
+    unsafeForm.append('file', new Blob([imageBytes]), 'escaped.png')
+    unsafeForm.append('documentPath', 'linked/note.md')
+    const unsafe = await fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: unsafeForm })
+    assert.notEqual(unsafe.status, 200)
+    assert.equal(await fs.access(path.join(outside, 'escaped.png')).then(() => true, () => false), false)
+  }
+})
+
+test('same-level asset upload returns the normalized permission error for a read-only directory', async t => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    return t.skip('requires POSIX permission checks under a non-root backend account')
+  }
+  const workspace = await temporaryDirectory(t, 'standalone-editor-media-readonly-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-media-readonly-recovery-')
+  const documentDirectory = path.join(workspace, 'locked')
+  await fs.mkdir(documentDirectory)
+  await fs.writeFile(path.join(documentDirectory, 'note.md'), '# note\n')
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const check = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'X-Workspace-Id': check.workspaceId,
+    'X-Workspace-Version': String(check.workspaceVersion),
+  }
+
+  await fs.chmod(documentDirectory, 0o555)
+  try {
+    const form = new FormData()
+    form.append('file', new Blob([Buffer.from('image bytes')]), 'asset.png')
+    form.append('documentPath', 'locked/note.md')
+    const response = await fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: form })
+
+    assert.equal(response.status, 403)
+    const body = await response.json()
+    assert.equal(body.code, 'PERMISSION_DENIED')
+    assert.equal(body.error, '无权限访问或修改该路径')
+    assert.equal(await fs.access(path.join(documentDirectory, 'assets')).then(() => true, () => false), false)
+  } finally {
+    // Restore write permission before temporaryDirectory's recursive cleanup,
+    // even when the API assertion fails.
+    await fs.chmod(documentDirectory, 0o755).catch(() => {})
+  }
 })

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { MAX_EDITABLE_MARKDOWN_BYTES, utf8ByteLength } from '../markdownSize'
+import { requestErrorMessage } from '../requestErrorMessage'
 
 const API = '/api/workspace'
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif']
@@ -660,7 +661,10 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
           cleanContentsRef.current[path] = content
           dirtyRef.current[path] = false
           delete restoredDraftsRef.current[path]
-          clearPendingDraft(path, content)
+          // An older throttled snapshot may still be in localStorage even
+          // though this exact current draft has reached disk. With no newer
+          // in-memory draft, every pending snapshot for this path is stale.
+          clearPendingDraft(path)
           const nextErrors = { ...saveErrorsRef.current }
           delete nextErrors[path]
           saveErrorsRef.current = nextErrors
@@ -693,7 +697,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
           if (activeFileRef.current === path) setSaveStatus('conflict')
           throw error
         }
-        const nextErrors = { ...saveErrorsRef.current, [path]: error?.message || '保存失败' }
+        const nextErrors = { ...saveErrorsRef.current, [path]: requestErrorMessage(error, '保存失败') }
         saveErrorsRef.current = nextErrors
         setSaveErrors(nextErrors)
         if (activeFileRef.current === path) setSaveStatus('error')

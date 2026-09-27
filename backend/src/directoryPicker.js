@@ -31,16 +31,10 @@ export function defaultRootCandidates({
     for (let code = 65; code <= 90; code += 1) values.push(`${String.fromCharCode(code)}:\\`)
     return [...new Set(values)]
   }
-  if (platform === 'darwin') {
-    return [...new Set([home, '/Users', '/Volumes', '/tmp'])]
-  }
-  return [...new Set([
-    home,
-    '/mnt',
-    '/media',
-    pathModule.join('/run/media', pathModule.basename(home)),
-    '/tmp',
-  ].filter(Boolean))]
+  // POSIX users can mount data anywhere (for example /srv, /data, /Volumes,
+  // or a custom mount point). Use `/` as the browsing boundary; the API
+  // filters each directory by the backend process's read/execute access.
+  return ['/']
 }
 
 export function normalizePickerPath(value, platform = process.platform) {
@@ -74,6 +68,14 @@ export function isDirectoryNavigable(target, roots, {
 
 export function isDirectorySelectable(target, roots, platform = process.platform) {
   return roots.some(root => isWithinPath(root, target, platform))
+}
+
+export function isDirectoryPickerSelectionAllowed(target, roots, {
+  platform = process.platform,
+} = {}) {
+  // Selection policy is based on the configured/default roots. Platform
+  // permissions and data-boundary checks are applied by the API layer.
+  return isDirectorySelectable(target, roots, platform)
 }
 
 export function parentPath(value, platform = process.platform) {

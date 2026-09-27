@@ -50,6 +50,12 @@ function makeError(message, code = 'INVALID_PATH') {
   return error
 }
 
+function makeCausedError(message, code, cause) {
+  const error = makeError(message, code)
+  error.details = { causeCode: cause?.code }
+  return error
+}
+
 function conflict(message = '目标已存在') {
   return makeError(message, 'CONFLICT')
 }
@@ -665,7 +671,7 @@ async function historyBucketIsSafe(recovery, bucket) {
       stat = await fs.lstat(current)
     } catch (error) {
       if (error.code === 'ENOENT') return false
-      throw makeError(`恢复历史目录不可用：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+      throw makeCausedError(`恢复历史目录不可用：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
     }
     if (stat.isSymbolicLink() || !stat.isDirectory()) {
       throw makeError('恢复历史目录不可用：路径包含非目录或符号链接', 'RECOVERY_STORAGE_ERROR')
@@ -696,7 +702,7 @@ async function ensurePrivateDirectory(dir) {
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('不是普通目录')
     await fs.chmod(dir, 0o700)
   } catch (error) {
-    throw makeError(`恢复历史目录不可用：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    throw makeCausedError(`恢复历史目录不可用：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
 }
 
@@ -732,7 +738,7 @@ async function storeHistory(workspace, base, target, bytes, { root } = {}) {
     await fs.unlink(temporary)
   } catch (error) {
     try { await fs.unlink(temporary) } catch {}
-    throw makeError(`无法保存文件恢复历史：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    throw makeCausedError(`无法保存文件恢复历史：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
 
   const entries = []
@@ -844,7 +850,7 @@ async function writeHistoryOwner(bucket, ownerPath) {
     await fs.rename(temporary, markerPath)
   } catch (error) {
     try { await fs.unlink(temporary) } catch {}
-    throw makeError(`无法更新恢复历史归属：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    throw makeCausedError(`无法更新恢复历史归属：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
 }
 
@@ -870,7 +876,7 @@ async function writeOrphanManifest(bucket, manifest) {
     await fs.rename(temporary, destination)
   } catch (error) {
     await fs.unlink(temporary).catch(() => {})
-    throw makeError(`无法标记孤儿历史：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    throw makeCausedError(`无法标记孤儿历史：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
 }
 
@@ -994,7 +1000,7 @@ async function archiveHistoryAtPath(base, target, options = {}) {
       failure.cause = error
       throw failure
     }
-    throw makeError(`无法归档旧路径历史：${error.message}`, 'RECOVERY_STORAGE_ERROR')
+    throw makeCausedError(`无法归档旧路径历史：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
   return moved.map(item => ({ id: item.manifest.id, path: item.manifest.path }))
 }
@@ -1366,6 +1372,10 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
   if (existing && existing.bytes.equals(bytes)) {
     return { success: true, path: relativePath(base, target), revision: contentRevision(existing.bytes) }
   }
+  // This service atomically replaces files via rename, which can succeed for
+  // a read-only file when the parent directory is writable. Preserve the
+  // current account's file-level write permission semantics explicitly.
+  if (existing) await fs.access(target, fsConstants.W_OK)
   if (!existing) await archiveHistoryAtPath(base, target, { root: options.root, reason: 'path-reused' })
   const name = path.basename(target)
   const relative = relativePath(base, target)
@@ -1395,6 +1405,9 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
         throw error
       }
       if (contentRevision(latest) !== expectedRevision) throw fileConflict(reqPath, expectedRevision, latest)
+      // Recheck after the optimistic revision read so a mode change during
+      // history capture cannot turn atomic rename into a permission bypass.
+      await fs.access(target, fsConstants.W_OK)
       await fs.rename(temporary, target)
     } else {
       // The null revision means create-if-absent. link is an atomic exclusive
@@ -1539,6 +1552,23 @@ export async function restoreFileHistory(workspace, reqPath, historyId, expected
 }
 
 // 上传文件，永远不覆盖已有目标。
+export async function ensureAdjacentAssetsDirectory(workspace, documentPath) {
+  if (!isMarkdownPath(documentPath)) throw makeError('只能为 Markdown 文档上传同级图片')
+  const { base, full: document } = await existingPath(workspace, documentPath)
+  const documentStat = await fs.lstat(document)
+  if (!documentStat.isFile()) throw makeError('目标文档不是普通文件')
+  const assets = path.join(path.dirname(document), 'assets')
+  assertInside(base, assets)
+  try {
+    await fs.mkdir(assets)
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+  }
+  const assetsStat = await fs.lstat(assets)
+  if (!assetsStat.isDirectory() || assetsStat.isSymbolicLink()) throw makeError('同级 assets 不是安全目录')
+  return relativePath(base, assets)
+}
+
 export async function uploadFile(workspace, reqPath, file, options = {}) {
   if (!file?.originalname) throw makeError('缺少文件')
   const cleanName = assertName(path.basename(file.originalname))

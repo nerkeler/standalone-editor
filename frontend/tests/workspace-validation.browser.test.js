@@ -32,6 +32,8 @@ const state = {
   editorRequests: 0,
   editorRequestDetails: [],
   dirRequests: 0,
+  dirPaths: [],
+  directoryLocationMode: false,
   setRequests: 0,
   requestOrder: [],
 }
@@ -152,6 +154,32 @@ function createFakeBackend() {
     }
     if (url.pathname === '/api/dirs' && request.method === 'GET') {
       state.dirRequests += 1
+      const requestedPath = url.searchParams.get('path') || ''
+      state.dirPaths.push(requestedPath)
+      if (state.directoryLocationMode) {
+        const inHome = requestedPath === '/home/alice'
+        return sendJson(response, 200, {
+          path: inHome ? '/home/alice' : '/',
+          canSelect: false,
+          canGoUp: inHome,
+          parent: inHome ? '/' : null,
+          separator: '/',
+          roots: [{ path: '/', name: '/', canNavigate: true, canSelect: false }],
+          locations: [
+            { path: '/', name: '/', canNavigate: true, canSelect: false },
+            { path: '/home/alice', name: 'alice', canNavigate: true, canSelect: true },
+          ],
+          breadcrumb: inHome
+            ? [
+              { name: '/', path: '/', canNavigate: true, canSelect: false },
+              { name: 'alice', path: '/home/alice', canNavigate: true, canSelect: true },
+            ]
+            : [{ name: '/', path: '/', canNavigate: true, canSelect: false }],
+          entries: inHome
+            ? [{ type: 'dir', name: 'Projects', path: '/home/alice/Projects', canNavigate: true, canSelect: true }]
+            : [],
+        })
+      }
       if (url.searchParams.get('path') === selectedWorkspace) {
         return sendJson(response, 200, {
           path: selectedWorkspace,
@@ -343,7 +371,7 @@ before(async () => {
   tempRoot = await mkdtemp(path.join(os.tmpdir(), 'standalone-editor-workspace-check-'))
   frontendPort = await freePort()
   backendPort = await freePort()
-  Object.assign(state, { phase: 'setup', checkMode: 'unavailable', checkCount: 0, editorRequests: 0, editorRequestDetails: [], dirRequests: 0, setRequests: 0, requestOrder: [] })
+  Object.assign(state, { phase: 'setup', checkMode: 'unavailable', checkCount: 0, editorRequests: 0, editorRequestDetails: [], dirRequests: 0, dirPaths: [], directoryLocationMode: false, setRequests: 0, requestOrder: [] })
 
   backendServer = createFakeBackend()
   await new Promise((resolve, reject) => {
@@ -437,6 +465,8 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   state.checkCount = 0
   state.editorRequests = 0
   state.dirRequests = 0
+  state.dirPaths = []
+  state.directoryLocationMode = false
   state.setRequests = 0
   state.requestOrder = []
   state.phase = 'invalid-config'
@@ -452,6 +482,11 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   await clickButton('选择工作目录')
   await waitUntil('directory roots request despite missing active workspace', () => state.dirRequests > 0)
   await waitUntil('directory entry in picker', () => connection.evaluate(`document.body.innerText.includes('Notes')`))
+  assert.equal(
+    await connection.evaluate(`Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === '/tmp')`),
+    true,
+    'a roots-only response must continue to expose its navigation root',
+  )
   await connection.evaluate(`(() => {
     const entry = Array.from(document.querySelectorAll('.ant-modal-body span')).find(item => item.innerText.trim() === 'Notes');
     entry?.click();
@@ -469,4 +504,46 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   state.checkMode = 'available'
   await clickButton('重试')
   await waitUntil('valid backend check to enter the editor', () => currentPageEditorRequests().length > 0)
+})
+
+test('directory picker shows and follows Linux locations alongside roots', async () => {
+  state.phase = 'closing-previous-page-for-locations'
+  await closeBrowserTarget()
+  await waitForEditorRequestsToSettle()
+  state.checkMode = 'invalid'
+  state.checkCount = 0
+  state.editorRequests = 0
+  state.dirRequests = 0
+  state.dirPaths = []
+  state.directoryLocationMode = true
+  state.setRequests = 0
+  state.requestOrder = []
+  state.phase = 'directory-locations'
+  await openBrowserTarget()
+  await navigateWithLocalStorage()
+
+  await clickButton('选择工作目录')
+  await waitUntil('directory roots and locations to load', () => state.dirRequests > 0 && connection.evaluate(
+    `Boolean(document.querySelector('button[aria-label="/home/alice"]'))`,
+  ))
+  assert.deepEqual(state.dirPaths, [''], 'the picker should start from the fake filesystem root')
+  assert.equal(
+    await connection.evaluate(`Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === '/home/alice')`),
+    true,
+    'the home shortcut from locations must be shown even though roots only contains /',
+  )
+
+  const clicked = await connection.evaluate(`(() => {
+    const button = document.querySelector('button[aria-label="/home/alice"]');
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(clicked, true)
+  await waitUntil('home shortcut navigation request and listing', () =>
+    state.dirPaths.includes('/home/alice') && connection.evaluate(
+      `document.querySelector('.ant-modal-body')?.innerText.includes('Projects')`,
+    ),
+  )
+  assert.equal(state.dirPaths.at(-1), '/home/alice')
+  await clickButton('取消')
 })

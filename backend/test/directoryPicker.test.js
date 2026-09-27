@@ -5,6 +5,7 @@ import {
   configuredRootValues,
   defaultRootCandidates,
   isDirectoryNavigable,
+  isDirectoryPickerSelectionAllowed,
   isDirectorySelectable,
   isWithinPath,
   parentPath,
@@ -41,10 +42,10 @@ test('configured roots use the host delimiter and ancestors are browseable only'
 
 test('default candidates expose platform-specific user and mount locations', () => {
   const mac = defaultRootCandidates({ platform: 'darwin', home: '/Users/alice' })
-  assert.deepEqual(mac.slice(0, 4), ['/Users/alice', '/Users', '/Volumes', '/tmp'])
+  assert.deepEqual(mac, ['/'])
 
   const linux = defaultRootCandidates({ platform: 'linux', home: '/home/alice' })
-  assert.deepEqual(linux.slice(0, 4), ['/home/alice', '/mnt', '/media', '/run/media/alice'])
+  assert.deepEqual(linux, ['/'])
 
   const windows = defaultRootCandidates({
     platform: 'win32',
@@ -53,4 +54,34 @@ test('default candidates expose platform-specific user and mount locations', () 
   })
   assert.deepEqual(windows.slice(0, 3), ['C:\\Users\\alice', 'C:\\Users', 'C:\\'])
   assert.ok(windows.includes('Z:\\'))
+})
+
+test('default POSIX root allows any descendant and explicit roots remain the only path policy', () => {
+  const roots = defaultRootCandidates({ platform: 'linux', home: '/home/alice' })
+  assert.deepEqual(roots, ['/'])
+  assert.equal(isDirectoryNavigable('/', roots, { platform: 'linux' }), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/', roots, {
+    platform: 'linux',
+  }), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/srv/notes', roots, {
+    platform: 'linux',
+  }), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/data/notes', roots, {
+    platform: 'linux',
+  }), true)
+  assert.deepEqual(defaultRootCandidates({ platform: 'darwin', home: '/Users/alice' }), ['/'])
+
+  const restricted = ['/srv/notes']
+  assert.equal(isDirectoryPickerSelectionAllowed('/srv/notes', restricted, { platform: 'linux' }), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/data/notes', restricted, { platform: 'linux' }), false)
+})
+
+test('explicit Linux roots stay narrow and preserve explicitly allowed filesystem roots', () => {
+  const roots = ['/srv/notes']
+  const configured = { platform: 'linux', hasConfiguredRoots: true }
+  assert.equal(isDirectoryPickerSelectionAllowed('/srv/notes', roots, configured), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/srv/notes/drafts', roots, configured), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/data/notes', roots, configured), false)
+  assert.equal(isDirectoryNavigable('/', roots, { platform: 'linux' }), true)
+  assert.equal(isDirectoryPickerSelectionAllowed('/', ['/'], configured), true)
 })

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -182,7 +182,7 @@ async function openFile(fileName, expectedText = 'Markdown fidelity fixture') {
     return Boolean(node);
   })()`)
   await waitUntil(`${fileName} content`, () => connection.evaluate(
-    `document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value.includes(${JSON.stringify(expectedText)}) || document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(expectedText)})`,
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(expectedText)}) || document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(expectedText)})`,
   ))
 }
 
@@ -268,10 +268,15 @@ test('complex Markdown opens in source mode and rich conversion requires explici
   await setupPage()
   await openFile(fileName)
   await waitUntil('complex Markdown source guard', () => connection.evaluate(
-    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]') && document.body.innerText.includes('源码模式'))`,
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.body.innerText.includes('源码保护'))`,
   ))
-  assert.equal(await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`), fixture)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), fixture)
   assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false, 'protected Markdown should not initialize the rich editor')
+  await waitUntil('specific wavy source diagnostics', () => connection.evaluate(`document.querySelectorAll('.cm-protected-range').length >= 5`))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-fidelity-warning')?.innerText.includes('处内容需要源码保护')`), true)
+  const protectedBox = await connection.evaluate(`(() => { const box = document.querySelector('.cm-protected-range')?.getBoundingClientRect(); return box && { x: box.x + 4, y: box.y + box.height / 2 } })()`)
+  await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: protectedBox.x, y: protectedBox.y })
+  await waitUntil('hover explains protected syntax', () => connection.evaluate(`Boolean(document.querySelector('.cm-tooltip-lint')?.innerText.includes('YAML'))`), 3000)
 
   await connection.evaluate(`document.querySelector('[aria-label="保存当前文件"]')?.click()`)
   await waitUntil('protected Markdown save action to settle', () => connection.evaluate(
@@ -285,9 +290,24 @@ test('complex Markdown opens in source mode and rich conversion requires explici
   ))
   await connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal button')).find(button => button.innerText.trim() === '继续源码模式')?.click()`)
   await waitUntil('source mode remains active after dismissing warning', () => connection.evaluate(
-    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]')) && !document.querySelector('.ProseMirror')`,
+    `Boolean(document.querySelector('.source-editor .cm-content')) && !document.querySelector('.ProseMirror')`,
   ))
-  assert.equal(await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`), fixture)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), fixture)
+})
+
+test('verified simple reference link is CAS-normalized only on its first clean open', async () => {
+  const fileName = 'safe-normalize.md'
+  await writeFile(path.join(workspace, fileName), '[guide][docs]\n\n[docs]: https://example.com\n')
+  await setupPage()
+  await openFile(fileName, 'guide')
+  await waitForDiskMarker(fileName, '[guide](https://example.com)')
+  const first = await stat(path.join(workspace, fileName))
+  await setupPage()
+  await openFile(fileName, 'guide')
+  await new Promise(resolve => setTimeout(resolve, 250))
+  const second = await stat(path.join(workspace, fileName))
+  assert.equal(second.mtimeMs, first.mtimeMs)
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), '[guide](https://example.com)\n')
 })
 
 test('tab-indented unordered and nested ordered tasks are protected in source mode', async () => {
@@ -297,9 +317,9 @@ test('tab-indented unordered and nested ordered tasks are protected in source mo
   await setupPage()
   await openFile(fileName, '- Parent')
   await waitUntil('nested task source protection', () => connection.evaluate(
-    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`,
+    `Boolean(document.querySelector('.source-editor .cm-content'))`,
   ))
-  assert.equal(await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`), nestedTasks)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), nestedTasks)
   assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false)
 })
 
@@ -308,21 +328,25 @@ test('source-mode edits preserve the original Markdown bytes around the edit', a
   await writeFile(path.join(workspace, fileName), fixture)
   await setupPage()
   await openFile(fileName)
-  await waitUntil('Markdown source textarea', () => connection.evaluate(`Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`))
+  await waitUntil('Markdown source textarea', () => connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
 
-  const sourceBefore = await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`)
+  const sourceBefore = await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`)
   assert.equal(sourceBefore, fixture, 'opening source mode should show the exact loaded Markdown')
   const marker = '\n\n<!-- SOURCE_EDIT_SENTINEL -->'
   await connection.evaluate(`(() => {
-    const source = document.querySelector('textarea[aria-label="Markdown 源文本"]');
-    source?.focus();
-    source?.setSelectionRange(source.value.length, source.value.length);
+    const source = document.querySelector('.source-editor .cm-content');
+    const view = source?.cmTile?.root?.view;
+    view?.dispatch({ selection: { anchor: view.state.doc.length } });
+    view?.focus();
     return Boolean(source);
   })()`)
   await connection.send('Input.insertText', { text: marker })
   await clickSave()
   const saved = await waitForDiskMarker(fileName, 'SOURCE_EDIT_SENTINEL')
-  assert.equal(saved, `${fixture}${marker}`)
+  // Chrome's Input.insertText collapses one leading newline at the final
+  // CodeMirror line. The loaded prefix must still remain byte-for-byte exact.
+  assert.equal(saved.slice(0, fixture.length), fixture)
+  assert.equal(saved.slice(fixture.length), '\n<!-- SOURCE_EDIT_SENTINEL -->')
 })
 
 test('nested Markdown images render through workspace media and stay relative through editing and upload', async () => {
@@ -388,9 +412,9 @@ test('nested Markdown images render through workspace media and stay relative th
 
   await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
   await waitUntil('nested source editor', () => connection.evaluate(
-    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`,
+    `Boolean(document.querySelector('.source-editor .cm-content'))`,
   ))
-  assert.equal(await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`), original)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), original)
   await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
   await waitUntil('nested rich editor after source round trip', () => connection.evaluate(
     `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="../../images/%E5%B0%81%20%E9%9D%A2.png"]'))`,
@@ -401,13 +425,12 @@ test('nested Markdown images render through workspace media and stay relative th
   await waitUntil('rich editor change to become dirty', () => connection.evaluate(
     `document.querySelector('.save-status')?.innerText.includes('修改待保存')`,
   ))
-  await connection.evaluate(`document.querySelector('.ProseMirror img[data-markdown-src="../../images/%E5%B0%81%20%E9%9D%A2.png"]')?.setAttribute('data-zoom', '175')`)
   await clickSave()
   try {
     await waitForDiskMarker(fileName, editMarker)
   } catch (error) {
     const editorState = await connection.evaluate(`JSON.stringify({
-      source: document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value || null,
+      source: document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() || null,
       editorText: document.querySelector('.ProseMirror')?.innerText || null,
       saveStatus: document.querySelector('.save-status')?.innerText || null,
       saveButtonDisabled: document.querySelector('[aria-label="保存当前文件"]')?.disabled ?? null,
@@ -417,7 +440,7 @@ test('nested Markdown images render through workspace media and stay relative th
     throw new Error(`${error.message}\nEditor state: ${editorState}\nDisk state: ${diskState}`)
   }
   let saved = await readFile(path.join(workspace, fileName), 'utf8')
-  assert.match(saved, /!\[封面\]\(\.\.\/\.\.\/images\/%E5%B0%81%20%E9%9D%A2\.png "封面标题"\)<!-- zoom:175 -->/)
+  assert.match(saved, /!\[封面\]\(\.\.\/\.\.\/images\/%E5%B0%81%20%E9%9D%A2\.png "封面标题"\)/)
   assert.match(saved, /!\[旧资源\]\(\.\.\/\.\.\/assets\/legacy\.png "旧标题"\)/)
   assert.match(saved, /!\[外链\]\(https:\/\/example\.com\/external\.png\)/)
   assert.match(saved, /!\[内嵌\]\(data:image\/png;base64,iVBORw0KGgo=\)/)
@@ -425,6 +448,13 @@ test('nested Markdown images render through workspace media and stay relative th
   assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
 
   const uploadName = '新图片.png'
+  const pickerTriggered = await connection.evaluate(`(() => {
+    const input = document.querySelector('#img-up');
+    input?.addEventListener('click', event => { event.preventDefault(); window.__imagePickerClicked = true }, { once: true });
+    document.querySelector('.editor-toolbar [aria-label="上传图片"]')?.click();
+    return Boolean(window.__imagePickerClicked);
+  })()`)
+  assert.equal(pickerTriggered, true, 'desktop image button must open the shared file input')
   await connection.evaluate(`(() => {
     const input = document.querySelector('#img-up');
     if (!input) return false;
@@ -435,7 +465,7 @@ test('nested Markdown images render through workspace media and stay relative th
     return true;
   })()`)
   const imageInserted = await waitUntil('uploaded image inserted with a relative Markdown path', () => connection.evaluate(
-    `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png"]'))`,
+    `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="assets/%E6%96%B0%E5%9B%BE%E7%89%87.png"]'))`,
   ), 3000).catch(() => false)
   if (!imageInserted) {
     const uploadState = await connection.evaluate(`JSON.stringify({
@@ -443,23 +473,179 @@ test('nested Markdown images render through workspace media and stay relative th
       toast: document.querySelector('.ant-message')?.innerText || '',
       images: Array.from(document.querySelectorAll('.ProseMirror img')).map(img => img.getAttribute('data-markdown-src')),
     })`)
-    const uploadedFiles = await readdir(path.join(workspace, 'assets')).catch(() => [])
+    const uploadedFiles = await readdir(path.join(workspace, 'docs', 'topic', 'assets')).catch(() => [])
     throw new Error(`Uploaded image was not inserted. UI: ${uploadState}; assets: ${uploadedFiles.join(', ')}`)
   }
   await waitUntil('uploaded image saved into the nested Markdown document', async () => {
     const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
-    return content.includes('../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png') ? content : null
+    return content.includes('assets/%E6%96%B0%E5%9B%BE%E7%89%87.png') ? content : null
   })
   saved = await readFile(path.join(workspace, fileName), 'utf8')
-  assert.match(saved, /!\[[^\]]*\]\(\.\.\/\.\.\/assets\/%E6%96%B0%E5%9B%BE%E7%89%87\.png\)/)
-  assert.deepEqual(await readFile(path.join(workspace, 'assets', uploadName)), imageBytes)
+  assert.match(saved, /!\[[^\]]*\]\(assets\/%E6%96%B0%E5%9B%BE%E7%89%87\.png\)/)
+  assert.deepEqual(await readFile(path.join(workspace, 'docs', 'topic', 'assets', uploadName)), imageBytes)
   assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
 
   await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
   await waitUntil('saved relative image Markdown in source mode', () => connection.evaluate(
-    `document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value.includes(${JSON.stringify('../../assets/%E6%96%B0%E5%9B%BE%E7%89%87.png')})`,
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify('assets/%E6%96%B0%E5%9B%BE%E7%89%87.png')})`,
   ))
-  const source = await connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value`)
+  const source = await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`)
   assert.match(source, /\.\.\/\.\.\/images\/%E5%B0%81%20%E9%9D%A2\.png "封面标题"/)
   assert.match(source, /\.\.\/\.\.\/assets\/legacy\.png "旧标题"/)
+})
+
+test('image width and alignment round-trip as adjacent portable metadata', async () => {
+  const fileName = 'image-presentation.md'
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  await mkdir(path.join(workspace, 'assets'), { recursive: true })
+  await writeFile(path.join(workspace, 'assets', 'presentation.png'), bytes)
+  await writeFile(path.join(workspace, fileName), '# Image presentation fixture\n\n![diagram](assets/presentation.png)<!-- se-image:width=50;align=center -->\n')
+  await setupPage()
+  await openFile(fileName, 'Image presentation fixture')
+  await waitUntil('image presentation node', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
+  const initial = await connection.evaluate(`(() => { const img = document.querySelector('.ProseMirror img'); return img && { width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align'), style: img.getAttribute('style') } })()`)
+  assert.equal(initial.width, '50')
+  assert.equal(initial.align, 'center')
+  assert.match(initial.style, /width:\s*50%/)
+  assert.match(initial.style, /margin-left:\s*auto/)
+  await connection.evaluate(`document.querySelector('.ProseMirror img')?.click()`)
+  await waitUntil('image settings toolbar', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="图片宽度 75%"]'))`))
+  const handle = await waitUntil('image corner resize handle', () => connection.evaluate(`(() => { const box = document.querySelector('.image-resize-handle')?.getBoundingClientRect(); return box && { x: box.x + box.width / 2, y: box.y + box.height / 2 } })()`))
+  await connection.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: handle.x, y: handle.y, button: 'left', clickCount: 1 })
+  await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: handle.x + 40, y: handle.y, button: 'left', buttons: 1 })
+  await connection.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: handle.x + 40, y: handle.y, button: 'left', clickCount: 1 })
+  await waitUntil('drag changes image width', () => connection.evaluate(`Number(document.querySelector('.ProseMirror img')?.getAttribute('data-image-width')) > 50`))
+  await connection.evaluate(`document.querySelector('[aria-label="图片宽度 75%"]')?.click()`)
+  await waitUntil('preset overrides drag width', () => connection.evaluate(`document.querySelector('.ProseMirror img')?.getAttribute('data-image-width') === '75'`))
+  await clickSave()
+  await waitForDiskMarker(fileName, '<!-- se-image:width=75;align=center -->')
+  await waitUntil('image save acknowledgment', () => connection.evaluate(`document.querySelector('.save-status')?.innerText.includes('已保存')`))
+  const saved = await readFile(path.join(workspace, fileName), 'utf8')
+  assert.match(saved, /!\[diagram\]\(assets\/presentation\.png\)<!-- se-image:width=75;align=center -->/)
+  await setupPage()
+  await openFile(fileName, 'Image presentation fixture')
+  await waitUntil('reopened image node', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
+  const reopened = await connection.evaluate(`(() => { const img = document.querySelector('.ProseMirror img'); return img && { width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align') } })()`)
+  assert.deepEqual(reopened, { width: '75', align: 'center' }, `disk=${JSON.stringify(await readFile(path.join(workspace, fileName), 'utf8'))}`)
+})
+
+test('legacy zoom stays attached to the correct image even when paths repeat', async () => {
+  const fileName = 'legacy-zoom.md'
+  const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  await mkdir(path.join(workspace, 'assets'), { recursive: true })
+  await writeFile(path.join(workspace, 'assets', 'legacy.png'), bytes)
+  await writeFile(path.join(workspace, fileName), '# Legacy zoom fixture\n\n![one](assets/legacy.png "title")<!-- zoom:175 --><!-- se-image:width=100;align=center -->\n\n![two](assets/legacy.png)\n')
+  await setupPage()
+  await openFile(fileName, 'Legacy zoom fixture')
+  await waitUntil('legacy image nodes', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img').length === 2`))
+  const zooms = await connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror img')).map(img => img.getAttribute('data-legacy-zoom'))`)
+  assert.deepEqual(zooms, ['175', null])
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror img')?.getAttribute('data-image-align')`), 'center')
+  await appendToRichEditor(' revised')
+  await clickSave()
+  await waitForDiskMarker(fileName, 'revised')
+  const saved = await readFile(path.join(workspace, fileName), 'utf8')
+  assert.match(saved, /!\[one\]\(assets\/legacy\.png "title"\)<!-- zoom:175 --><!-- se-image:width=100;align=center -->/)
+  assert.match(saved, /!\[two\]\(assets\/legacy\.png\)/)
+  assert.equal((saved.match(/<!-- zoom:175 -->/g) || []).length, 1)
+})
+
+test('table picker chooses dimensions and contextual tools add rows and columns', async () => {
+  const fileName = 'table-controls.md'
+  await writeFile(path.join(workspace, fileName), '# Table controls fixture\n')
+  await setupPage()
+  await openFile(fileName, 'Table controls fixture')
+  await connection.evaluate(`document.querySelector('.editor-toolbar [aria-label="插入表格"]')?.click()`)
+  await waitUntil('table dimensions grid', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="4 行 5 列"]'))`))
+  await connection.evaluate(`document.querySelector('[aria-label="4 行 5 列"]')?.click()`)
+  await waitUntil('4 by 5 table', () => connection.evaluate(`document.querySelectorAll('.ProseMirror table tr').length === 4 && document.querySelectorAll('.ProseMirror table tr:first-child > *').length === 5`))
+  await connection.evaluate(`document.querySelector('.ProseMirror table tr:nth-child(2) td')?.click()`)
+  await waitUntil('table contextual toolbar', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="下方增行"]'))`))
+  await connection.evaluate(`document.querySelector('[aria-label="下方增行"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="右侧增列"]')?.click()`)
+  await waitUntil('expanded table', () => connection.evaluate(`document.querySelectorAll('.ProseMirror table tr').length === 5 && document.querySelectorAll('.ProseMirror table tr:first-child > *').length === 6`))
+  await clickSave()
+  await waitUntil('table Markdown persisted', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8')
+    return content.split('\n').filter(line => line.startsWith('|')).length === 6
+  })
+})
+
+test('mobile image action opens the same file input', async () => {
+  const fileName = 'mobile-image.md'
+  await writeFile(path.join(workspace, fileName), '# Mobile image fixture\n')
+  await setupPage()
+  await openFile(fileName, 'Mobile image fixture')
+  await connection.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true })
+  await waitUntil('mobile format menu', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="更多格式"]'))`))
+  await connection.evaluate(`(() => { document.querySelector('#img-up')?.addEventListener('click', event => { event.preventDefault(); window.__mobileImagePickerClicked = true }, { once: true }); document.querySelector('[aria-label="更多格式"]')?.click() })()`)
+  await waitUntil('mobile upload item', () => connection.evaluate(`Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).some(item => item.innerText.includes('上传图片'))`))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).find(item => item.innerText.includes('上传图片'))?.click()`)
+  assert.equal(await connection.evaluate(`Boolean(window.__mobileImagePickerClicked)`), true)
+})
+
+test('visual review snapshots on isolated workspace', { skip: !process.env.EDITOR_REVIEW_DIR }, async () => {
+  const fileName = 'visual-review.md'
+  await writeFile(path.join(workspace, fileName), '# Quiet writing workspace\n\nA focused paragraph with **emphasis** and a [link](https://example.com).\n\n## Document structure\n\n- First idea\n- Second idea\n\n| Column | Detail |\n| --- | --- |\n| One | Two |\n')
+  await mkdir(process.env.EDITOR_REVIEW_DIR, { recursive: true })
+  await setupPage()
+  await openFile(fileName, 'Quiet writing workspace')
+  for (const [width, height, dark] of [[1440, 900, false], [1195, 751, true], [768, 900, false], [390, 844, true]]) {
+    await connection.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 769 })
+    await connection.evaluate(`(() => {
+      const dark = ${dark};
+      const label = dark ? '切换到深色模式' : '切换到浅色模式';
+      document.querySelector('[aria-label="' + label + '"]')?.click();
+    })()`)
+    await new Promise(resolve => setTimeout(resolve, 200))
+    const screenshot = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+    await writeFile(path.join(process.env.EDITOR_REVIEW_DIR, `${width}-${dark ? 'dark' : 'light'}.png`), Buffer.from(screenshot.data, 'base64'))
+  }
+})
+
+test('interactive visual review of source, table and image controls', { skip: !process.env.EDITOR_REVIEW_INTERACTION_DIR }, async () => {
+  const directory = process.env.EDITOR_REVIEW_INTERACTION_DIR
+  await mkdir(directory, { recursive: true })
+  const screenshot = async name => {
+    await new Promise(resolve => setTimeout(resolve, 180))
+    const frame = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+    await writeFile(path.join(directory, name), Buffer.from(frame.data, 'base64'))
+  }
+
+  await writeFile(path.join(workspace, 'review-source.md'), '---\ntitle: Review\n---\n\nSee [[Home]] and [guide][docs].\n\n[docs]: https://example.com\n')
+  await setupPage()
+  await openFile('review-source.md', 'title: Review')
+  await waitUntil('source annotations', () => connection.evaluate(`document.querySelectorAll('.cm-protected-range').length >= 2`))
+  await connection.evaluate(`document.querySelector('[aria-label="切换到深色模式"]')?.click()`)
+  await screenshot('source-protection-dark.png')
+  await connection.evaluate(`document.querySelector('[aria-label="跳转到下一个受保护位置"]')?.click()`)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`), true)
+
+  await writeFile(path.join(workspace, 'review-table.md'), '# Review table\n')
+  await setupPage()
+  await openFile('review-table.md', 'Review table')
+  await connection.evaluate(`document.querySelector('[aria-label="切换到浅色模式"]')?.click()`)
+  await connection.evaluate(`document.querySelector('.editor-toolbar [aria-label="插入表格"]')?.click()`)
+  await waitUntil('table picker visible', () => connection.evaluate(`Boolean(document.querySelector('.table-insert-panel'))`))
+  await screenshot('table-picker-light.png')
+
+  await mkdir(path.join(workspace, 'assets'), { recursive: true })
+  await writeFile(path.join(workspace, 'assets', 'review.png'), Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64'))
+  await writeFile(path.join(workspace, 'review-image.md'), '# Review image\n\n![diagram](assets/review.png)<!-- se-image:width=75;align=center -->\n')
+  await setupPage()
+  await openFile('review-image.md', 'Review image')
+  await connection.evaluate(`document.querySelector('[aria-label="切换到浅色模式"]')?.click()`)
+  await waitUntil('image visible', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
+  await connection.evaluate(`document.querySelector('.ProseMirror img')?.click()`)
+  await waitUntil('image controls visible', () => connection.evaluate(`Boolean(document.querySelector('.image-context-tools'))`))
+  await screenshot('image-controls-light.png')
+  await connection.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true })
+  const positions = await waitUntil('mobile resize handle aligned with image corner', () => connection.evaluate(`(() => {
+    const image = document.querySelector('.ProseMirror img')?.getBoundingClientRect();
+    const handle = document.querySelector('.image-resize-handle')?.getBoundingClientRect();
+    if (!image || !handle) return null;
+    return Math.abs(image.right - handle.right) < 24 && Math.abs(image.bottom - handle.bottom) < 24;
+  })()`))
+  assert.equal(positions, true)
+  await screenshot('image-controls-mobile.png')
 })

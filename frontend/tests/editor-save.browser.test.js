@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises'
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -229,7 +229,7 @@ async function openFile(fileName, expectedText, connection = cdp) {
     node?.click();
     return Boolean(node);
   })()`)
-  await waitUntil(`${fileName} content`, () => connection.evaluate(`document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value.includes(${JSON.stringify(expectedText)}) || document.querySelector('.ProseMirror[contenteditable="true"]')?.innerText.includes(${JSON.stringify(expectedText)})`))
+  await waitUntil(`${fileName} content`, () => connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(expectedText)}) || document.querySelector('.ProseMirror[contenteditable="true"]')?.innerText.includes(${JSON.stringify(expectedText)})`))
 }
 
 async function insertAtDocumentEnd(text, connection = cdp) {
@@ -251,17 +251,18 @@ async function insertAtDocumentEnd(text, connection = cdp) {
 async function insertAtSourceEnd(text, connection = cdp) {
   await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
   await waitUntil('Markdown source textarea to open', () => connection.evaluate(
-    `Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`,
+    `Boolean(document.querySelector('.source-editor .cm-content'))`,
   ))
   await connection.evaluate(`(() => {
-    const source = document.querySelector('textarea[aria-label="Markdown 源文本"]');
-    source?.focus();
-    source?.setSelectionRange(source.value.length, source.value.length);
+    const source = document.querySelector('.source-editor .cm-content');
+    const view = source?.cmTile?.root?.view;
+    view?.dispatch({ selection: { anchor: view.state.doc.length } });
+    view?.focus();
     return Boolean(source);
   })()`)
   await connection.send('Input.insertText', { text })
   await waitUntil('Markdown source edit to reach the textarea', () => connection.evaluate(
-    `document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value.includes(${JSON.stringify(text)})`,
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(text)})`,
   ))
 }
 
@@ -614,6 +615,31 @@ test('an edit is persisted by the three-second autosave', async () => {
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
 })
 
+test('a denied workspace write explains the permission error and keeps the draft', async t => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    return t.skip('requires POSIX permission checks under a non-root backend account')
+  }
+  const token = `PERMISSION-DENIED-${Date.now()}`
+  const filePath = path.join(workspace, firstFile)
+  await openFile(firstFile, firstSeed)
+  t.after(() => chmod(filePath, 0o644))
+  await chmod(filePath, 0o444)
+  await insertAtDocumentEnd(token)
+  await waitUntil('permission test draft to appear in editor', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`,
+  ))
+
+  await clickAriaButton('保存当前文件')
+  await waitUntil('save status to explain the permission denial', () => cdp.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('无权限')`,
+  ))
+  await waitUntil('save notification to explain that the draft was kept', () => cdp.evaluate(
+    `document.body.innerText.includes('无权限访问或修改该路径') && document.body.innerText.includes('未保存内容已保留')`,
+  ))
+  assert.equal(await readFile(filePath, 'utf8'), firstSeed)
+  assert.ok(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`))
+})
+
 test('Markdown larger than the preview cap opens read-only without a draft or autosave', async t => {
   const fileName = `large-readonly-${Date.now()}.md`
   const filePath = path.join(workspace, fileName)
@@ -636,7 +662,7 @@ test('Markdown larger than the preview cap opens read-only without a draft or au
     `Boolean(document.querySelector('[aria-label="Markdown 只读预览"]')?.innerText.includes('超过 5 MiB 可编辑上限'))`,
   ))
   const view = await cdp.evaluate(`JSON.stringify({
-    source: Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]')),
+    source: Boolean(document.querySelector('.source-editor .cm-content')),
     save: Boolean(document.querySelector('button[aria-label="保存当前文件"]')),
     history: Boolean(document.querySelector('button[aria-label="查看版本历史"]')),
     download: Boolean(document.querySelector('button[aria-label="下载 Markdown"]')),
@@ -930,7 +956,7 @@ test('.markdown stays editable while attachments use a read-only byte download v
     `Boolean(document.querySelector('[aria-label="附件只读查看"]') && document.querySelector('[aria-label="附件只读查看"]').innerText.includes('不会按 Markdown 打开或自动保存'))`,
   ))
   const attachmentState = await cdp.evaluate(`JSON.stringify({
-    sourceEditor: Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]')),
+    sourceEditor: Boolean(document.querySelector('.source-editor .cm-content')),
     saveButton: Boolean(document.querySelector('button[aria-label="保存当前文件"]')),
     historyButton: Boolean(document.querySelector('button[aria-label="查看版本历史"]')),
     attachedDraft: Object.values(localStorage).some(value => value.includes(${JSON.stringify(attachmentPath)})),
@@ -1005,7 +1031,7 @@ test('two independent browser tabs cannot silently overwrite a newer save', asyn
 test('duplicating a tab with a cloned session id keeps each draft snapshot separate', async () => {
   await openFile(firstFile, firstSeed)
   await cdp.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
-  await waitUntil('first source editor to open', () => cdp.evaluate(`Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`))
+  await waitUntil('first source editor to open', () => cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
   const storageWorkspace = await realpath(workspace)
   const originalSession = await cdp.evaluate(`sessionStorage.getItem('editor_draft_tab_session')`)
   const firstToken = `DUPLICATE-A-${Date.now()}`
@@ -1533,7 +1559,7 @@ test('a renderer crash restores the throttled draft without writing it blindly',
     const target = targets.find(item => item.id === inspectedTargetId)
     const page = connection
       ? await Promise.race([
-        connection.evaluate(`JSON.stringify({ url: location.href, status: document.querySelector('.save-status')?.innerText || '', source: document.querySelector('textarea[aria-label="Markdown 源文本"]')?.value || '', editor: document.querySelector('.ProseMirror')?.innerText || '' })`).catch(error => `unavailable: ${error.message}`),
+        connection.evaluate(`JSON.stringify({ url: location.href, status: document.querySelector('.save-status')?.innerText || '', source: document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() || '', editor: document.querySelector('.ProseMirror')?.innerText || '' })`).catch(error => `unavailable: ${error.message}`),
         new Promise(resolve => setTimeout(() => resolve('renderer did not answer within 500ms'), 500)),
       ])
       : 'closed'
@@ -1557,7 +1583,7 @@ test('a renderer crash restores the throttled draft without writing it blindly',
   await openFile(firstFile, firstSeed)
   await installSaveTimerProbe(cdp)
   await cdp.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
-  await waitUntil('source editor to open before the crash test', () => cdp.evaluate(`Boolean(document.querySelector('textarea[aria-label="Markdown 源文本"]'))`))
+  await waitUntil('source editor to open before the crash test', () => cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
   const token = `CRASH-RECOVERY-${Date.now()}`
   await insertAtSourceEnd(token)
   await waitUntil('draft snapshot to reach local storage before autosave', () => cdp.evaluate(`(() => {

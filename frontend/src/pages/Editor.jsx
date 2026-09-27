@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react'
 import { Tree, Button, Modal, Input, message, Tooltip, Dropdown } from 'antd'
 import {
   FileOutlined, FolderOpenOutlined, PlusOutlined, UploadOutlined, SaveOutlined,
@@ -31,6 +31,12 @@ import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import { requiresSourceMode } from './markdownSourcePolicy'
+import { analyzeMarkdownSource } from './markdownDiagnostics.js'
+import { normalizeSafeMarkdown } from './safeMarkdownNormalization.js'
+import { isPermissionDenied, requestErrorMessage } from '../requestErrorMessage'
+import { TableInsertButton, TableContextTools } from './TableControls'
+import { parseImagePresentationComment, formatImagePresentationComment } from './imagePresentation.js'
+import ImageControls from './ImageControls'
 import { createSearchCoordinator } from '../searchCoordinator'
 import {
   createUploadedImageReference,
@@ -43,10 +49,11 @@ import { ConflictModal, HistoryModal, RecoveryAlternativesModal, TrashModal } fr
 import './Editor.css'
 
 const lowlight = createLowlight(common)
+const MarkdownSourceEditor = lazy(() => import('./MarkdownSourceEditor'))
 
 const API = '/api/workspace'
 
-function SaveStatus({ status, onRetry }) {
+function SaveStatus({ status, errorMessage, onRetry }) {
   const states = {
     modified: { icon: <EditOutlined />, label: '修改待保存', className: 'is-modified' },
     saving: { icon: <LoadingOutlined spin />, label: '保存中', className: 'is-saving' },
@@ -58,7 +65,9 @@ function SaveStatus({ status, onRetry }) {
   return (
     <div className={`save-status ${current.className}`} role="status" aria-live="polite">
       <span className="save-status-icon" aria-hidden="true">{current.icon}</span>
-      <span>{current.label}</span>
+      <span title={status === 'error' ? errorMessage : undefined}>
+        {status === 'error' && errorMessage?.includes('无权限') ? '无权限，保存失败' : current.label}
+      </span>
       {status === 'error' && (
         <Button
           type="link"
@@ -117,6 +126,22 @@ function markdownToHtml(markdown, imageIdentity, documentPath) {
     if (reference && title) image.setAttribute('data-markdown-title', title)
     image.setAttribute('src', reference?.url || 'about:blank')
   })
+  // Metadata belongs to the immediately preceding image node, not its URL.
+  // Duplicate image paths therefore retain independent display settings.
+  const comments = doc.createTreeWalker(doc.body, NodeFilter.SHOW_COMMENT)
+  const imageComments = []
+  while (comments.nextNode()) imageComments.push(comments.currentNode)
+  imageComments.forEach(comment => {
+    const metadata = parseImagePresentationComment(comment.nodeValue)
+    const legacy = String(comment.nodeValue || '').trim().match(/^zoom:(\d+)$/)
+    const image = comment.previousSibling
+    if (image?.nodeName !== 'IMG' || (!metadata && !legacy)) return
+    if (metadata) {
+      image.setAttribute('data-image-width', String(metadata.width))
+      image.setAttribute('data-image-align', metadata.align)
+    } else image.setAttribute('data-legacy-zoom', legacy[1])
+    comment.remove()
+  })
   return doc.body.innerHTML
 }
 
@@ -139,7 +164,10 @@ function createMarkdownSerializer() {
       const alt = (node.getAttribute('alt') || '').replace(/\\/g, '\\\\').replace(/\]/g, '\\]')
       const title = node.getAttribute('data-markdown-title')
       const formattedTitle = title ? ` "${title.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : ''
-      return source ? `![${alt}](${source}${formattedTitle})` : ''
+      const presentation = formatImagePresentationComment(node.getAttribute('data-image-width'), node.getAttribute('data-image-align'))
+      const legacy = node.getAttribute('data-legacy-zoom')
+        ? `<!-- zoom:${node.getAttribute('data-legacy-zoom')} -->` : ''
+      return source ? `![${alt}](${source}${formattedTitle})${legacy}${presentation}` : ''
     },
   })
   td.addRule('editorTaskItem', {
@@ -196,6 +224,27 @@ const MarkdownImage = Image.extend({
         parseHTML: element => element.getAttribute('data-markdown-title'),
         renderHTML: attributes => attributes.markdownTitle
           ? { 'data-markdown-title': attributes.markdownTitle }
+          : {},
+      },
+      imageWidth: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-image-width'),
+        renderHTML: attributes => attributes.imageWidth
+          ? { 'data-image-width': String(attributes.imageWidth), style: `width:${attributes.imageWidth}%;max-width:100%` }
+          : {},
+      },
+      imageAlign: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-image-align'),
+        renderHTML: attributes => attributes.imageAlign
+          ? { 'data-image-align': attributes.imageAlign, style: attributes.imageAlign === 'center' ? 'display:block;margin-left:auto;margin-right:auto' : 'display:block;margin-left:0;margin-right:auto' }
+          : {},
+      },
+      legacyZoom: {
+        default: null,
+        parseHTML: element => element.getAttribute('data-legacy-zoom'),
+        renderHTML: attributes => attributes.legacyZoom
+          ? { 'data-legacy-zoom': attributes.legacyZoom, style: `zoom:${attributes.legacyZoom}%` }
           : {},
       },
     }
@@ -306,12 +355,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [createModal, setCreateModal] = useState({ open: false, parent: '', type: 'file' })
   const [createName, setCreateName] = useState('')
   const [uploading, setUploading] = useState(false)
+  const imageInputRef = useRef(null)
   const [contextMenu, setContextMenu] = useState({ visible: false, node: null, x: 0, y: 0 })
   const [moveModal, setMoveModal] = useState({ open: false, node: null })
   const [moveTarget, setMoveTarget] = useState('')
   const [moveBusy, setMoveBusy] = useState(false)
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
+  const [, setSelectionEpoch] = useState(0)
+  const [editorInteracted, setEditorInteracted] = useState(false)
+  const sourceEditorRef = useRef(null)
   const [largeMarkdownView, setLargeMarkdownView] = useState(null)
   const [editorFullscreen, setEditorFullscreen] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -420,7 +473,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [renamingPath, setRenamingPath] = useState(null)
   const [renameValue, setRenameValue] = useState('')
   const renameInputRef = useRef(null)
-  const zoomMapRef = useRef({})
 
   useEffect(() => {
     const mq = window.matchMedia('(max-width: 768px)')
@@ -474,6 +526,22 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     return () => editor.off('update', refreshOutline)
   }, [editor, refreshOutline, activeFile, savedContents[activeFile]])
 
+  useEffect(() => {
+    if (!editor) return
+    const rerender = () => setSelectionEpoch(value => value + 1)
+    editor.on('selectionUpdate', rerender)
+    return () => editor.off('selectionUpdate', rerender)
+  }, [editor])
+
+  useEffect(() => {
+    if (!editor) return
+    const markInteraction = () => setEditorInteracted(true)
+    const dom = editor.view.dom
+    dom.addEventListener('click', markInteraction)
+    dom.addEventListener('focusin', markInteraction)
+    return () => { dom.removeEventListener('click', markInteraction); dom.removeEventListener('focusin', markInteraction) }
+  }, [editor])
+
   // 键盘快捷键
   useEffect(() => {
     if (!editor) return
@@ -493,17 +561,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     return () => window.removeEventListener('keydown', handler)
   }, [editor, activeFile])
 
-  const applyZoom = useCallback(() => {
-    const zoomMap = zoomMapRef.current
-    document.querySelectorAll('.ProseMirror img').forEach(img => {
-      const key = (img.getAttribute('data-markdown-src') || img.getAttribute('src') || '').replace(/^\//, '')
-      if (zoomMap[key] && !img.getAttribute('data-zoom')) {
-        img.setAttribute('data-zoom', zoomMap[key])
-        img.style.zoom = zoomMap[key] + '%'
-      }
-    })
-  }, [])
-
   // TipTap paste handler — use a ref so it always sees the current tab.
   useEffect(() => {
     if (!editor) return
@@ -519,16 +576,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     dom.addEventListener('paste', handlePaste)
     return () => dom.removeEventListener('paste', handlePaste)
   }, [editor])
-
-  useEffect(() => {
-    if (!editor) return
-    const observer = new MutationObserver(() => applyZoom())
-    const el = editor.view.dom
-    observer.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] })
-    const onTransaction = () => setTimeout(applyZoom, 0)
-    editor.on('transaction', onTransaction)
-    return () => { observer.disconnect(); editor.off('transaction', onTransaction) }
-  }, [editor, applyZoom])
 
   const loadTree = useCallback(async () => {
     try {
@@ -589,17 +636,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const serializeCurrentEditor = useCallback(() => {
     if (!editor) return ''
-    let md = htmlToMarkdown(editor.getHTML())
-    document.querySelectorAll('.ProseMirror img[data-zoom]').forEach(img => {
-      const zoom = img.getAttribute('data-zoom')
-      if (zoom && zoom !== '100') {
-        const src = img.getAttribute('data-markdown-src') || img.getAttribute('src') || ''
-        const escapedSrc = src.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-        const pattern = `!\\[([^\\]]*)\\]\\(${escapedSrc}(?:\\s+"(?:[^"\\\\]|\\\\.)*")?\\)`
-        md = md.replace(new RegExp(pattern), `$&<!-- zoom:${zoom} -->`)
-      }
-    })
-    return md
+    return htmlToMarkdown(editor.getHTML())
   }, [editor])
 
   const captureCurrentDraft = useCallback(() => {
@@ -702,13 +739,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }
       }
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
-      const visible = draftContentsRef.current[path] ?? fetched
-      const zoomMap = {}
-      const withoutZoom = visible.replace(/!\[(.*?)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
-        zoomMap[src.replace(/^\//, '')] = zoom
-        return `![${_alt}](${src})`
-      })
-      zoomMapRef.current = zoomMap
+      const safeCorrection = !hasDirtyDraft && diskRevision ? normalizeSafeMarkdown(fetched) : null
+      setEditorInteracted(false)
+      const visible = draftContentsRef.current[path] ?? safeCorrection ?? fetched
       sourceContentRef.current = visible
       renderedFileRef.current = path
       loadingRef.current = false
@@ -716,11 +749,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       const keepSource = requiresSourceMode(visible)
       showSourceRef.current = keepSource
       setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(withoutZoom, path)
+      if (!keepSource) setEditorMarkdown(visible, path)
       setSourceContent(visible)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
       if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
-      setTimeout(applyZoom, 0)
+      if (safeCorrection && requestId === openRequestRef.current && activeFileRef.current === path && !dirtyRef.current[path]) {
+        setDraft(path, safeCorrection, true)
+        doSave(path, safeCorrection).catch(() => {})
+      }
     } catch (error) {
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
       loadingRef.current = false
@@ -734,7 +770,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       setLargeMarkdownView(null)
       message.error('打开文件失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyZoom, clearFileConflict, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked])
+  }, [clearFileConflict, doSave, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked])
 
   const handleFileOpen = useCallback(async node => {
     // The tab identity probe and own-tab crash recovery must finish before a
@@ -926,8 +962,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
     try {
       await flushPaths([path])
-    } catch {
-      message.error('保存失败，标签页仍保持打开')
+    } catch (error) {
+      message.error(isPermissionDenied(error)
+        ? `${requestErrorMessage(error)}；未保存内容已保留，标签页仍保持打开`
+        : '保存失败，标签页仍保持打开')
       return
     }
     await finishCloseTab(path)
@@ -950,6 +988,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     } catch (error) {
       message.error(error?.response?.data?.code === 'FILE_CONFLICT'
         ? '文件已在磁盘上变化；本地草稿已保留，没有覆盖磁盘内容'
+        : isPermissionDenied(error)
+        ? `${requestErrorMessage(error)}；未保存内容已保留`
         : '保存失败，已保留未保存状态')
     }
   }, [captureCurrentDraft, doSave, saveBlockedRef])
@@ -1006,13 +1046,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       }
       applyRecoveryAlternative(path, entry)
       const content = entry.snapshot.content
-      const withoutZoom = content.replace(/!\[(.*?)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)')
       const keepSource = requiresSourceMode(content)
       sourceContentRef.current = content
       setSourceContent(content)
       showSourceRef.current = keepSource
       setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(withoutZoom)
+      if (!keepSource) setEditorMarkdown(content)
       setSaveStatus('conflict')
       setRecoveryModalOpen(false)
       await handleShowConflictReview(path, conflictsRef.current[path])
@@ -1270,18 +1309,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }
     const content = sourceContentRef.current
     const enterRichMode = () => {
-      const zoomMap = {}
-      content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, (_, _alt, src, zoom) => {
-        zoomMap[src.replace(/^\//, '')] = zoom
-        return ''
-      })
-      zoomMapRef.current = zoomMap
-      setEditorMarkdown(content.replace(/!\[([^\]]*)\]\((.*?)\)<!-- zoom:(\d+) -->/g, '![$1]($2)'))
+      setEditorMarkdown(content)
       setDraft(path, content, content !== cleanContentsRef.current[path])
       if (content !== cleanContentsRef.current[path]) setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
       showSourceRef.current = false
       setShowSource(false)
-      setTimeout(applyZoom, 0)
     }
     if (requiresSourceMode(content)) {
       Modal.confirm({
@@ -1294,7 +1326,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       return
     }
     enterRichMode()
-  }, [applyZoom, captureCurrentDraft, saveBlockedRef, setEditorMarkdown])
+  }, [captureCurrentDraft, saveBlockedRef, setEditorMarkdown])
 
   const handleChangeWorkspace = useCallback(async () => {
     try {
@@ -1428,7 +1460,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (!editor) return
     const formData = new FormData()
     formData.append('file', file)
-    formData.append('path', 'assets')
+    formData.append('documentPath', targetFile)
     setUploading(true)
     try {
       const res = await axios.post(`${API}/upload`, formData)
@@ -1911,6 +1943,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const activeLargeMarkdown = largeMarkdownView?.path === activeFile ? largeMarkdownView : null
   const tabDirtyState = isDirty
   const sourceModeRequired = showSource && requiresSourceMode(sourceContent)
+  const sourceDiagnostics = showSource ? analyzeMarkdownSource(sourceContent) : []
   const recoveryAlternativeCount = Object.values(recoveryAlternatives).reduce((count, entries) => count + entries.length, 0)
   const activeSaveStatus = activeLargeMarkdown ? (activeLargeMarkdown.hasUnsavedDraft ? 'error' : 'saved') : activeFile
     ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
@@ -1935,7 +1968,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     { key: 'blockquote', label: '引用', icon: <HolderOutlined /> },
     { key: 'code-block', label: '代码块', icon: <ApiOutlined /> },
     { key: 'link', label: '插入链接', icon: <LinkOutlined /> },
-    { key: 'table', label: '插入表格', icon: <TableOutlined /> },
     { key: 'image', label: '上传图片', icon: <UploadOutlined /> },
   ]
   const applyMobileToolbarAction = ({ key }) => {
@@ -1947,8 +1979,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (key === 'blockquote') chain?.toggleBlockquote().run()
     if (key === 'code-block') chain?.toggleCodeBlock().run()
     if (key === 'link') handleInsertLink()
-    if (key === 'table') chain?.insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()
-    if (key === 'image') document.getElementById('img-up')?.click()
+    if (key === 'image') imageInputRef.current?.click()
   }
 
   return (
@@ -1965,6 +1996,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         background: 'var(--color-bg)',
       }}
     >
+      <input ref={imageInputRef} id="img-up" type="file" accept="image/*" hidden aria-label="选择要插入的图片"
+        onChange={event => { const file = event.target.files?.[0]; if (file) handleImageUpload(file); event.target.value = '' }} />
       {/* 左侧面板 - PC */}
       {!editorFullscreen && !isMobile && showSidebar && (
         <div className="workspace-sidebar" style={{
@@ -2409,9 +2442,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                     <Tooltip title="引用"><Button aria-label="引用" {...tbBtn(editor?.isActive('blockquote') || false)} onClick={() => editor?.chain().focus().toggleBlockquote().run()} icon={<HolderOutlined />} /></Tooltip>
                     <Tooltip title="代码块"><Button aria-label="代码块" {...tbBtn(editor?.isActive('codeBlock') || false)} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<ApiOutlined />} /></Tooltip>
                     <Tooltip title="插入链接"><Button aria-label="插入链接" {...tbBtn(editor?.isActive('link') || false)} onClick={handleInsertLink} icon={<LinkOutlined />} /></Tooltip>
-                    <Tooltip title="插入表格"><Button aria-label="插入表格" {...tbBtn(false)} onClick={() => editor?.chain().focus().insertTable({ rows: 3, cols: 3, withHeaderRow: true }).run()} icon={<TableOutlined />} /></Tooltip>
-                    <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
-                    <Tooltip title="上传图片"><label><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} /></label></Tooltip>
+                    <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
+                    <Tooltip title="上传图片"><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} onClick={() => imageInputRef.current?.click()} /></Tooltip>
                   </div>
                   <span className="toolbar-spacer" />
                   <div className="toolbar-group toolbar-view-group">
@@ -2456,7 +2488,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   >
                     <Button className="mobile-more-formats" aria-label="更多格式" {...tbBtn(false, 'var(--color-text-secondary)')} icon={<MoreOutlined />}>更多格式</Button>
                   </Dropdown>
-                  <input type="file" accept="image/*" style={{ display: 'none' }} id="img-up" onChange={e => { const f = e.target.files?.[0]; if (f) handleImageUpload(f); e.target.value = '' }} />
+                  <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
                   <span className="toolbar-spacer" />
                   <Tooltip title={showSource ? '编辑' : '源码'}>
                     <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
@@ -2479,8 +2511,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
               {/* 编辑区 */}
               {sourceModeRequired && (
-                <div role="alert" className="source-fidelity-warning" style={{ padding: '7px 12px', color: 'var(--color-warning)', background: 'var(--color-bg-muted)', borderBottom: '1px solid var(--color-border)', fontSize: 12 }}>
-                  此文档包含富文本模式无法完整保留的 Markdown 语法。当前使用源码模式，可原样编辑和保存；切换到富文本前会再次提示风险。
+                <div role="status" className="source-fidelity-warning">
+                  <span>{sourceDiagnostics.length} 处内容需要源码保护。波浪线标出具体片段；悬停可查看原因。</span>
+                  <Button size="small" onClick={() => sourceEditorRef.current?.nextProtected()} aria-label="跳转到下一个受保护位置">下一个位置（F8）</Button>
                 </div>
               )}
               {fileLoading && (
@@ -2494,102 +2527,30 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 </div>
               )}
               {showSource ? (
-                <textarea
-                  value={sourceContent}
-                  onChange={e => {
-                    const value = e.target.value
-                    if (!isEditableMarkdownSize(value)) {
-                      const accepted = draftContentsRef.current[activeFileRef.current] ?? cleanContentsRef.current[activeFileRef.current] ?? ''
-                      sourceContentRef.current = accepted
-                      setSourceContent(accepted)
-                      message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
-                      return
-                    }
-                    sourceContentRef.current = value
-                    setSourceContent(value)
-                    const path = activeFileRef.current
-                    if (path) {
-                      setDraft(path, value, true)
-                      setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
-                      scheduleSave(path, value)
-                    }
-                  }}
-                  className="source-editor"
-                  aria-label="Markdown 源文本"
-                  style={{ flex: 1, width: '100%', border: 'none', outline: 'none', background: 'var(--color-bg-card)', color: 'var(--color-text)', fontFamily: 'monospace', fontSize: 14, lineHeight: 1.8, padding: '20px 32px', resize: 'none' }}
-                />
+                <Suspense fallback={<div className="source-editor" aria-label="正在加载源码编辑器" />}>
+                  <MarkdownSourceEditor
+                    ref={sourceEditorRef}
+                    value={sourceContent}
+                    onChange={value => {
+                      if (!isEditableMarkdownSize(value)) {
+                        message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
+                        return false
+                      }
+                      sourceContentRef.current = value
+                      setSourceContent(value)
+                      const path = activeFileRef.current
+                      if (path) {
+                        setDraft(path, value, true)
+                        setSaveStatus(conflictsRef.current[path] ? 'conflict' : 'modified')
+                        scheduleSave(path, value)
+                      }
+                    }}
+                  />
+                </Suspense>
               ) : (
                 <div className="editor-scroll" style={{ flex: 1, overflow: 'auto', padding: '20px 32px', background: 'var(--color-bg-card)' }}>
-                  <style>{`
-                    .ProseMirror { outline: none; min-height: 100%; font-size: 17px; line-height: 1.8; color: var(--color-text); }
-                    .ProseMirror h1 { font-size: 1.8em; font-weight: 700; border-bottom: 1px solid var(--color-border); padding-bottom: 8px; margin: 1em 0 0.5em; }
-                    .ProseMirror h2 { font-size: 1.4em; font-weight: 600; margin: 1em 0 0.5em; }
-                    .ProseMirror h3 { font-size: 1.2em; font-weight: 600; margin: 0.8em 0 0.4em; }
-                    .ProseMirror p { margin: 0.4em 0; }
-                    .ProseMirror code { background: var(--color-code-inline); padding: 2px 6px; border-radius: 4px; font-size: 0.88em; font-family: 'JetBrains Mono', monospace; }
-                    .ProseMirror pre {
-                      background: #282c34 !important;
-                      border-radius: 10px;
-                      padding: 16px 20px;
-                      margin: 0.8em 0;
-                      overflow: auto;
-                      border: 1px solid #3a3f4b;
-                      box-shadow: 0 2px 12px rgba(0,0,0,0.25);
-                      max-width: 760px;
-                      display: block;
-                    }
-                    .ProseMirror pre code {
-                      background: none !important;
-                      padding: 0;
-                      font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
-                      font-size: 13.5px;
-                      line-height: 1.7;
-                      color: #abb2bf;
-                    }
-                    .ProseMirror blockquote { border-inline-start: 2px solid var(--color-border); padding-inline-start: 12px; margin: 0.5em 0; color: var(--color-text-secondary); }
-                    .ProseMirror img { max-width: 100%; border-radius: 4px; }
-                    .ProseMirror ul, .ProseMirror ol { padding-left: 1.5em; margin: 0.4em 0; }
-                    .ProseMirror li { margin: 0.2em 0; }
-                    .ant-tree-treenode:hover .tree-node-more { opacity: 1 !important; }
-                    .tree-node-more { transition: opacity 0.15s; }
-                    /* ===== 表格样式 ===== */
-                    .ProseMirror table {
-                      width: 100%;
-                      max-width: 760px;
-                      border-collapse: collapse;
-                      margin: 0.8em 0;
-                      border-radius: 8px;
-                      overflow: hidden;
-                      border: 1px solid var(--color-border);
-                      box-shadow: var(--shadow);
-                    }
-                    .ProseMirror table th {
-                      background: var(--color-table-header);
-                      font-weight: 600;
-                      text-align: left;
-                      padding: 10px 14px;
-                      border: 1px solid var(--color-border);
-                      color: var(--color-text);
-                    }
-                    .ProseMirror table td {
-                      padding: 8px 14px;
-                      border: 1px solid var(--color-border);
-                      vertical-align: top;
-                    }
-                    .ProseMirror table tr:nth-child(even) td {
-                      background: var(--color-table-row-alt);
-                    }
-                    .ProseMirror table tr:hover td {
-                      background: var(--color-table-hover) !important;
-                    }
-                    .ProseMirror table td.selectedCell {
-                      background: var(--color-table-selected) !important;
-                    }
-                    .ProseMirror .column-resize-handle {
-                      background-color: var(--color-primary);
-                      width: 3px;
-                    }
-                  `}</style>
+                  <TableContextTools editor={editor} visible={editorInteracted} />
+                  <ImageControls editor={editor} visible={editorInteracted} />
                   <div className="prose-column">
                     <EditorContent editor={editor} style={{ height: '100%' }} />
                   </div>
@@ -2621,12 +2582,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               {activeLargeMarkdown?.hasUnsavedDraft && (
                 <Button aria-label="下载本地草稿" size="small" onClick={() => handleExportConflictDraft(activeFile)}>下载草稿</Button>
               )}
-              {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && <SaveStatus status={activeSaveStatus} onRetry={handleRetrySave} />}
+              {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && <SaveStatus status={activeSaveStatus} errorMessage={saveErrors[activeFile]} onRetry={handleRetrySave} />}
               {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && (
                 <Button aria-label="查看版本历史" size="small" icon={<HistoryOutlined />} onClick={() => handleOpenHistory(activeFile)}>历史</Button>
               )}
               {activeFile && isMarkdownFile(activeFile) && !activeLargeMarkdown && (
-                <Button aria-label="保存当前文件" size="small" type="primary" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
+                <Button aria-label="保存当前文件" size="small" icon={<SaveOutlined />} onClick={handleSave} className="save-button">保存</Button>
               )}
               {activeLargeMarkdown && (
                 <Button aria-label="下载 Markdown" size="small" icon={<ApiOutlined />} onClick={() => handleExport(activeFile)}>下载</Button>

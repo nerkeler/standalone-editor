@@ -186,10 +186,10 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
         {/* Root locations come from the host. Keep the complete path in the
             tooltip and use the backend-provided path when navigating so this
             works for POSIX roots, Windows drive letters, and UNC shares. */}
-        {(pickerData?.roots || []).length > 0 && (
+        {(pickerData?.locations || pickerData?.roots || []).length > 0 && (
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
             <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>位置</span>
-            {pickerData.roots.map(root => (
+            {(pickerData.locations || pickerData.roots).map(root => (
               <Button
                 key={root.path}
                 size="small"

@@ -121,6 +121,92 @@ test('file API requires revisions, returns structured conflicts, and restores gu
   assert.equal((await duplicateCreate.json()).code, 'FILE_CONFLICT')
 })
 
+test('read-only directories remain selectable while unreadable listing and denied writes return permission errors', async t => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) {
+    return t.skip('requires POSIX permission checks under a non-root backend account')
+  }
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-readonly-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-readonly-recovery-')
+  const unreadable = path.join(workspace, 'unreadable')
+  const notePath = path.join(workspace, 'note.md')
+  await fs.mkdir(unreadable)
+  await fs.writeFile(notePath, 'initial')
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const check = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Workspace-Id': check.workspaceId,
+    'X-Workspace-Version': String(check.workspaceVersion),
+  }
+
+  await fs.chmod(workspace, 0o555)
+  await fs.chmod(unreadable, 0o000)
+  t.after(async () => {
+    await fs.chmod(unreadable, 0o755).catch(() => {})
+    await fs.chmod(workspace, 0o755).catch(() => {})
+    await fs.chmod(notePath, 0o644).catch(() => {})
+  })
+
+  const readableReadonlyListing = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(workspace)}`)
+  assert.equal(readableReadonlyListing.status, 200)
+  const listing = await readableReadonlyListing.json()
+  assert.equal(listing.canSelect, true, 'selection checks read access, not write access')
+  assert.equal(listing.entries.some(entry => entry.path === unreadable), false)
+
+  const selectReadonly = await fetch(`${baseUrl}/api/workspace/set`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: workspace }),
+  })
+  assert.equal(selectReadonly.status, 200)
+
+  const unreadableListing = await fetch(`${baseUrl}/api/dirs?path=${encodeURIComponent(unreadable)}`)
+  assert.equal(unreadableListing.status, 403)
+  const unreadableBody = await unreadableListing.json()
+  assert.equal(unreadableBody.code, 'PERMISSION_DENIED')
+  assert.equal(unreadableBody.error, '无权限访问或修改该路径')
+  assert.equal(unreadableBody.systemCode, 'EACCES')
+
+  const selectUnreadable = await fetch(`${baseUrl}/api/workspace/set`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: unreadable }),
+  })
+  assert.equal(selectUnreadable.status, 403)
+  assert.equal((await selectUnreadable.json()).code, 'PERMISSION_DENIED')
+
+  const currentFile = await fetch(`${baseUrl}/api/workspace/file?path=note.md`, { headers })
+  assert.equal(currentFile.status, 200)
+  const revision = (await currentFile.json()).revision
+  const deniedSave = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'note.md', content: 'replacement', expectedRevision: revision }),
+  })
+  assert.equal(deniedSave.status, 403)
+  const deniedBody = await deniedSave.json()
+  assert.equal(deniedBody.code, 'PERMISSION_DENIED')
+  assert.equal(deniedBody.error, '无权限访问或修改该路径')
+  assert.equal(deniedBody.systemCode, 'EACCES')
+
+  await fs.chmod(unreadable, 0o755)
+  await fs.chmod(workspace, 0o755)
+  assert.equal(await fs.readFile(notePath, 'utf8'), 'initial')
+
+  // Atomic rename would otherwise replace a 0444 file when its directory is
+  // writable. The API preserves the file's own effective W_OK requirement.
+  await fs.chmod(notePath, 0o444)
+  const readonlyFileSave = await fetch(`${baseUrl}/api/workspace`, {
+    method: 'PUT', headers,
+    body: JSON.stringify({ path: 'note.md', content: 'file replacement', expectedRevision: revision }),
+  })
+  assert.equal(readonlyFileSave.status, 403)
+  const readonlyFileBody = await readonlyFileSave.json()
+  assert.equal(readonlyFileBody.code, 'PERMISSION_DENIED')
+  assert.equal(readonlyFileBody.error, '无权限访问或修改该路径')
+  assert.equal(await fs.readFile(notePath, 'utf8'), 'initial')
+  await fs.chmod(notePath, 0o644)
+})
+
 test('large Markdown stays read-only, restore and writes are blocked, and downloads stream unchanged bytes', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-api-large-workspace-')
   const recovery = await temporaryDirectory(t, 'standalone-editor-api-large-recovery-')

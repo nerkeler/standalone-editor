@@ -64,9 +64,11 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ### 跨平台目录选择
 
-目录选择器由后端主机决定路径规则。`/api/dirs` 返回 `platform`、当前 `path`、`parent`、`canGoUp`、`canSelect`、`breadcrumb`、`roots` 和 `entries`；条目和面包屑中的 `path` 都是完整的主机路径，前端应原样传回接口，不自行拼接 `/`、`\\` 或驱动器路径。Windows 的盘符根（例如 `C:\\`）和 UNC 根（例如 `\\\\server\\share\\`）也遵循同一规则。
+目录选择器由后端主机决定路径规则。`/api/dirs` 返回 `platform`、当前 `path`、`parent`、`canGoUp`、`canSelect`、`breadcrumb`、受策略限制的 `roots`、便于快速跳转的 `locations` 和 `entries`；条目和面包屑中的 `path` 都是完整的主机路径，前端应原样传回接口，不自行拼接 `/`、`\\` 或驱动器路径。Windows 的盘符根（例如 `C:\\`）和 UNC 根（例如 `\\\\server\\share\\`）也遵循同一规则。
 
-可通过 `EDITOR_DIRECTORY_ROOTS`（别名 `DIRECTORY_ROOTS`）限制可选目录。POSIX 使用 `:` 分隔，Windows 使用 `;` 分隔；不存在、不可读或指向文件的配置会被忽略。白名单祖先目录可以浏览到允许根，但 `canSelect` 为 false；只有真实存在的根和可继续到允许根的目录会出现在列表中。未配置时，macOS 使用用户目录、`/Users`、`/Volumes` 等入口，Linux 使用用户目录和常见挂载点，Windows 使用用户目录、系统盘用户目录及实际存在的盘符。
+可通过 `EDITOR_DIRECTORY_ROOTS`（别名 `DIRECTORY_ROOTS`）限制可选目录。POSIX 使用 `:` 分隔，Windows 使用 `;` 分隔；不存在、不可读或指向文件的配置会被忽略。白名单祖先目录可以浏览到允许根，但 `canSelect` 为 false；只有真实存在的根和可继续到允许根的目录会出现在列表中。
+
+未配置 roots 时，macOS 和 Linux 都从 `/` 浏览；目录项按后端运行账号实际的读和进入权限显示，直接访问无权限目录会返回 `403/PERMISSION_DENIED`。可读但只读的目录仍可作为工作区，保存等写操作由操作系统权限决定，失败时返回 `403/PERMISSION_DENIED`。Windows 继续使用现有盘符和 UNC 路径规则。`canSelect` 与设置工作区共用恢复数据目录的嵌套约束：例如默认 recovery 位于 `/` 内，因此 `/` 会显示为不可选并由设置接口以恢复目录冲突原因拒绝。显式 roots 是可选的管理员范围限制，不会覆盖操作系统本身的权限检查。
 
 只有从未保存过工作区配置时，后端才会创建默认目录。已保存目录不可访问、配置损坏或恢复数据目录与工作区互相包含时，`/api/workspace/check` 会给出错误，文件 API 暂停；目录浏览和选择仍可使用。选择新目录前会校验恢复数据目录的位置，配置通过同目录临时文件原子替换，保存失败不会切换当前工作区。
 

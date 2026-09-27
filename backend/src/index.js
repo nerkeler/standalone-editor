@@ -27,6 +27,7 @@ import {
   restoreOrphanFileHistory,
   reattachTrashFileHistory,
   uploadFile,
+  ensureAdjacentAssetsDirectory,
   listAll,
   searchWorkspace,
 } from './fileService.js'
@@ -38,16 +39,18 @@ import {
   defaultRootCandidates,
   breadcrumbFor,
   isDirectoryNavigable,
-  isDirectorySelectable,
+  isDirectoryPickerSelectionAllowed,
   isWithinPath,
   parentPath,
   pathModuleFor,
   rootEntry,
 } from './directoryPicker.js'
+import { permissionErrorResponse } from './permissionErrors.js'
 import {
   assertWorkspaceRecoveryRootsDisjoint,
   defaultRecoveryRoot,
   loadWorkspaceConfig,
+  projectCanonicalPath,
   saveWorkspaceConfig,
 } from './workspaceConfigService.js'
 
@@ -78,6 +81,8 @@ const workspaceMutationTails = new Map()
 let workspaceSelectionTail = Promise.resolve()
 
 function errorStatus(error) {
+  const permissionFailure = permissionErrorResponse(error)
+  if (permissionFailure) return permissionFailure.status
   if (
     error?.code === 'CONFLICT' || error?.code === 'FILE_CONFLICT' ||
     error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH'
@@ -120,6 +125,13 @@ async function workspaceRecoveryStats(ws) {
 function sendError(res, error, req = res.req) {
   console.error(`[${res.req.method} ${res.req.originalUrl}]`, error?.message || error)
   if (req?.workspaceSnapshot) setWorkspaceHeaders(res, req.workspaceSnapshot)
+  const permissionFailure = permissionErrorResponse(error)
+  if (permissionFailure) {
+    return res.status(permissionFailure.status).json({
+      ...(error?.details || {}),
+      ...permissionFailure.body,
+    })
+  }
   res.status(errorStatus(error)).json({ error: error?.message || '请求失败', code: error?.code, ...(error?.details || {}) })
 }
 
@@ -138,6 +150,14 @@ async function canonicalDirectory(input, { create = false } = {}) {
     throw error
   }
   return real
+}
+
+async function assertDirectoryReadable(directory) {
+  // Workspace browsing and selection need read + traversal access, but do not
+  // require write permission. Windows does not expose POSIX execute bits.
+  const mode = fs.constants.R_OK | (process.platform === 'win32' ? 0 : fs.constants.X_OK)
+  await fs.access(directory, mode)
+  await fs.readdir(directory)
 }
 
 function currentWorkspaceInfo() {
@@ -207,23 +227,64 @@ async function allowedDirectoryRoots() {
       const resolved = await canonicalDirectory(value)
       // A stat-able mount can still deny directory enumeration. Exclude it
       // here so the picker never advertises a root that cannot be opened.
-      await fs.readdir(resolved)
+      await assertDirectoryReadable(resolved)
       if (!roots.some(root => isWithinPath(root, resolved, process.platform))) roots.push(resolved)
     } catch {}
   }
   return roots
 }
 
+async function directorySelectionPolicy(roots) {
+  // Match the canonical/projected recovery path used by workspace selection,
+  // including a recovery directory reached through a symlinked parent.
+  const recovery = await projectCanonicalPath(RECOVERY_ROOT)
+  return target => {
+    if (!isDirectoryPickerSelectionAllowed(target, roots, { platform: process.platform })) return false
+    const normalizedTarget = path.resolve(target)
+    // Never allow a workspace to contain recovery data or be inside it. This
+    // makes `/` non-selectable under the default recovery location while leaving
+    // other readable directories governed by their roots and OS permissions.
+    return !isWithinPath(normalizedTarget, recovery, process.platform)
+      && !isWithinPath(recovery, normalizedTarget, process.platform)
+  }
+}
+
 async function defaultDirectoryPickerPath() {
   const roots = await allowedDirectoryRoots()
-  if (roots.some(root => isWithinPath(root, os.homedir(), process.platform))) return os.homedir()
+  if (roots.some(root => isWithinPath(root, os.homedir(), process.platform))) {
+    try {
+      const home = await canonicalDirectory(os.homedir())
+      await assertDirectoryReadable(home)
+      return home
+    } catch {}
+  }
   return roots[0] || os.homedir()
+}
+
+async function directoryPickerLocations(roots) {
+  const configured = process.env.EDITOR_DIRECTORY_ROOTS || process.env.DIRECTORY_ROOTS
+  if (process.platform === 'win32' || configured) return roots
+
+  // Keep common places one click away while `/` remains the effective default
+  // browsing root. These are navigation shortcuts, not extra allow-list roots.
+  const candidates = process.platform === 'darwin'
+    ? [...roots, os.homedir(), '/Users', '/Volumes', '/tmp']
+    : [...roots, os.homedir(), '/mnt', '/media', path.join('/run/media', path.basename(os.homedir())), '/tmp']
+  const locations = []
+  for (const candidate of candidates) {
+    try {
+      const location = await canonicalDirectory(candidate)
+      await assertDirectoryReadable(location)
+      if (!locations.includes(location)) locations.push(location)
+    } catch {}
+  }
+  return locations
 }
 
 async function assertDirectoryAllowed(realPath, { allowFilesystemRoot = false } = {}) {
   if (process.env.ALLOW_ANY_WORKSPACE === '1') return
   const roots = await allowedDirectoryRoots()
-  if (isDirectorySelectable(realPath, roots, process.platform)) return
+  if (isDirectoryPickerSelectionAllowed(realPath, roots, { platform: process.platform })) return
   if (allowFilesystemRoot && isDirectoryNavigable(realPath, roots, { platform: process.platform })) return
   if (!roots.length && allowFilesystemRoot && realPath === path.parse(realPath).root) return
   const error = new Error('只能选择允许范围内的目录')
@@ -555,6 +616,7 @@ app.post('/api/workspace/set', async (req, res) => {
       }
       const resolved = await canonicalDirectory(newPath)
       await assertDirectoryAllowed(resolved)
+      await assertDirectoryReadable(resolved)
       await assertWorkspaceRecoveryRootsDisjoint(resolved, RECOVERY_ROOT)
       const previousWorkspace = workspace || workspaceCandidate
       const nextWorkspaceVersion = resolved !== previousWorkspace
@@ -583,9 +645,9 @@ app.get('/api/dirs', async (req, res) => {
     const requested = req.query.path || await defaultDirectoryPickerPath()
     const resolved = await canonicalDirectory(requested)
     const roots = await allowedDirectoryRoots()
-    // The picker needs to display the filesystem root on macOS/Linux so that
-    // users can reach an allowed mount. Selecting a workspace still goes
-    // through the stricter allow-list in /api/workspace/set.
+    const canSelectDirectory = await directorySelectionPolicy(roots)
+    // The picker needs to display filesystem roots and configured-root
+    // ancestors so users can navigate to allowed directories.
     if (!isDirectoryNavigable(resolved, roots, { platform: process.platform })) {
       await assertDirectoryAllowed(resolved, { allowFilesystemRoot: true })
     }
@@ -609,13 +671,23 @@ app.get('/api/dirs', async (req, res) => {
       // At a filesystem root or an allow-list ancestor, hide directories that
       // cannot lead to an allowed location instead of showing dead-end items.
       if (stat.isDirectory() && !canNavigate) continue
+      if (stat.isDirectory()) {
+        try {
+          const mode = fs.constants.R_OK | (process.platform === 'win32' ? 0 : fs.constants.X_OK)
+          await fs.access(entryPath, mode)
+        } catch {
+          // The picker follows the backend account's effective permissions.
+          // A readable but read-only directory remains selectable.
+          continue
+        }
+      }
       result.push({
         name: entry.name,
         type: stat.isDirectory() ? 'dir' : 'file',
         path: entryPath,
         parent: resolved,
         canNavigate,
-        canSelect: stat.isDirectory() && isDirectorySelectable(entryPath, roots, process.platform),
+        canSelect: stat.isDirectory() && canSelectDirectory(entryPath, roots),
       })
     }
     result.sort((a, b) => {
@@ -627,18 +699,26 @@ app.get('/api/dirs', async (req, res) => {
     const breadcrumbs = breadcrumbFor(resolved, process.platform).map(item => ({
       ...item,
       canNavigate: isDirectoryNavigable(item.path, roots, { platform: process.platform }),
-      canSelect: isDirectorySelectable(item.path, roots, process.platform),
+      canSelect: canSelectDirectory(item.path, roots),
     }))
-    const rootEntries = roots.map(root => rootEntry(root, process.platform))
+    const rootEntries = roots.map(root => ({
+      ...rootEntry(root, process.platform),
+      canSelect: canSelectDirectory(root, roots),
+    }))
+    const locationEntries = (await directoryPickerLocations(roots)).map(location => ({
+      ...rootEntry(location, process.platform),
+      canSelect: canSelectDirectory(location, roots),
+    }))
     res.json({
       platform: process.platform,
       separator: pathModuleFor(process.platform).sep,
       path: resolved,
       parent: canGoUp ? parent : null,
       canGoUp,
-      canSelect: isDirectorySelectable(resolved, roots, process.platform),
+      canSelect: canSelectDirectory(resolved, roots),
       breadcrumb: breadcrumbs,
       roots: rootEntries,
+      locations: locationEntries,
       rootPaths: roots,
       entries: result,
     })
@@ -906,12 +986,15 @@ async function handleWorkspaceUpload(req, res, { assetsOnly = false } = {}) {
     const extension = path.extname(file.originalname).toLowerCase().slice(1)
     if (assetsOnly && !IMAGE_EXTENSIONS.has(extension)) throw new Error('只允许上传图片文件')
     const ws = workspaceFor(req)
+    const documentPath = assetsOnly ? '' : req.body?.documentPath
+    if (documentPath && !IMAGE_EXTENSIONS.has(extension)) throw new Error('文档同级 assets 只允许上传图片')
     const targetPath = assetsOnly ? 'assets' : (req.body?.path || '')
     const result = await withWorkspaceMutation(ws, async () => {
-      // Image uploads always use the same assets directory, while the generic
-      // endpoint can target any existing workspace directory.
-      if (assetsOnly || targetPath === 'assets') await fs.mkdir(path.join(ws, 'assets'), { recursive: true })
-      return uploadFile(ws, targetPath, file, recoveryOptions())
+      const destination = documentPath
+        ? await ensureAdjacentAssetsDirectory(ws, documentPath)
+        : targetPath
+      if (!documentPath && (assetsOnly || targetPath === 'assets')) await fs.mkdir(path.join(ws, 'assets'), { recursive: true })
+      return uploadFile(ws, destination, file, recoveryOptions())
     })
     sendData(res, result, req)
   } catch (error) { sendError(res, error, req) }
