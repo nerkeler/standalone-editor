@@ -100,6 +100,13 @@ test('aligned tables underline their actual delimiter rows, while paragraph look
   for (const source of [':--- | plain text\n', '> :--- | plain text\n']) {
     assert.ok(!analyzeMarkdownSource(source).some(item => item.reason === 'tableAlignment'))
   }
+
+  const explicitlyLeftAligned = '| API | 路径 | 说明 |\n|:---|:---|:---|\n| A | /a | alpha |\n'
+  assert.ok(!analyzeMarkdownSource(explicitlyLeftAligned).some(item => item.reason === 'tableAlignment'))
+  const quotedLeftAligned = '> | API | 路径 | 说明 |\n> |:---|:---|:---|\n> | A | /a | alpha |\n'
+  assert.ok(analyzeMarkdownSource(quotedLeftAligned).some(item => item.reason === 'tableAlignment'))
+  const mixedAlignment = '| API | 路径 | 说明 |\n|:---|:---:|---:|\n| A | /a | alpha |\n'
+  assert.ok(analyzeMarkdownSource(mixedAlignment).some(item => item.reason === 'tableAlignment'))
 })
 
 test('angle URL and email autolinks are reported as fixable Markdown, not raw HTML', () => {
@@ -119,6 +126,17 @@ test('ordinary links with angle destinations and titles are not confused with au
   assert.ok(title)
   assert.equal(source.slice(title.from, title.to), '[x](<https://example.com> "title")')
   assert.equal(proposeSafeMarkdownRepair(source), null)
+})
+
+test('escaped decimal dots in ATX heading numbers stay rich-safe without hiding HTML warnings', () => {
+  const source = '### 1\\. 第一阶段\n\n### 2\\. 第二阶段\n'
+  assert.equal(marked.parse(source), marked.parse(source.replaceAll('\\.', '.')))
+  assert.ok(!analyzeMarkdownSource(source).some(item => item.reason === 'escapedSyntax'))
+
+  const underlined = '### 1\\. <u>第一阶段</u>\n'
+  const diagnostics = analyzeMarkdownSource(underlined)
+  assert.ok(!diagnostics.some(item => item.reason === 'escapedSyntax'))
+  assert.ok(diagnostics.some(item => item.reason === 'rawHtml'))
 })
 
 test('non-autolink angle text is not classified as raw HTML or an autolink', () => {

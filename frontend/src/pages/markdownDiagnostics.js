@@ -138,6 +138,11 @@ function collectListItemMarkers(tokens, output = [], parentItem = null, insideBl
   return output
 }
 
+function hasUnsupportedTableAlignment(token, nested = false) {
+  return token.type === 'table' && token.align?.some(Boolean) &&
+    (nested || !token.align.every(value => value === 'left'))
+}
+
 export function analyzeMarkdownSource(markdown) {
   const source = String(markdown || '')
   const items = []
@@ -221,6 +226,10 @@ export function analyzeMarkdownSource(markdown) {
     const code = [...logical.matchAll(/(`+)(.*?)\1/g)].map(match => [match.index, match.index + match[0].length])
     const escapedLiteralFootnotes = [...logical.matchAll(/\\\[\^[^\]\n]+\\\]/g)]
       .map(match => [match.index, match.index + match[0].length])
+    const numberedHeading = logical.match(/^ {0,3}#{1,6}[\t ]+\d+\\\./)
+    const safeNumberedHeadingDot = numberedHeading
+      ? [numberedHeading[0].length - 2, numberedHeading[0].length]
+      : null
     const scan = (reason, regex) => {
       for (const match of logical.matchAll(regex)) {
         const trailingLinkTitle = /^[\t ]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^\)\r\n]*\))[\t ]*\)/
@@ -231,7 +240,10 @@ export function analyzeMarkdownSource(markdown) {
             trailingLinkTitle.test(logical.slice(match.index + match[0].length)))
         if (!code.some(([start, end]) => match.index >= start && match.index < end) &&
             !insideLinkDestination &&
-            !(reason === 'escapedSyntax' && escapedLiteralFootnotes.some(([start, end]) => match.index >= start && match.index < end)) &&
+            !(reason === 'escapedSyntax' && (
+              escapedLiteralFootnotes.some(([start, end]) => match.index >= start && match.index < end) ||
+              (safeNumberedHeadingDot && match.index >= safeNumberedHeadingDot[0] && match.index < safeNumberedHeadingDot[1])
+            )) &&
             !(reason === 'rawHtml' && /^(?:<https?:\/\/|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@)/i.test(match[0]))) {
           add(reason, logicalStart + match.index, logicalStart + match.index + match[0].length)
         }
@@ -325,15 +337,14 @@ export function analyzeMarkdownSource(markdown) {
   }
 
   // Marked's token tree tells us whether a delimiter-looking row is actually
-  // part of an aligned table. Use the exact delimiter row for ordinary tables
-  // and quote-contained tables; structural fallback below covers deeper
-  // container shapes where source offsets cannot be mapped narrowly.
-  const alignedTableTokens = token => {
+  // part of a table. The rich editor preserves explicit all-left delimiters
+  // for ordinary tables; nested containers and other alignments stay protected.
+  const alignedTableTokens = (token, nested = false) => {
     const found = []
-    if (token.type === 'table' && token.align?.some(Boolean)) found.push(token)
-    for (const child of token.tokens || []) found.push(...alignedTableTokens(child))
+    if (hasUnsupportedTableAlignment(token, nested)) found.push(token)
+    for (const child of token.tokens || []) found.push(...alignedTableTokens(child, true))
     for (const item of token.items || []) {
-      for (const child of item.tokens || []) found.push(...alignedTableTokens(child))
+      for (const child of item.tokens || []) found.push(...alignedTableTokens(child, true))
     }
     return found
   }
@@ -390,7 +401,7 @@ export function analyzeMarkdownSource(markdown) {
   const collectQuotedLossyReasons = (token, inBlockquote = false, listDepth = 0) => {
     const reasons = new Set()
     const insideQuote = inBlockquote || token.type === 'blockquote'
-    if (token.type === 'table' && token.align?.some(Boolean)) reasons.add('tableAlignment')
+    if (hasUnsupportedTableAlignment(token, insideQuote || listDepth > 0)) reasons.add('tableAlignment')
     if (token.type === 'code' && insideQuote && token.lang?.trim() && !/^[\w.+#-]+$/.test(token.lang.trim())) {
       reasons.add('codeFenceMetadata')
     }

@@ -398,6 +398,39 @@ test('ordinary nested model bullets open in rich mode and keep their hierarchy a
   await saveRepairScreenshot('nested-list-rich.png')
 })
 
+test('numbered Markdown heading dots survive rich editing and save without an open-time write', async () => {
+  const fileName = 'numbered-headings.md'
+  const source = '### 1\\. 第一部分\n\n### 2\\. 第二部分\n\n### 3. 普通标题\n'
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await openFile(fileName, '第一部分')
+
+  await waitUntil('numbered headings to open in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening valid headings must leave source bytes intact')
+  assert.equal(workspacePutCount(), initialPuts, 'opening the headings must not send a workspace PUT')
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
+
+  await appendToRichEditor(' 已编辑')
+  await clickSave()
+  const saved = await waitForDiskMarker(fileName, '已编辑')
+  assert.match(saved, /### 1\\\. 第一部分/)
+  assert.match(saved, /### 2\\\. 第二部分/)
+  assert.match(saved, /### 3\. 普通标题 已编辑/)
+  assert.doesNotMatch(saved, /### 3\\\./, 'unescaped numbered headings must not gain a slash')
+
+  await setupPage()
+  await openFile(fileName, '第一部分')
+  await waitUntil('saved numbered headings to reopen in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), saved)
+  await saveRepairScreenshot('numbered-headings-rich.png')
+})
+
 test('lossy quote, reference, and multiline HTML syntax stays byte-identical on a no-op save', async () => {
   const fileName = 'lossy-structure-regression.md'
   const source = [
@@ -863,6 +896,47 @@ test('image width and alignment round-trip as adjacent portable metadata', async
   await waitUntil('reopened image node', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
   const reopened = await connection.evaluate(`(() => { const img = document.querySelector('.ProseMirror img'); return img && { width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align') } })()`)
   assert.deepEqual(reopened, { width: '75', align: 'center' }, `disk=${JSON.stringify(await readFile(path.join(workspace, fileName), 'utf8'))}`)
+})
+
+test('explicit left alignment survives rich table editing, save, and reopen', async () => {
+  const fileName = 'explicit-left-table.md'
+  const source = [
+    '# External API fixture',
+    '',
+    '| 参数 | 值 | 说明 |',
+    '|:---|:---|:---|',
+    '| `page` | `1 ~ 40` | 页号，每页 100 条 |',
+    '| `num` | `100` | 每页数量（固定） |',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  await openFile(fileName, 'External API fixture')
+
+  await waitUntil('explicitly aligned table to load in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror table') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror th, .ProseMirror td')).every(cell => cell.getAttribute('align') === 'left')`), true,
+    'Marked left alignment must survive in every header and body cell')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening an aligned table must not rewrite source')
+  assert.equal(workspacePutCount(), initialPuts, 'opening an aligned table must not send a workspace PUT')
+
+  await appendToRichEditor(' 已编辑')
+  await clickSave()
+  const saved = await waitForDiskMarker(fileName, '已编辑')
+  assert.match(saved, /^\| :--- \| :--- \| :--- \|$/m, 'saving should retain explicit left alignment delimiters')
+  assert.deepEqual(marked.lexer(saved).find(token => token.type === 'table')?.align, ['left', 'left', 'left'])
+
+  await setupPage()
+  await openFile(fileName, 'External API fixture')
+  await waitUntil('saved left alignment to reopen in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror table') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror th, .ProseMirror td')).every(cell => cell.getAttribute('align') === 'left')`), true,
+    'all reopened header and body cells must retain explicit left alignment')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), saved)
+  await saveRepairScreenshot('explicit-left-table-rich.png')
 })
 
 test('legacy zoom stays attached to the correct image even when paths repeat', async () => {

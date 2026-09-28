@@ -52,6 +52,10 @@ test('table alignment is identified from Marked table tokens', () => {
   const table = quote?.tokens?.find(token => token.type === 'table')
   assert.deepEqual(table?.align, ['left', 'right'])
   assert.deepEqual(getMarkdownSourceModeReasons(markdown), ['tableAlignment'])
+
+  const allLeft = '| API | Path | Note |\n|:---|:---|:---|\n| A | /a | alpha |'
+  assert.deepEqual(marked.lexer(allLeft).find(token => token.type === 'table')?.align, ['left', 'left', 'left'])
+  assert.deepEqual(getMarkdownSourceModeReasons(allLeft), [])
 })
 
 test('quoted lossy structures and conservative nested-list fallback require source mode', () => {

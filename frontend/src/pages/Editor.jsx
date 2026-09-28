@@ -23,6 +23,7 @@ import { Table } from '@tiptap/extension-table'
 import { TableRow } from '@tiptap/extension-table-row'
 import { TableCell } from '@tiptap/extension-table-cell'
 import { TableHeader } from '@tiptap/extension-table-header'
+import Heading from '@tiptap/extension-heading'
 import Strike from '@tiptap/extension-strike'
 import { api as axios } from '../api'
 import { marked } from 'marked'
@@ -144,6 +145,22 @@ function markdownToHtml(markdown, imageIdentity, documentPath) {
   const html = marked.parse(markdown || '')
   if (typeof DOMParser === 'undefined') return html
   const doc = new DOMParser().parseFromString(html, 'text/html')
+  const headingTokens = []
+  const collectHeadings = tokens => {
+    for (const token of tokens || []) {
+      if (token.type === 'heading') headingTokens.push(token)
+      collectHeadings(token.tokens)
+      for (const item of token.items || []) collectHeadings(item.tokens)
+    }
+  }
+  collectHeadings(marked.lexer(markdown || ''))
+  const renderedHeadings = Array.from(doc.querySelectorAll('h1,h2,h3,h4,h5,h6'))
+  headingTokens.forEach((token, index) => {
+    const sourceLine = String(token.raw || '').split(/\r?\n/, 1)[0]
+    if (/^ {0,3}#{1,6}[\t ]+\d+\\\./.test(sourceLine)) {
+      renderedHeadings[index]?.setAttribute('data-markdown-escaped-numbering-dot', 'true')
+    }
+  })
   doc.querySelectorAll('ul').forEach(list => {
     const items = Array.from(list.children).filter(node => node.nodeName === 'LI')
     if (!items.length || !items.every(item => item.querySelector('input[type="checkbox"]'))) return
@@ -226,18 +243,44 @@ function createMarkdownSerializer() {
     filter: node => node.nodeName === 'UL' && node.getAttribute('data-type') === 'taskList',
     replacement: content => `\n${content.trim()}\n`,
   })
+  td.addRule('editorNumberedHeading', {
+    filter: node => /^H[1-6]$/.test(node.nodeName) && /^\s*\d+\./.test(node.textContent || ''),
+    replacement: (content, node) => {
+      const level = Number(node.nodeName.slice(1))
+      const plainNumbering = content.replace(/^(\s*\d+)\\\./, '$1.')
+      const numbering = node.hasAttribute('data-markdown-escaped-numbering-dot')
+        ? plainNumbering.replace(/^(\s*\d+)\./, '$1\\.')
+        : plainNumbering
+      return `${'#'.repeat(level)} ${numbering}\n\n`
+    },
+  })
   td.addRule('editorTable', {
     filter: 'table',
     replacement: (content, node) => {
-      const rows = Array.from(node.querySelectorAll('tr')).map(row =>
-        Array.from(row.querySelectorAll('th,td')).map(cell =>
-          td.turndown(cell.innerHTML).trim().replace(/\|/g, '\\|').replace(/\n+/g, '<br>')
-        )
-      ).filter(row => row.length)
+      const rows = Array.from(node.querySelectorAll('tr')).map(row => {
+        const cells = Array.from(row.querySelectorAll('th,td'))
+        return {
+          cells,
+          values: cells.map(cell =>
+            td.turndown(cell.innerHTML).trim().replace(/\|/g, '\\|').replace(/\n+/g, '<br>')
+          ),
+        }
+      }).filter(row => row.values.length)
       if (!rows.length) return ''
-      const columns = Math.max(...rows.map(row => row.length))
-      const normalized = rows.map(row => Array.from({ length: columns }, (_, index) => row[index] || ''))
-      const separator = normalized[0].map(() => '---')
+      const columns = Math.max(...rows.map(row => row.values.length))
+      const normalized = rows.map(row => Array.from({ length: columns }, (_, index) => row.values[index] || ''))
+      const alignments = Array.from({ length: columns }, (_, index) => {
+        const values = rows
+          .map(row => row.cells[index]?.getAttribute('align')?.toLowerCase())
+          .filter(value => ['left', 'center', 'right'].includes(value))
+        return values.length && values.every(value => value === values[0]) ? values[0] : null
+      })
+      const separator = alignments.map(alignment => {
+        if (alignment === 'left') return ':---'
+        if (alignment === 'right') return '---:'
+        if (alignment === 'center') return ':---:'
+        return '---'
+      })
       const lines = [
         `| ${normalized[0].join(' | ')} |`,
         `| ${separator.join(' | ')} |`,
@@ -291,6 +334,47 @@ const MarkdownImage = Image.extend({
         renderHTML: attributes => attributes.legacyZoom
           ? { 'data-legacy-zoom': attributes.legacyZoom, style: `zoom:${attributes.legacyZoom}%` }
           : {},
+      },
+    }
+  },
+})
+
+const MarkdownHeading = Heading.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      escapedNumberingDot: {
+        default: false,
+        parseHTML: element => element.getAttribute('data-markdown-escaped-numbering-dot') === 'true',
+        renderHTML: attributes => attributes.escapedNumberingDot
+          ? { 'data-markdown-escaped-numbering-dot': 'true' }
+          : {},
+      },
+    }
+  },
+})
+
+const MarkdownTableCell = TableCell.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      textAlign: {
+        default: null,
+        parseHTML: element => element.getAttribute('align'),
+        renderHTML: attributes => attributes.textAlign ? { align: attributes.textAlign } : {},
+      },
+    }
+  },
+})
+
+const MarkdownTableHeader = TableHeader.extend({
+  addAttributes() {
+    return {
+      ...this.parent?.(),
+      textAlign: {
+        default: null,
+        parseHTML: element => element.getAttribute('align'),
+        renderHTML: attributes => attributes.textAlign ? { align: attributes.textAlign } : {},
       },
     }
   },
@@ -558,7 +642,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3, 4, 5, 6] }, strike: false, codeBlock: false }),
+      StarterKit.configure({ heading: false, strike: false, codeBlock: false }),
+      MarkdownHeading.configure({ levels: [1, 2, 3, 4, 5, 6] }),
       CodeBlockLowlight.configure({ lowlight, defaultLanguage: 'plaintext' }),
       MarkdownImage.configure({ inline: false, allowBase64: true }),
       Link.configure({ openOnClick: false }),
@@ -567,8 +652,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       TaskItem.configure({ nested: true }),
       Table.configure({ resizable: true }),
       TableRow,
-      TableCell,
-      TableHeader,
+      MarkdownTableCell,
+      MarkdownTableHeader,
       Strike,
     ],
   }, [])
