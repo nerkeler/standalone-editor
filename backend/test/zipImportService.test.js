@@ -130,3 +130,68 @@ test('rolls back an earlier committed file and created directories after a later
 
   assert.deepEqual(await fs.readdir(workspace), [])
 })
+
+test('rollback leaves a concurrent replacement at a committed path untouched', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-replaced-')
+  const archive = createZip([
+    { name: 'nested/first.md', data: 'imported' },
+    { name: 'nested/second.md', data: 'second' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'nested/second.md') {
+        await fs.unlink(path.join(workspace, 'nested', 'first.md'))
+        await fs.writeFile(path.join(workspace, 'nested', 'first.md'), 'concurrent replacement')
+        throw new Error('injected later failure')
+      }
+    },
+  }), /injected later failure/)
+
+  assert.equal(await fs.readFile(path.join(workspace, 'nested', 'first.md'), 'utf8'), 'concurrent replacement')
+})
+
+test('rollback leaves a replaced import directory untouched', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-directory-replaced-')
+  const archive = createZip([
+    { name: 'nested/first.md', data: 'imported' },
+    { name: 'nested/second.md', data: 'second' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'nested/second.md') {
+        await fs.unlink(path.join(workspace, 'nested', 'first.md'))
+        await fs.rmdir(path.join(workspace, 'nested'))
+        await fs.mkdir(path.join(workspace, 'nested'))
+        await fs.writeFile(path.join(workspace, 'nested', 'sentinel.md'), 'concurrent directory')
+        throw new Error('injected later failure')
+      }
+    },
+  }), /injected later failure/)
+
+  assert.equal(await fs.readFile(path.join(workspace, 'nested', 'sentinel.md'), 'utf8'), 'concurrent directory')
+})
+
+test('import rejects a parent replaced by a symlink before the next commit and avoids unsafe rollback', async t => {
+  if (process.platform === 'win32') return t.skip('symlink creation may require administrator privileges')
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-parent-')
+  const outside = await temporaryDirectory(t, 'standalone-editor-zip-outside-')
+  await fs.writeFile(path.join(outside, 'second.md'), 'outside value')
+  const archive = createZip([
+    { name: 'folder/first.md', data: 'first' },
+    { name: 'folder/second.md', data: 'second' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'folder/second.md') {
+        await fs.rename(path.join(workspace, 'folder'), path.join(workspace, 'held'))
+        await fs.symlink(outside, path.join(workspace, 'folder'))
+      }
+    },
+  }), error => error.code === 'INVALID_ARCHIVE')
+
+  assert.equal(await fs.readFile(path.join(outside, 'second.md'), 'utf8'), 'outside value')
+  assert.equal(await fs.readFile(path.join(workspace, 'held', 'first.md'), 'utf8'), 'first')
+})

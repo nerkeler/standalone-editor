@@ -83,6 +83,9 @@ let workspaceSelectionTail = Promise.resolve()
 function errorStatus(error) {
   const permissionFailure = permissionErrorResponse(error)
   if (permissionFailure) return permissionFailure.status
+  if (error instanceof multer.MulterError) {
+    return error.code?.startsWith('LIMIT_') && error.code !== 'LIMIT_UNEXPECTED_FILE' ? 413 : 400
+  }
   if (
     error?.code === 'CONFLICT' || error?.code === 'FILE_CONFLICT' ||
     error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH'
@@ -540,7 +543,27 @@ app.use((req, res, next) => {
   parser(req, res, next)
 })
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 100 * 1024 * 1024 } })
+// Uploads contain one file and at most the path and documentPath text fields.
+// Keep the 100 MiB file ceiling used by ZIP import, while bounding every
+// multipart dimension that can otherwise consume parser time or memory.
+const uploadSingleFile = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 100 * 1024 * 1024,
+    files: 1,
+    fields: 2,
+    parts: 3,
+    fieldNameSize: 32,
+    fieldSize: 8 * 1024,
+    fieldNestingDepth: 0,
+    fieldArrayIndexLimit: 0,
+    headerPairs: 16,
+  },
+}).single('file')
+
+function parseUpload(req, res, next) {
+  uploadSingleFile(req, res, error => error ? sendError(res, error, req) : next())
+}
 
 // Every editor operation carries the workspace identity obtained from
 // /api/workspace/check or /api/workspace/set. A window left on an old
@@ -1019,8 +1042,8 @@ async function handleWorkspaceUpload(req, res, { assetsOnly = false } = {}) {
 
 // The workspace upload route is canonical. Keep the short assets alias for
 // existing clients while both routes share the same implementation.
-app.post('/api/workspace/upload', workspaceGuard, upload.single('file'), (req, res) => handleWorkspaceUpload(req, res))
-app.post('/api/upload/assets', workspaceGuard, upload.single('file'), (req, res) => handleWorkspaceUpload(req, res, { assetsOnly: true }))
+app.post('/api/workspace/upload', workspaceGuard, parseUpload, (req, res) => handleWorkspaceUpload(req, res))
+app.post('/api/upload/assets', workspaceGuard, parseUpload, (req, res) => handleWorkspaceUpload(req, res, { assetsOnly: true }))
 
 app.get('/api/workspace/assets/:filename', workspaceGuard, async (req, res) => {
   try {
@@ -1107,7 +1130,7 @@ app.get('/api/workspace/download', workspaceGuard, async (req, res) => {
 
 // 从 ZIP 导入 Markdown 和图片。服务会先验证并暂存全部内容，再排他写入；
 // 路径、父目录和目标冲突都在工作空间变更锁内检查。
-app.post('/api/workspace/import', workspaceGuard, upload.single('file'), async (req, res) => {
+app.post('/api/workspace/import', workspaceGuard, parseUpload, async (req, res) => {
   try {
     if (!req.file) throw new Error('缺少导入文件')
     if (path.extname(req.file.originalname).toLowerCase() !== '.zip') throw new Error('只允许导入 .zip 文件')

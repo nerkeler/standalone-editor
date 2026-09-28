@@ -394,6 +394,28 @@
 .document-tab:not(.is-active):hover,
 .document-tab:not(.is-active):focus-visible { opacity: 1; }
 
+.document-tab-select {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  gap: 7px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.document-tab-select:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -3px;
+  border-radius: 4px;
+}
+
 .document-tab-title {
   flex: 1 1 auto;
   min-width: 0;

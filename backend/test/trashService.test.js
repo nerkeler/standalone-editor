@@ -60,6 +60,81 @@ test('restore refuses to overwrite an item created at the original path', async 
   assert.equal((await trash.list()).length, 1)
 })
 
+test('restore refuses a file created after parent validation', async t => {
+  const { workspace, recovery } = await workspaceFixture(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'trashed')
+  const normal = createTrashService(workspace, { recoveryRoot: recovery })
+  const { id } = await normal.trash('note.md')
+  const racing = createTrashService(workspace, {
+    recoveryRoot: recovery,
+    beforeRestoreCommit: async () => fs.writeFile(path.join(workspace, 'note.md'), 'newer'),
+  })
+
+  await assert.rejects(racing.restore(id), error => error.code === 'CONFLICT')
+  assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'newer')
+  assert.equal((await normal.list()).length, 1)
+})
+
+test('file restore copies exclusively when hard links are unavailable', async t => {
+  const { workspace, recovery } = await workspaceFixture(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'trashed')
+  const normal = createTrashService(workspace, { recoveryRoot: recovery })
+  const { id } = await normal.trash('note.md')
+  const fallback = createTrashService(workspace, {
+    recoveryRoot: recovery,
+    async linkFile() {
+      const error = new Error('hard links unavailable')
+      error.code = 'EXDEV'
+      throw error
+    },
+  })
+
+  assert.deepEqual(await fallback.restore(id), { success: true, path: 'note.md' })
+  assert.equal(await fs.readFile(path.join(workspace, 'note.md'), 'utf8'), 'trashed')
+  assert.deepEqual(await normal.list(), [])
+})
+
+test('restore refuses a directory populated after parent validation', async t => {
+  const { workspace, recovery } = await workspaceFixture(t)
+  await fs.mkdir(path.join(workspace, 'folder'))
+  await fs.writeFile(path.join(workspace, 'folder', 'old.md'), 'trashed')
+  const normal = createTrashService(workspace, { recoveryRoot: recovery })
+  const { id } = await normal.trash('folder')
+  const racing = createTrashService(workspace, {
+    recoveryRoot: recovery,
+    async beforeRestoreCommit() {
+      await fs.mkdir(path.join(workspace, 'folder'))
+      await fs.writeFile(path.join(workspace, 'folder', 'new.md'), 'newer')
+    },
+  })
+
+  await assert.rejects(racing.restore(id), error => error.code === 'CONFLICT')
+  assert.equal(await fs.readFile(path.join(workspace, 'folder', 'new.md'), 'utf8'), 'newer')
+  assert.equal((await normal.list()).length, 1)
+})
+
+test('restore rejects a parent replaced by a symlink after validation', async t => {
+  if (process.platform === 'win32') return t.skip('symlink creation may require administrator privileges')
+  const { workspace, recovery } = await workspaceFixture(t)
+  const outside = await tempDirectory(t, 'standalone-editor-trash-outside-')
+  await fs.mkdir(path.join(workspace, 'folder'))
+  await fs.writeFile(path.join(workspace, 'folder', 'note.md'), 'trashed')
+  const normal = createTrashService(workspace, { recoveryRoot: recovery })
+  const { id } = await normal.trash('folder/note.md')
+  await fs.writeFile(path.join(outside, 'note.md'), 'outside value')
+  const racing = createTrashService(workspace, {
+    recoveryRoot: recovery,
+    async beforeRestoreCommit() {
+      await fs.rename(path.join(workspace, 'folder'), path.join(workspace, 'held'))
+      await fs.symlink(outside, path.join(workspace, 'folder'))
+    },
+  })
+
+  await assert.rejects(racing.restore(id), error => error.code === 'INVALID_PATH')
+  assert.equal(await fs.readFile(path.join(outside, 'note.md'), 'utf8'), 'outside value')
+  assert.equal((await normal.list()).length, 1)
+})
+
 test('trash rejects symlinks without moving the source', async t => {
   if (process.platform === 'win32') return t.skip('symlink creation may require administrator privileges')
   const { workspace, recovery } = await workspaceFixture(t)

@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { assertSameEntry, openWorkspaceParent } from './workspacePathGuard.js'
 import { randomUUID } from 'node:crypto'
 import { inflateRaw } from 'node:zlib'
 import { promisify } from 'node:util'
@@ -316,25 +317,50 @@ async function makeDirectories(base, targetDirectory, createdDirectories) {
       if (stat.isSymbolicLink() || !stat.isDirectory()) throw zipError('导入目录包含非法符号链接或文件')
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
+      const guard = await openWorkspaceParent(base, current, zipError)
       try {
+        await guard.check()
         await fs.mkdir(current, { mode: 0o700 })
-        createdDirectories.push(current)
+        createdDirectories.push({ path: current, stat: await fs.lstat(current) })
       } catch (mkdirError) {
         if (mkdirError.code !== 'EEXIST') throw mkdirError
         const stat = await fs.lstat(current)
         if (stat.isSymbolicLink() || !stat.isDirectory()) throw zipError('导入目录包含非法符号链接或文件')
+      } finally {
+        await guard.close()
       }
     }
   }
 }
 
-async function writeExclusive(destination, content, createdFiles) {
-  const handle = await fs.open(destination, 'wx', 0o600)
-  createdFiles.push(destination)
+async function writeExclusive(base, destination, content, createdFiles) {
+  const guard = await openWorkspaceParent(base, destination, zipError)
   try {
-    await handle.writeFile(content)
+    await guard.check()
+    const handle = await fs.open(destination, 'wx', 0o600)
+    createdFiles.push({ path: destination, stat: await handle.stat() })
+    try {
+      await handle.writeFile(content)
+    } finally {
+      await handle.close()
+    }
   } finally {
-    await handle.close()
+    await guard.close()
+  }
+}
+
+async function removeCreated(base, entry, remove) {
+  try {
+    const guard = await openWorkspaceParent(base, entry.path, zipError)
+    try {
+      await guard.check()
+      await assertSameEntry(entry.path, entry.stat, zipError)
+      await remove(entry.path)
+    } finally {
+      await guard.close()
+    }
+  } catch {
+    // A changed path belongs to another actor. Never remove it by name.
   }
 }
 
@@ -389,7 +415,15 @@ export async function importZip(workspace, archive, options = {}) {
   }
 
   const stagingDirectory = path.join(realWorkspace, `.standalone-editor-import-${randomUUID()}.staging`)
-  await fs.mkdir(stagingDirectory, { mode: 0o700 })
+  const stagingGuard = await openWorkspaceParent(realWorkspace, stagingDirectory, zipError)
+  let stagingStat
+  try {
+    await stagingGuard.check()
+    await fs.mkdir(stagingDirectory, { mode: 0o700 })
+    stagingStat = await fs.lstat(stagingDirectory)
+  } finally {
+    await stagingGuard.close()
+  }
   const createdFiles = []
   const createdDirectories = []
   try {
@@ -407,15 +441,16 @@ export async function importZip(workspace, archive, options = {}) {
       await makeDirectories(realWorkspace, path.dirname(destination), createdDirectories)
       if (typeof options.beforeCommitFile === 'function') await options.beforeCommitFile(entry.name)
       const data = await fs.readFile(stagedPath)
-      await writeExclusive(destination, data, createdFiles)
+      await writeExclusive(realWorkspace, destination, data, createdFiles)
     }
     return { imported: staged.length, files: staged.map(item => item.entry.name) }
   } catch (error) {
-    for (const file of createdFiles.reverse()) await fs.unlink(file).catch(() => {})
-    for (const directory of createdDirectories.reverse()) await fs.rmdir(directory).catch(() => {})
+    for (const file of createdFiles.reverse()) await removeCreated(realWorkspace, file, filePath => fs.unlink(filePath))
+    for (const directory of createdDirectories.reverse()) await removeCreated(realWorkspace, directory, directoryPath => fs.rmdir(directoryPath))
     throw error
   } finally {
-    await fs.rm(stagingDirectory, { recursive: true, force: true }).catch(() => {})
+    await removeCreated(realWorkspace, { path: stagingDirectory, stat: stagingStat },
+      directoryPath => fs.rm(directoryPath, { recursive: true, force: true }))
   }
 }
 

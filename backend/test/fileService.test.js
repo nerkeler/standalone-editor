@@ -184,6 +184,25 @@ test('recursive tree uses the workspace-relative shape and omits hidden and syml
   ])
 })
 
+test('recursive tree keeps readable siblings when one child directory is unreadable', async t => {
+  if (process.platform === 'win32' || process.getuid?.() === 0) return t.skip('permission bits are not enforced here')
+  const workspace = await temporaryWorkspace(t)
+  const unreadable = path.join(workspace, 'restricted')
+  await fs.mkdir(unreadable)
+  await fs.writeFile(path.join(unreadable, 'hidden.md'), 'private')
+  await fs.mkdir(path.join(workspace, 'readable'))
+  await fs.writeFile(path.join(workspace, 'readable', 'visible.md'), 'visible')
+  await fs.chmod(unreadable, 0o000)
+  try {
+    const tree = await listTree(workspace)
+    assert.ok(tree.some(item => item.path === 'readable/visible.md'))
+    assert.ok(tree.some(item => item.path === 'restricted' && item.type === 'dir'))
+    assert.ok(!tree.some(item => item.path === 'restricted/hidden.md'))
+  } finally {
+    await fs.chmod(unreadable, 0o700)
+  }
+})
+
 test('recursive tree handles a large flat and nested workspace', async t => {
   const workspace = await temporaryWorkspace(t)
   const expected = []
@@ -599,6 +618,104 @@ test('file moves migrate source history and preserve old destination history as 
   const restored = await restoreFileHistory(workspace, 'renamed/two.md', migrated.history[0].id, now.revision, { root: recovery })
   assert.equal(restored.revision, two.revision)
   assert.equal(await fs.readFile(path.join(workspace, 'renamed', 'two.md'), 'utf8'), 'two')
+})
+
+test('move refuses a destination created after its initial collision check', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'source.md'), 'source')
+  await fs.writeFile(path.join(workspace, 'target.md'), 'old occupant')
+  const old = await readFile(workspace, 'target.md')
+  await writeFile(workspace, 'target.md', 'old updated', old.revision, { root: recovery })
+  await fs.unlink(path.join(workspace, 'target.md'))
+  let injected = false
+
+  await assert.rejects(moveItem(workspace, 'source.md', 'target.md', {
+    root: recovery,
+    async moveHistoryBucket(from, to) {
+      injected = true
+      await fs.writeFile(path.join(workspace, 'target.md'), 'concurrent occupant')
+      await fs.rename(from, to)
+    },
+  }), error => error.code === 'CONFLICT')
+
+  assert.equal(injected, true)
+  assert.equal(await fs.readFile(path.join(workspace, 'source.md'), 'utf8'), 'source')
+  assert.equal(await fs.readFile(path.join(workspace, 'target.md'), 'utf8'), 'concurrent occupant')
+})
+
+test('file move uses an exclusive verified copy when hard links are unavailable', async t => {
+  const workspace = await temporaryWorkspace(t)
+  await fs.writeFile(path.join(workspace, 'source.md'), 'copy fallback', { mode: 0o640 })
+  const unavailableLink = async () => {
+    const error = new Error('hard links unavailable')
+    error.code = 'ENOTSUP'
+    throw error
+  }
+
+  await moveItem(workspace, 'source.md', 'target.md', { linkFile: unavailableLink })
+
+  await assert.rejects(fs.lstat(path.join(workspace, 'source.md')), error => error.code === 'ENOENT')
+  assert.equal(await fs.readFile(path.join(workspace, 'target.md'), 'utf8'), 'copy fallback')
+  if (process.platform !== 'win32') assert.equal((await fs.stat(path.join(workspace, 'target.md'))).mode & 0o777, 0o640)
+})
+
+test('directory move refuses a populated destination created after its initial check', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.mkdir(path.join(workspace, 'source'))
+  await fs.writeFile(path.join(workspace, 'source', 'child.md'), 'source')
+  await fs.mkdir(path.join(workspace, 'target'))
+  await fs.writeFile(path.join(workspace, 'target', 'old.md'), 'old')
+  const old = await readFile(workspace, 'target/old.md')
+  await writeFile(workspace, 'target/old.md', 'old updated', old.revision, { root: recovery })
+  await fs.rm(path.join(workspace, 'target'), { recursive: true })
+  let injected = false
+
+  await assert.rejects(moveItem(workspace, 'source', 'target', {
+    root: recovery,
+    async moveHistoryBucket(from, to) {
+      injected = true
+      await fs.mkdir(path.join(workspace, 'target'))
+      await fs.writeFile(path.join(workspace, 'target', 'concurrent.md'), 'concurrent')
+      await fs.rename(from, to)
+    },
+  }), error => error.code === 'HISTORY_ARCHIVE_ROLLBACK_FAILED' && error.cause?.code === 'CONFLICT')
+
+  assert.equal(injected, true)
+  assert.equal(await fs.readFile(path.join(workspace, 'source', 'child.md'), 'utf8'), 'source')
+  assert.equal(await fs.readFile(path.join(workspace, 'target', 'concurrent.md'), 'utf8'), 'concurrent')
+})
+
+test('move rejects a source parent replaced by a symlink during history archiving', async t => {
+  if (process.platform === 'win32') return t.skip('symlink creation may require administrator privileges')
+  const workspace = await temporaryWorkspace(t)
+  const outside = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.mkdir(path.join(workspace, 'folder'))
+  await fs.writeFile(path.join(workspace, 'folder', 'source.md'), 'source')
+  await fs.writeFile(path.join(workspace, 'target.md'), 'old occupant')
+  const old = await readFile(workspace, 'target.md')
+  await writeFile(workspace, 'target.md', 'old updated', old.revision, { root: recovery })
+  await fs.unlink(path.join(workspace, 'target.md'))
+  await fs.writeFile(path.join(outside, 'source.md'), 'outside value')
+  let swapped = false
+
+  await assert.rejects(moveItem(workspace, 'folder/source.md', 'target.md', {
+    root: recovery,
+    async moveHistoryBucket(from, to) {
+      if (!swapped) {
+        swapped = true
+        await fs.rename(path.join(workspace, 'folder'), path.join(workspace, 'held'))
+        await fs.symlink(outside, path.join(workspace, 'folder'))
+      }
+      await fs.rename(from, to)
+    },
+  }), error => error.code === 'HISTORY_ARCHIVE_ROLLBACK_FAILED' && error.cause?.code === 'INVALID_PATH')
+
+  assert.equal(await fs.readFile(path.join(outside, 'source.md'), 'utf8'), 'outside value')
+  assert.equal(await fs.readFile(path.join(workspace, 'held', 'source.md'), 'utf8'), 'source')
+  await assert.rejects(fs.lstat(path.join(workspace, 'target.md')), error => error.code === 'ENOENT')
 })
 
 test('trash history is separated from same-path files and remains restorable after path reuse', async t => {

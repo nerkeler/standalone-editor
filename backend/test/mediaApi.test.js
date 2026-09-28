@@ -165,6 +165,58 @@ test('workspace media route serves nested images safely and preserves the legacy
   }
 })
 
+test('upload limits reject abusive multipart fields and allow the full editor form', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-upload-limits-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-upload-limits-recovery-')
+  const baseUrl = await startBackend(t, workspace, recovery)
+  const check = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const headers = {
+    'X-Workspace-Id': check.workspaceId,
+    'X-Workspace-Version': String(check.workspaceVersion),
+  }
+  const upload = form => fetch(`${baseUrl}/api/workspace/upload`, { method: 'POST', headers, body: form })
+  const image = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+
+  const indexedFields = new FormData()
+  indexedFields.append('items[4294967294]', 'x')
+  indexedFields.append('items[label]', 'y')
+  indexedFields.append('file', new Blob([image]), 'blocked.png')
+  const indexedResponse = await upload(indexedFields)
+  assert.equal(indexedResponse.status, 413)
+  assert.equal((await indexedResponse.json()).code, 'LIMIT_FIELD_NESTING')
+
+  const oversizedField = new FormData()
+  oversizedField.append('path', 'a'.repeat(8 * 1024 + 1))
+  oversizedField.append('file', new Blob([image]), 'blocked.png')
+  const oversizedResponse = await upload(oversizedField)
+  assert.equal(oversizedResponse.status, 413)
+  assert.equal((await oversizedResponse.json()).code, 'LIMIT_FIELD_VALUE')
+
+  const extraFields = new FormData()
+  extraFields.append('path', 'assets')
+  extraFields.append('documentPath', '')
+  extraFields.append('extra', 'unused')
+  extraFields.append('file', new Blob([image]), 'blocked.png')
+  const extraResponse = await upload(extraFields)
+  assert.equal(extraResponse.status, 413)
+  assert.match((await extraResponse.json()).code, /^LIMIT_(FIELD_COUNT|PART_COUNT)$/)
+  assert.equal(await fs.access(path.join(workspace, 'assets', 'blocked.png')).then(() => true, () => false), false)
+
+  const validForm = new FormData()
+  validForm.append('file', new Blob([image]), 'valid.png')
+  validForm.append('path', 'assets')
+  validForm.append('documentPath', '')
+  const validResponse = await upload(validForm)
+  assert.equal(validResponse.status, 200)
+  assert.deepEqual(await fs.readFile(path.join(workspace, 'assets', 'valid.png')), image)
+
+  const legacyForm = new FormData()
+  legacyForm.append('file', new Blob([image]), 'legacy.png')
+  const legacyResponse = await fetch(`${baseUrl}/api/upload/assets`, { method: 'POST', headers, body: legacyForm })
+  assert.equal(legacyResponse.status, 200)
+  assert.deepEqual(await fs.readFile(path.join(workspace, 'assets', 'legacy.png')), image)
+})
+
 test('same-level asset upload returns the normalized permission error for a read-only directory', async t => {
   if (process.platform === 'win32' || process.getuid?.() === 0) {
     return t.skip('requires POSIX permission checks under a non-root backend account')

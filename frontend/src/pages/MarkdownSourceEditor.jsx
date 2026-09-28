@@ -38,6 +38,25 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({ value, o
   useImperativeHandle(ref, () => ({
     nextProtected() { if (viewRef.current) nextDiagnostic(viewRef.current) },
     focus() { viewRef.current?.focus() },
+    goToPosition(position) {
+      const view = viewRef.current
+      if (!view || !Number.isInteger(position)) return false
+      view.dispatch({ selection: { anchor: Math.max(0, Math.min(position, view.state.doc.length)) }, scrollIntoView: true })
+      view.focus()
+      return true
+    },
+    insertMarkdownImage(markdownSrc) {
+      const view = viewRef.current
+      if (!view || !markdownSrc) return false
+      const { from, to } = view.state.selection.main
+      const image = `![](${markdownSrc})`
+      const original = view.state.doc.toString()
+      const expected = original.slice(0, from) + image + original.slice(to)
+      view.dispatch({ changes: { from, to, insert: image }, selection: { anchor: from + image.length }, scrollIntoView: true })
+      if (view.state.doc.toString() !== expected) return false
+      view.focus()
+      return true
+    },
   }), [])
 
   useEffect(() => {

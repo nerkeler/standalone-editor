@@ -74,6 +74,7 @@ class DevToolsConnection {
     this.networkRequests = []
     this.pausedFetchRequests = []
     this.pauseNextWorkspacePut = false
+    this.pauseNextWorkspaceUpload = false
     this.acceptBeforeUnload = false
     socket.addEventListener('message', event => {
       const message = JSON.parse(event.data.toString())
@@ -91,6 +92,9 @@ class DevToolsConnection {
           const request = paused.request || {}
           if (this.pauseNextWorkspacePut && request.method === 'PUT' && request.url.includes('/api/workspace')) {
             this.pauseNextWorkspacePut = false
+            this.pausedFetchRequests.push(paused)
+          } else if (this.pauseNextWorkspaceUpload && request.method === 'POST' && request.url.includes('/api/workspace/upload')) {
+            this.pauseNextWorkspaceUpload = false
             this.pausedFetchRequests.push(paused)
           } else {
             this.send('Fetch.continueRequest', { requestId: paused.requestId }).catch(error => appendLog('fetch continue', error.message))
@@ -231,6 +235,18 @@ async function appendToRichEditor(text) {
   await connection.send('Input.insertText', { text })
 }
 
+async function selectImageFile(name, bytes) {
+  return connection.evaluate(`(() => {
+    const input = document.querySelector('#img-up');
+    if (!input) return false;
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(${JSON.stringify([...bytes])})], ${JSON.stringify(name)}, { type: 'image/png' }));
+    Object.defineProperty(input, 'files', { configurable: true, value: transfer.files });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`)
+}
+
 async function clickSave() {
   await connection.evaluate(`document.querySelector('[aria-label="保存当前文件"]')?.click()`)
 }
@@ -354,6 +370,148 @@ test('complex Markdown opens in source mode and rich conversion requires explici
     `Boolean(document.querySelector('.source-editor .cm-content')) && !document.querySelector('.ProseMirror')`,
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), fixture)
+})
+
+test('source image upload inserts at the CodeMirror cursor, saves, and source outline tracks live headings', async () => {
+  const richFile = 'rich-before-source.md'
+  const sourceFile = 'source-image-outline.md'
+  const sourceSeed = '---\nmode: source\n---\n# Source first\n\n## Source second\n\n```md\n# Fenced false heading\n```\n\nSetext source\n-------------\n\nCursor: \n'
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  await writeFile(path.join(workspace, richFile), '# Hidden rich heading\n\nRich body\n')
+  await writeFile(path.join(workspace, sourceFile), sourceSeed)
+  await setupPage()
+  await openFile(richFile, 'Hidden rich heading')
+  await openFile(sourceFile, 'Source first')
+
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.editor-toolbar [aria-label="加粗"], .editor-toolbar [aria-label="插入链接"], .editor-toolbar [aria-label="插入表格"]'))`), false, 'rich tools must not target the hidden editor')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.editor-toolbar [aria-label="上传图片"]'))`), true)
+  await connection.evaluate(`document.querySelector('.editor-toolbar [aria-label="显示右侧大纲"]')?.click()`)
+  const outline = await waitUntil('source outline, excluding the old rich heading and fenced code', () => connection.evaluate(
+    `(() => { const items = Array.from(document.querySelectorAll('.outline-panel .outline-item')).map(item => item.innerText.trim()); return items.length === 3 ? items : null })()`,
+  ))
+  assert.match(outline[0], /Source first/)
+  assert.match(outline[1], /Source second/)
+  assert.match(outline[2], /Setext source/)
+  assert.doesNotMatch(outline.join(' '), /Hidden rich|Fenced false/)
+  await connection.evaluate(`Array.from(document.querySelectorAll('.outline-panel .outline-item')).find(item => item.innerText.includes('Source second'))?.click()`)
+  assert.equal(await connection.evaluate(`(() => { const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view; return view?.state.selection.main.head === view?.state.doc.toString().indexOf('## Source second') })()`), true, 'outline click must select the source heading')
+  await connection.evaluate(`Array.from(document.querySelectorAll('.outline-panel .outline-item')).find(item => item.innerText.includes('Setext source'))?.click()`)
+  assert.equal(await connection.evaluate(`(() => { const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view; return view?.state.selection.main.head === view?.state.doc.toString().indexOf('Setext source') })()`), true, 'Setext outline click must select its source heading')
+
+  await connection.evaluate(`(() => { const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view; const from = view.state.doc.toString().indexOf('Source second'); view.dispatch({ selection: { anchor: from, head: from + 'Source second'.length } }); view.focus() })()`)
+  await connection.send('Input.insertText', { text: 'Live second' })
+  await waitUntil('source outline to update after typing', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.outline-panel .outline-item')).some(item => item.innerText.includes('Live second'))`,
+  ))
+
+  await connection.evaluate(`(() => { const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view; const cursor = view.state.doc.toString().indexOf('Cursor: ') + 'Cursor: '.length; view.dispatch({ selection: { anchor: cursor } }); view.focus() })()`)
+  const pickerOpened = await connection.evaluate(`(() => { const input = document.querySelector('#img-up'); input?.addEventListener('click', event => { event.preventDefault(); window.__sourceImagePickerOpened = true }, { once: true }); document.querySelector('.editor-toolbar [aria-label="上传图片"]')?.click(); return Boolean(window.__sourceImagePickerOpened) })()`)
+  assert.equal(pickerOpened, true)
+  assert.equal(await selectImageFile('source image.png', imageBytes), true)
+  const insertedImage = 'Cursor: ![](assets/source%20image.png)'
+  await waitUntil('relative image at the CodeMirror cursor', () => connection.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(insertedImage)})`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.ant-message')?.innerText.includes('图片已插入')`), true)
+  await waitForDiskMarker(sourceFile, insertedImage)
+  assert.deepEqual(await readFile(path.join(workspace, 'assets', 'source image.png')), imageBytes)
+  const saved = await readFile(path.join(workspace, sourceFile), 'utf8')
+  assert.match(saved, /^---\nmode: source\n---/)
+  assert.match(saved, /## Live second/)
+  assert.doesNotMatch(saved, /\/api\/workspace\/media\//)
+
+  await waitUntil('success toast to finish before failure check', () => connection.evaluate(`!document.querySelector('.ant-message-success')`))
+  assert.equal(await selectImageFile('source image.png', imageBytes), true)
+  await waitUntil('duplicate image upload to fail', () => connection.evaluate(`document.querySelector('.ant-message-error')?.innerText.includes('上传失败')`))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), saved)
+  assert.equal(await readFile(path.join(workspace, sourceFile), 'utf8'), saved)
+
+  await connection.send('Fetch.enable', { patterns: [{ urlPattern: '*api/workspace/upload*', requestStage: 'Request' }] })
+  connection.pauseNextWorkspaceUpload = true
+  assert.equal(await selectImageFile('after-switch.png', imageBytes), true)
+  const pausedUpload = await waitUntil('second image upload to pause', () => (
+    connection.pausedFetchRequests.find(item => item.request?.method === 'POST' && item.request.url.includes('/api/workspace/upload'))
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.document-tab')).find(tab => tab.innerText.includes(${JSON.stringify(richFile)}))?.click()`)
+  await waitUntil('rich tab active while upload is pending', () => connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('Rich body')`))
+  await connection.send('Fetch.continueRequest', { requestId: pausedUpload.requestId })
+  await waitUntil('upload completion to report the changed document', () => connection.evaluate(
+    `document.querySelector('.ant-message-info')?.innerText.includes('当前文档已变化，未插入')`,
+  ))
+  await connection.send('Fetch.disable')
+  assert.equal(await readFile(path.join(workspace, sourceFile), 'utf8'), saved)
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('after-switch.png')`), false)
+
+  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await waitUntil('rich file switched to source before upload', () => connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
+  await connection.send('Fetch.enable', { patterns: [{ urlPattern: '*api/workspace/upload*', requestStage: 'Request' }] })
+  connection.pauseNextWorkspaceUpload = true
+  assert.equal(await selectImageFile('after-mode-switch.png', imageBytes), true)
+  const pausedModeUpload = await waitUntil('source upload to pause before mode switch', () => (
+    connection.pausedFetchRequests.find(item => item.request?.method === 'POST' && item.request.url.includes('/api/workspace/upload') && item.requestId !== pausedUpload.requestId)
+  ))
+  await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
+  await waitUntil('rich mode restored while upload is pending', () => connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('Rich body')`))
+  await connection.send('Fetch.continueRequest', { requestId: pausedModeUpload.requestId })
+  await waitUntil('mode change to report no insertion', () => connection.evaluate(
+    `document.querySelector('.ant-message-info')?.innerText.includes('当前文档已变化，未插入')`,
+  ))
+  await connection.send('Fetch.disable')
+  assert.equal(await readFile(path.join(workspace, richFile), 'utf8'), '# Hidden rich heading\n\nRich body\n')
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('after-mode-switch.png')`), false)
+})
+
+test('document tabs can be selected with the keyboard without closing adjacent tabs', async () => {
+  const first = 'keyboard-first.md'
+  const second = 'keyboard-second.md'
+  await writeFile(path.join(workspace, first), '# Keyboard first\n')
+  await writeFile(path.join(workspace, second), '# Keyboard second\n')
+  await setupPage()
+  await openFile(first, 'Keyboard first')
+  await openFile(second, 'Keyboard second')
+
+  const firstLabel = JSON.stringify(first)
+  const secondLabel = JSON.stringify(second)
+  await connection.evaluate(`Array.from(document.querySelectorAll('.document-tabs [role="tab"]')).find(tab => tab.getAttribute('aria-label')?.startsWith(${firstLabel}))?.focus()`)
+  assert.equal(await connection.evaluate(`document.activeElement?.getAttribute('aria-label')?.startsWith(${firstLabel})`), true)
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 })
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 })
+  await waitUntil('second tab selected by ArrowRight', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.document-tabs [role="tab"]')).some(tab => tab.getAttribute('aria-label')?.startsWith(${secondLabel}) && tab.getAttribute('aria-selected') === 'true' && tab === document.activeElement)`,
+  ))
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('.document-tab')).filter(tab => tab.innerText.includes('keyboard-first.md') || tab.innerText.includes('keyboard-second.md')).length`), 2)
+  assert.equal(await connection.evaluate(`document.querySelector('.document-tabs')?.getAttribute('role')`), 'tablist')
+})
+
+test('renaming an open image updates its viewer address and title', async () => {
+  const original = 'viewer-before.png'
+  const renamed = 'viewer-after.png'
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  await writeFile(path.join(workspace, original), imageBytes)
+  await setupPage()
+  await waitUntil('image in the file tree', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(original)})`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.click()`)
+  await waitUntil('image viewer to load', () => connection.evaluate(
+    `Boolean(document.querySelector('img[alt=${JSON.stringify(original)}]')?.src.includes(${JSON.stringify(original)}))`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }))`)
+  await waitUntil('image rename action', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('#editor-root div')).some(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)?.click()`)
+  await waitUntil('inline filename input', () => connection.evaluate(`Boolean(document.querySelector('.ant-tree-title input'))`))
+  await connection.evaluate(`(() => { const input = document.querySelector('.ant-tree-title input'); input.focus(); input.select() })()`)
+  await connection.send('Input.insertText', { text: renamed })
+  await waitUntil('new filename in the input', () => connection.evaluate(`document.querySelector('.ant-tree-title input')?.value === ${JSON.stringify(renamed)}`))
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await waitUntil('viewer to follow renamed image', () => connection.evaluate(
+    `Boolean(document.querySelector('img[alt=${JSON.stringify(renamed)}]')?.src.includes(${JSON.stringify(renamed)}))`,
+  ))
+  assert.deepEqual(await readFile(path.join(workspace, renamed)), imageBytes)
+  await assert.rejects(readFile(path.join(workspace, original)), error => error.code === 'ENOENT')
 })
 
 test('ordinary nested model bullets open in rich mode and keep their hierarchy after editing', async () => {

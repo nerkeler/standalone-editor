@@ -42,7 +42,7 @@ export default function DocumentTabs({
   if (!files.length) return null
 
   return (
-    <div className="document-tabs" style={{
+    <div className="document-tabs" role="tablist" aria-label="打开的文档" style={{
       display: 'flex', background: 'var(--color-bg-card)',
       borderRadius: 0, border: '1px solid var(--color-border)', borderBottom: 'none',
       overflowX: 'auto', overflowY: 'hidden', flexShrink: 0, flexWrap: 'nowrap',
@@ -54,18 +54,32 @@ export default function DocumentTabs({
           <Tooltip title={showToolbar ? '隐藏工具栏' : '显示工具栏'}><Button aria-label={showToolbar ? '隐藏工具栏' : '显示工具栏'} size="small" {...toolbarButtonProps(!showToolbar)} onClick={onToggleToolbar} icon={<AlignLeftOutlined />} /></Tooltip>
         </div>
       )}
-      {files.map(file => {
+      {files.map((file, index) => {
         const name = file.split('/').pop() || file
         const active = file === activeFile
         const hasSaveError = Boolean(saveErrors[file])
         const hasUnsavedChanges = Boolean(isDirty[file])
         return (
           <div key={file} className={`document-tab${active ? ' is-active' : ''}`} title={file} onClick={() => onOpenFile(file, name)}
-            aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
             onContextMenu={event => onTabContextMenu(file, event)}
             style={{ cursor: 'pointer', borderRight: '1px solid var(--color-border)' }}>
-            <FileOutlined aria-hidden="true" />
-            <span className="document-tab-title">{name}</span>
+            <button type="button" className="document-tab-select" role="tab" aria-selected={active} tabIndex={active ? 0 : -1}
+              aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
+              onKeyDown={event => {
+                let nextIndex = index
+                if (event.key === 'ArrowRight') nextIndex = (index + 1) % files.length
+                else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + files.length) % files.length
+                else if (event.key === 'Home') nextIndex = 0
+                else if (event.key === 'End') nextIndex = files.length - 1
+                else return
+                event.preventDefault()
+                event.currentTarget.closest('.document-tabs')?.querySelectorAll('[role="tab"]')[nextIndex]?.focus()
+                const nextFile = files[nextIndex]
+                onOpenFile(nextFile, nextFile.split('/').pop() || nextFile)
+              }}>
+              <FileOutlined aria-hidden="true" />
+              <span className="document-tab-title">{name}</span>
+            </button>
             {hasSaveError ? (
               <Tooltip title="保存失败">
                 <span className="tab-status-label is-error" aria-label="保存失败">失败</span>

@@ -5,6 +5,7 @@ import os from 'os'
 import { Readable } from 'node:stream'
 import { createHash, randomUUID } from 'crypto'
 import { extractMarkdownReferences, resolveWorkspaceReference } from './markdownMoveImpact.js'
+import { assertSameEntry, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
 
 const IMAGE_MIMES = {
   jpg: 'image/jpeg',
@@ -266,7 +267,15 @@ export async function listTree(workspace) {
   const { base, full } = await existingPath(workspace, '')
   const result = []
   async function walk(dir) {
-    const entries = await fs.readdir(dir, { withFileTypes: true })
+    let entries
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true })
+    } catch (error) {
+      // A child that cannot be read should not make the entire workspace
+      // appear unavailable. Root access still needs to fail visibly.
+      if (dir !== full && ['EACCES', 'EPERM'].includes(error.code)) return
+      throw error
+    }
     for (const entry of entries) {
       if (entry.name.startsWith('.')) continue
       const entryPath = path.join(dir, entry.name)
@@ -425,29 +434,43 @@ export async function createItem(workspace, reqPath, type, name, options = {}) {
   if (!targetDirStat.isDirectory()) throw makeError('目标目录无效')
   const newPath = path.join(targetDir, cleanName)
   assertInside(base, newPath)
-  await ensureDestinationDoesNotExist(newPath)
-  if (type === 'file' && isMarkdownPath(cleanName)) {
-    await archiveHistoryAtPath(base, newPath, { ...options, reason: 'path-reused' })
+  const guard = await openWorkspaceParent(base, newPath, makeError)
+  try {
+    await ensureDestinationDoesNotExist(newPath)
+    if (type === 'file' && isMarkdownPath(cleanName)) {
+      await archiveHistoryAtPath(base, newPath, { ...options, reason: 'path-reused' })
+    }
+    await guard.check()
+    await assertSameEntry(targetDir, targetDirStat, makeError)
+    if (type === 'dir') {
+      await fs.mkdir(newPath)
+    } else {
+      const handle = await fs.open(newPath, 'wx')
+      await handle.close()
+    }
+    return { path: relativePath(base, newPath), type, name: cleanName }
+  } finally {
+    await guard.close()
   }
-  if (type === 'dir') {
-    await fs.mkdir(newPath)
-  } else {
-    const handle = await fs.open(newPath, 'wx')
-    await handle.close()
-  }
-  return { path: relativePath(base, newPath), type, name: cleanName }
 }
 
 // 删除文件或目录。工作空间根目录不可删除。
 export async function deleteItem(workspace, reqPath) {
-  const { full, stat } = await existingPath(workspace, reqPath, { allowRoot: false })
-  if (stat.isDirectory()) {
-    await archiveHistoryAtPath(await workspaceBase(workspace), full, { reason: 'deleted', includeDescendants: true })
-  } else if (stat.isFile() && isMarkdownPath(full)) {
-    await archiveHistoryAtPath(await workspaceBase(workspace), full, { reason: 'deleted' })
+  const { base, full, stat } = await existingPath(workspace, reqPath, { allowRoot: false })
+  const guard = await openWorkspaceParent(base, full, makeError)
+  try {
+    if (stat.isDirectory()) {
+      await archiveHistoryAtPath(base, full, { reason: 'deleted', includeDescendants: true })
+    } else if (stat.isFile() && isMarkdownPath(full)) {
+      await archiveHistoryAtPath(base, full, { reason: 'deleted' })
+    }
+    await guard.check()
+    await assertSameEntry(full, stat, makeError)
+    await fs.rm(full, { recursive: stat.isDirectory(), force: false })
+    return { success: true }
+  } finally {
+    await guard.close()
   }
-  await fs.rm(full, { recursive: stat.isDirectory(), force: false })
-  return { success: true }
 }
 
 // 移动/重命名，目标存在时返回冲突，不覆盖目标。
@@ -466,46 +489,63 @@ export async function moveItem(workspace, oldPath, newPath, options = {}) {
   if (source.stat.isDirectory() && destInsideSource) {
     throw makeError('不能移动到自己的子目录')
   }
-  await ensureDestinationDoesNotExist(dest)
-  const filesToMove = await collectRegularFiles(source.full, source.stat)
-  const displacedHistory = await archiveHistoryAtPath(source.base, dest, {
-    ...options,
-    reason: 'path-reused',
-    includeDescendants: source.stat.isDirectory(),
-  })
-  let itemMoved = false
+  const sourceGuard = await openWorkspaceParent(source.base, source.full, makeError)
+  let destinationGuard
   try {
-    await fs.rename(source.full, dest)
-    itemMoved = true
-    await migrateHistoryForMove(source.base, source.full, dest, source.stat.isDirectory(), filesToMove, options)
-  } catch (error) {
-    if (itemMoved) {
-      try {
-        await fs.rename(dest, source.full)
-      } catch (rollbackError) {
-        const rollbackFailure = makeError(
-          `文件已移动，但恢复原路径失败：${rollbackError.message}`,
-          'MOVE_ROLLBACK_FAILED',
-        )
-        rollbackFailure.cause = error
-        throw rollbackFailure
-      }
+    destinationGuard = await openWorkspaceParent(destination.base, dest, makeError)
+    await ensureDestinationDoesNotExist(dest)
+    const filesToMove = await collectRegularFiles(source.full, source.stat)
+    const displacedHistory = await archiveHistoryAtPath(source.base, dest, {
+      ...options,
+      reason: 'path-reused',
+      includeDescendants: source.stat.isDirectory(),
+    })
+    const checkParents = async () => {
+      await sourceGuard.check()
+      await destinationGuard.check()
     }
-    if (displacedHistory.length) {
-      const historyRollback = await reattachHistoryArchives(source.base, displacedHistory.map(item => item.id), options)
-      if (historyRollback.retained > 0) {
-        const failure = makeError(
-          '移动失败；目标路径旧历史已安全保留在孤儿历史中，无法自动重挂',
-          'HISTORY_ARCHIVE_ROLLBACK_FAILED',
-        )
-        failure.cause = error
-        failure.details = { orphanHistoryIds: displacedHistory.map(item => item.id) }
-        throw failure
+    let itemMoved = false
+    try {
+      await moveEntryNoReplace(source.full, dest, source.stat, {
+        check: checkParents, errorFactory: makeError, conflictFactory: conflict, link: options.linkFile,
+      })
+      itemMoved = true
+      await migrateHistoryForMove(source.base, source.full, dest, source.stat.isDirectory(), filesToMove, options)
+    } catch (error) {
+      if (itemMoved) {
+        try {
+          const movedStat = await fs.lstat(dest)
+          await moveEntryNoReplace(dest, source.full, movedStat, {
+            check: checkParents, errorFactory: makeError, conflictFactory: conflict, link: options.linkFile,
+          })
+        } catch (rollbackError) {
+          const rollbackFailure = makeError(
+            `文件已移动，但恢复原路径失败：${rollbackError.message}`,
+            'MOVE_ROLLBACK_FAILED',
+          )
+          rollbackFailure.cause = error
+          throw rollbackFailure
+        }
       }
+      if (displacedHistory.length) {
+        const historyRollback = await reattachHistoryArchives(source.base, displacedHistory.map(item => item.id), options)
+        if (historyRollback.retained > 0) {
+          const failure = makeError(
+            '移动失败；目标路径旧历史已安全保留在孤儿历史中，无法自动重挂',
+            'HISTORY_ARCHIVE_ROLLBACK_FAILED',
+          )
+          failure.cause = error
+          failure.details = { orphanHistoryIds: displacedHistory.map(item => item.id) }
+          throw failure
+        }
+      }
+      throw error
     }
-    throw error
+    return { success: true }
+  } finally {
+    await destinationGuard?.close()
+    await sourceGuard.close()
   }
-  return { success: true }
 }
 
 function remapMovedPath(value, oldPath, newPath) {
@@ -1365,69 +1405,102 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
   validateExpectedRevision(expectedRevision)
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
   const { base, target, parent } = location
-  if (location.stat && location.stat.size > MAX_EDITABLE_MARKDOWN_BYTES) {
-    throw markdownTooLarge(location.stat.size)
-  }
-  const existing = await readCurrent(location, reqPath, expectedRevision)
-  if (existing && existing.bytes.equals(bytes)) {
-    return { success: true, path: relativePath(base, target), revision: contentRevision(existing.bytes) }
-  }
-  // This service atomically replaces files via rename, which can succeed for
-  // a read-only file when the parent directory is writable. Preserve the
-  // current account's file-level write permission semantics explicitly.
-  if (existing) await fs.access(target, fsConstants.W_OK)
-  if (!existing) await archiveHistoryAtPath(base, target, { root: options.root, reason: 'path-reused' })
-  const name = path.basename(target)
-  const relative = relativePath(base, target)
-
-  if (existing) await storeHistory(workspace, base, target, existing.bytes, options)
-
-  const temporary = path.join(parent, `.${name}.${randomUUID()}.tmp`)
-  const mode = existing ? existing.mode : 0o600
+  const guard = await openWorkspaceParent(base, target, makeError)
   try {
-    const handle = await fs.open(temporary, 'wx', mode)
-    try { await handle.writeFile(bytes) } finally { await handle.close() }
-    await fs.chmod(temporary, mode)
+    if (location.stat && location.stat.size > MAX_EDITABLE_MARKDOWN_BYTES) {
+      throw markdownTooLarge(location.stat.size)
+    }
+    const existing = await readCurrent(location, reqPath, expectedRevision)
+    if (existing && existing.bytes.equals(bytes)) {
+      return { success: true, path: relativePath(base, target), revision: contentRevision(existing.bytes) }
+    }
+    // This service atomically replaces files via rename, which can succeed for
+    // a read-only file when the parent directory is writable. Preserve the
+    // current account's file-level write permission semantics explicitly.
+    if (existing) await fs.access(target, fsConstants.W_OK)
+    if (!existing) await archiveHistoryAtPath(base, target, { root: options.root, reason: 'path-reused' })
+    const name = path.basename(target)
+    const relative = relativePath(base, target)
 
-    if (existing) {
-      // Recheck immediately before the atomic replacement. The workspace
-      // mutation queue excludes other API writes; this second read also catches
-      // most external edits that race the history write or temp-file creation.
-      let latest
+    if (existing) await storeHistory(workspace, base, target, existing.bytes, options)
+
+    const temporary = path.join(parent, `.${name}.${randomUUID()}.tmp`)
+    const mode = existing ? existing.mode : 0o600
+    try {
+      await guard.check()
+      const handle = await fs.open(temporary, 'wx', mode)
+      const temporaryStat = await handle.stat()
       try {
-        const latestStat = await fs.lstat(target)
-        if (latestStat.isSymbolicLink() || !latestStat.isFile()) throw makeError('目标文件已变化', 'FILE_CONFLICT')
-        latest = await readRegularFile({ base, target, stat: latestStat })
-        const latestMode = latestStat.mode & 0o777
-        if (latestMode !== mode) await fs.chmod(temporary, latestMode)
-      } catch (error) {
-        if (error.code === 'ENOENT') throw fileConflict(reqPath, expectedRevision, null)
-        throw error
+        await handle.writeFile(bytes)
+        await handle.chmod(mode)
+      } finally {
+        await handle.close()
       }
-      if (contentRevision(latest) !== expectedRevision) throw fileConflict(reqPath, expectedRevision, latest)
-      // Recheck after the optimistic revision read so a mode change during
-      // history capture cannot turn atomic rename into a permission bypass.
-      await fs.access(target, fsConstants.W_OK)
-      await fs.rename(temporary, target)
-    } else {
-      // The null revision means create-if-absent. link is an atomic exclusive
-      // install, so another creator cannot be silently overwritten.
-      await fs.link(temporary, target)
-      await fs.unlink(temporary)
-    }
-  } catch (error) {
-    try { await fs.unlink(temporary) } catch {}
-    if (error.code === 'EEXIST' && expectedRevision === null) {
-      let current = null
+
+      if (existing) {
+        // Recheck immediately before the atomic replacement. The workspace
+        // mutation queue excludes other API writes; this second read also catches
+        // most external edits that race the history write or temp-file creation.
+        let latest
+        try {
+          const latestStat = await fs.lstat(target)
+          if (latestStat.isSymbolicLink() || !latestStat.isFile()) throw makeError('目标文件已变化', 'FILE_CONFLICT')
+          latest = await readRegularFile({ base, target, stat: latestStat })
+          const latestMode = latestStat.mode & 0o777
+          if (latestMode !== mode) {
+            await guard.check()
+            const temporaryHandle = await fs.open(temporary, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0))
+            try {
+              const opened = await temporaryHandle.stat()
+              if (opened.dev !== temporaryStat.dev || opened.ino !== temporaryStat.ino) {
+                throw makeError('临时文件已变化')
+              }
+              await temporaryHandle.chmod(latestMode)
+            } finally {
+              await temporaryHandle.close()
+            }
+          }
+        } catch (error) {
+          if (error.code === 'ENOENT') throw fileConflict(reqPath, expectedRevision, null)
+          throw error
+        }
+        if (contentRevision(latest) !== expectedRevision) throw fileConflict(reqPath, expectedRevision, latest)
+        // Recheck after the optimistic revision read so a mode change during
+        // history capture cannot turn atomic rename into a permission bypass.
+        await fs.access(target, fsConstants.W_OK)
+        await guard.check()
+        await assertSameEntry(temporary, temporaryStat, makeError)
+        await fs.rename(temporary, target)
+      } else {
+        // The null revision means create-if-absent. link is an atomic exclusive
+        // install, so another creator cannot be silently overwritten.
+        await guard.check()
+        await assertSameEntry(temporary, temporaryStat, makeError)
+        await fs.link(temporary, target)
+        await guard.check()
+        await assertSameEntry(temporary, temporaryStat, makeError)
+        await fs.unlink(temporary)
+      }
+    } catch (error) {
       try {
-        const stat = await fs.lstat(target)
-        if (stat.isFile() && !stat.isSymbolicLink()) current = await readRegularFile({ base, target, stat })
+        await guard.check()
+        await assertSameEntry(temporary, temporaryStat, makeError)
+        await fs.unlink(temporary)
       } catch {}
-      throw fileConflict(reqPath, expectedRevision, current)
+      if (error.code === 'EEXIST' && expectedRevision === null) {
+        let current = null
+        try {
+          const stat = await fs.lstat(target)
+          if (stat.isFile() && !stat.isSymbolicLink()) current = await readRegularFile({ base, target, stat })
+        } catch {}
+        throw fileConflict(reqPath, expectedRevision, current)
+      }
+      throw error
     }
-    throw error
+    return { success: true, path: relative, revision: contentRevision(bytes) }
+  } finally {
+    await guard.close()
   }
-  return { success: true, path: relative, revision: contentRevision(bytes) }
 }
 
 // Versioned write. Existing files require the SHA-256 revision returned by
@@ -1559,10 +1632,14 @@ export async function ensureAdjacentAssetsDirectory(workspace, documentPath) {
   if (!documentStat.isFile()) throw makeError('目标文档不是普通文件')
   const assets = path.join(path.dirname(document), 'assets')
   assertInside(base, assets)
+  const guard = await openWorkspaceParent(base, assets, makeError)
   try {
+    await guard.check()
     await fs.mkdir(assets)
   } catch (error) {
     if (error.code !== 'EEXIST') throw error
+  } finally {
+    await guard.close()
   }
   const assetsStat = await fs.lstat(assets)
   if (!assetsStat.isDirectory() || assetsStat.isSymbolicLink()) throw makeError('同级 assets 不是安全目录')
@@ -1578,17 +1655,24 @@ export async function uploadFile(workspace, reqPath, file, options = {}) {
   if (!dirStat.isDirectory()) throw makeError('目标目录无效')
   const destPath = path.join(targetDir, cleanName)
   assertInside(base, destPath)
-  await ensureDestinationDoesNotExist(destPath)
-  if (isMarkdownPath(cleanName)) {
-    await archiveHistoryAtPath(base, destPath, { ...options, reason: 'path-reused' })
-  }
-  const handle = await fs.open(destPath, 'wx')
+  const guard = await openWorkspaceParent(base, destPath, makeError)
   try {
-    await handle.writeFile(file.buffer)
+    await ensureDestinationDoesNotExist(destPath)
+    if (isMarkdownPath(cleanName)) {
+      await archiveHistoryAtPath(base, destPath, { ...options, reason: 'path-reused' })
+    }
+    await guard.check()
+    await assertSameEntry(targetDir, dirStat, makeError)
+    const handle = await fs.open(destPath, 'wx')
+    try {
+      await handle.writeFile(file.buffer)
+    } finally {
+      await handle.close()
+    }
+    return { filename: cleanName, path: relativePath(base, destPath) }
   } finally {
-    await handle.close()
+    await guard.close()
   }
-  return { filename: cleanName, path: relativePath(base, destPath) }
 }
 
 // 列出所有文件（用于判断是否为空工作空间）

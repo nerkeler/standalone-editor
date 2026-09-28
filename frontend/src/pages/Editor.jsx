@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react'
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react'
 import { Tree, Button, Modal, Input, message, Tooltip, Dropdown } from 'antd'
 import {
   FileOutlined, FolderOpenOutlined, PlusOutlined, UploadOutlined, SaveOutlined,
@@ -33,6 +33,7 @@ import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import { requiresSourceMode } from './markdownSourcePolicy'
 import { analyzeMarkdownSource } from './markdownDiagnostics.js'
+import { getMarkdownSourceOutline } from './markdownSourceOutline.js'
 import { proposeSafeMarkdownRepair } from './safeMarkdownNormalization.js'
 import { isPermissionDenied, requestErrorMessage } from '../requestErrorMessage'
 import { TableInsertButton, TableContextTools } from './TableControls'
@@ -677,6 +678,22 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     })
     setOutlineItems(items)
   }, [editor])
+
+  const sourceOutlineItems = useMemo(
+    () => showSource && (showOutline || sidebarView === 'outline') ? getMarkdownSourceOutline(sourceContent) : [],
+    [showSource, showOutline, sidebarView, sourceContent],
+  )
+  const visibleOutlineItems = fileLoading || !isMarkdownFile(activeFile) || renderedFileRef.current !== activeFile
+    ? []
+    : (showSource ? sourceOutlineItems : outlineItems)
+  const goToOutlineItem = item => {
+    if (item.pos == null) return
+    if (showSource) {
+      sourceEditorRef.current?.goToPosition(item.pos)
+      return
+    }
+    if (editor) editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
+  }
 
   useEffect(() => {
     if (!editor) return
@@ -1714,14 +1731,21 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const handleImageUpload = async (file) => {
     const targetFile = activeFileRef.current
     const requestId = openRequestRef.current
+    const sourceModeAtUpload = showSourceRef.current
+    const sourceEditorAtUpload = sourceEditorRef.current
     if (
       !isMarkdownFile(targetFile) || loadingRef.current ||
-      renderedFileRef.current !== targetFile
+      renderedFileRef.current !== targetFile || readOnlyMarkdownRef.current ||
+      saveBlockedRef.current.has(targetFile)
     ) {
       message.error('请先打开一个 Markdown 文件')
       return
     }
-    if (!editor) return
+    if (!sourceModeAtUpload && !editor) return
+    if (sourceModeAtUpload && !sourceEditorAtUpload) {
+      message.error('源码编辑器尚未就绪，请稍后重试')
+      return
+    }
     const formData = new FormData()
     formData.append('file', file)
     formData.append('documentPath', targetFile)
@@ -1734,10 +1758,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       if (
         activeFileRef.current === targetFile &&
         openRequestRef.current === requestId &&
-        !loadingRef.current && renderedFileRef.current === targetFile
+        !loadingRef.current && renderedFileRef.current === targetFile &&
+        !readOnlyMarkdownRef.current && !saveBlockedRef.current.has(targetFile) &&
+        showSourceRef.current === sourceModeAtUpload &&
+        (!sourceModeAtUpload || sourceEditorRef.current === sourceEditorAtUpload)
       ) {
-        editor?.chain().focus().setImage({ src: reference.url, markdownSrc: reference.markdownSrc }).run()
-        message.success('图片已插入')
+        const inserted = sourceModeAtUpload
+          ? sourceEditorAtUpload?.insertMarkdownImage(reference.markdownSrc)
+          : editor?.chain().focus().setImage({ src: reference.url, markdownSrc: reference.markdownSrc }).run()
+        if (inserted) message.success('图片已插入')
+        else message.error('图片已上传，但未能插入当前文档')
       } else {
         message.info('图片已上传，但当前文档已变化，未插入')
       }
@@ -2010,6 +2040,25 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     })
   }
 
+  const remapViewers = (oldPath, newPath) => {
+    setImageViewer(current => {
+      if (!current) return current
+      const imagePath = remapPath(current.path, oldPath, newPath)
+      if (imagePath === current.path) return current
+      const reference = createUploadedImageReference(imagePath, imagePath, workspaceInfoRef.current)
+      return reference?.url
+        ? { ...current, path: imagePath, url: reference.url, name: imagePath.split('/').pop() || current.name }
+        : null
+    })
+    setAttachmentViewer(current => {
+      if (!current) return current
+      const attachmentPath = remapPath(current.path, oldPath, newPath)
+      return attachmentPath === current.path ? current : {
+        ...current, path: attachmentPath, name: attachmentPath.split('/').pop() || current.name,
+      }
+    })
+  }
+
   const handleMove = async (node, newParent) => {
     const parts = node.path.split('/')
     const oldName = parts.pop() || node.name
@@ -2048,6 +2097,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         setActiveFile(activeFileRef.current)
       }
       renderedFileRef.current = remapPath(renderedFileRef.current, node.path, newPath)
+      remapViewers(node.path, newPath)
       await loadTree()
       message.success('移动成功')
       return true
@@ -2058,7 +2108,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }
 
   const handleClear = () => {
-    if (!editor) return
+    if (!editor || showSourceRef.current) return
     Modal.confirm({
       title: '确定清空当前内容？', content: '清空后不可恢复。',
       okText: '清空', cancelText: '取消', okButtonProps: { danger: true },
@@ -2067,12 +2117,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }
 
   const handleInsertLink = () => {
+    if (showSourceRef.current) return
     Modal.confirm({
       title: '插入链接',
       content: <Input placeholder="输入链接 URL" id="link-url-input" autoFocus style={{ marginTop: 8 }} />,
       onOk: () => {
         const url = document.getElementById('link-url-input')?.value
-        if (url) editor?.chain().focus().setLink({ href: url }).run()
+        if (url && !showSourceRef.current) editor?.chain().focus().setLink({ href: url }).run()
       },
     })
   }
@@ -2121,6 +2172,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         setActiveFile(activeFileRef.current)
       }
       renderedFileRef.current = remapPath(renderedFileRef.current, renamingPath, newPath)
+      remapViewers(renamingPath, newPath)
       await loadTree()
       message.success('重命名成功')
     } catch (error) {
@@ -2254,6 +2306,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     { key: 'image', label: '上传图片', icon: <UploadOutlined /> },
   ]
   const applyMobileToolbarAction = ({ key }) => {
+    if (showSourceRef.current && key !== 'image') return
     const chain = editor?.chain().focus()
     if (key === 'strike') chain?.toggleStrike().run()
     if (key === 'bullet-list') chain?.toggleBulletList().run()
@@ -2383,16 +2436,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 {activeFile && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginLeft: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>— {activeFile.split('/').pop()}</span>}
               </div>
               <div style={{ flex: 1, overflow: 'auto', padding: '8px' }}>
-                {outlineItems.length === 0 && (
+                {visibleOutlineItems.length === 0 && (
                   <div style={{ padding: '24px', textAlign: 'center', color: 'var(--color-text-secondary)', fontSize: 13 }}>当前文档无标题</div>
                 )}
-                {outlineItems.map((item, i) => (
+                {visibleOutlineItems.map((item, i) => (
                   <div
                     key={i}
-                    onClick={() => {
-                      if (!editor || item.pos == null) return
-                      editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
-                    }}
+                    onClick={() => goToOutlineItem(item)}
                     style={{
                       padding: '6px 8px', fontSize: 13, cursor: 'pointer',
                       paddingLeft: 8 + (item.level - 1) * 14,
@@ -2489,16 +2539,15 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           </div>
           {sidebarView === 'outline' ? (
             <div className="mobile-outline-list" aria-label="文档大纲">
-              {outlineItems.length === 0 && <div className="outline-empty">当前文档还没有标题</div>}
-              {outlineItems.map((item, i) => (
+              {visibleOutlineItems.length === 0 && <div className="outline-empty">当前文档还没有标题</div>}
+              {visibleOutlineItems.map((item, i) => (
                 <button
                   type="button"
                   className="outline-item"
                   key={`${item.pos}-${i}`}
                   style={{ paddingLeft: 10 + (item.level - 1) * 14 }}
                   onClick={() => {
-                    if (!editor || item.pos == null) return
-                    editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
+                    goToOutlineItem(item)
                     setMobileSidebarOpen(false)
                   }}
                   title={item.text}
@@ -2692,6 +2741,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             <>
               {showToolbar && !isMobile && (
                 <div className="editor-toolbar" role="toolbar" aria-label="编辑工具栏">
+                  {!showSource && <>
                   <div className="toolbar-group toolbar-format-group">
                     <Tooltip title="加粗 (⌘/Ctrl+B)"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
                     <Tooltip title="斜体 (⌘/Ctrl+I)"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
@@ -2726,6 +2776,9 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                     <Tooltip title="代码块"><Button aria-label="代码块" {...tbBtn(editor?.isActive('codeBlock') || false)} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<ApiOutlined />} /></Tooltip>
                     <Tooltip title="插入链接"><Button aria-label="插入链接" {...tbBtn(editor?.isActive('link') || false)} onClick={handleInsertLink} icon={<LinkOutlined />} /></Tooltip>
                     <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
+                  </div>
+                  </>}
+                  <div className="toolbar-group">
                     <Tooltip title="上传图片"><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} onClick={() => imageInputRef.current?.click()} /></Tooltip>
                   </div>
                   <span className="toolbar-spacer" />
@@ -2746,6 +2799,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
               {showToolbar && isMobile && (
                 <div className="mobile-toolbar" role="toolbar" aria-label="移动端编辑工具栏">
+                  {!showSource && <>
                   <Tooltip title="加粗"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
                   <Tooltip title="斜体"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
                   <Dropdown
@@ -2772,6 +2826,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                     <Button className="mobile-more-formats" aria-label="更多格式" {...tbBtn(false, 'var(--color-text-secondary)')} icon={<MoreOutlined />}>更多格式</Button>
                   </Dropdown>
                   <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
+                  </>}
+                  {showSource && <Tooltip title="上传图片"><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} onClick={() => imageInputRef.current?.click()} /></Tooltip>}
                   <span className="toolbar-spacer" />
                   <Tooltip title={showSource ? '编辑' : '源码'}>
                     <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
@@ -2936,19 +2992,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             />
           </div>
           <div className="outline-panel-body">
-            {outlineItems.length === 0 && (
+            {visibleOutlineItems.length === 0 && (
               <div className="outline-empty">当前文档还没有标题</div>
             )}
-            {outlineItems.map((item, i) => (
+            {visibleOutlineItems.map((item, i) => (
               <button
                 type="button"
                 className="outline-item"
                 key={`${item.pos}-${i}`}
                 style={{ paddingLeft: 12 + (item.level - 1) * 14 }}
-                onClick={() => {
-                  if (!editor || item.pos == null) return
-                  editor.chain().focus().setTextSelection(Math.min(item.pos + 1, editor.state.doc.content.size)).scrollIntoView().run()
-                }}
+                onClick={() => goToOutlineItem(item)}
                 title={item.text}
               >
                 <span className="outline-level">H{item.level}</span>

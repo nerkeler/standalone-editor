@@ -3,6 +3,7 @@ import { constants as fsConstants, createReadStream } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
+import { assertSameEntry, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
 
 const MANIFEST_NAME = 'entry.json'
 const PAYLOAD_NAME = 'payload'
@@ -236,6 +237,7 @@ export function createTrashService(workspace, options = {}) {
     ? options.retentionDays
     : DEFAULT_RETENTION_DAYS
   const rename = options.rename || fs.rename
+  const linkFile = options.linkFile || fs.link
   const copyFile = options.copyFile || fs.copyFile
   const now = options.now || (() => new Date())
 
@@ -290,69 +292,80 @@ export function createTrashService(workspace, options = {}) {
     const { realWorkspace, workspaceId, trashDirectory } = await locations()
     const item = await resolveWorkspaceItem(realWorkspace, requestPath)
     if (!item.stat.isDirectory() && !item.stat.isFile()) throw serviceError('回收站不支持特殊文件')
-    // Refuse a directory containing a symlink or special file. This operation
-    // moves hidden children too; it never follows links outside the workspace.
-    await assertTreeCopyable(item.fullPath)
-
-    const id = randomUUID()
-    const entryDirectory = path.join(trashDirectory, id)
-    const payloadPath = path.join(entryDirectory, PAYLOAD_NAME)
-    await fs.mkdir(entryDirectory, { mode: 0o700 })
-    const created = now()
-    const manifest = {
-      version: 1,
-      id,
-      workspaceId,
-      originalPath: item.relativePath,
-      type: item.stat.isDirectory() ? 'directory' : 'file',
-      createdAt: created.toISOString(),
-      expiresAt: new Date(created.getTime() + retentionDays * 24 * 60 * 60 * 1000).toISOString(),
-      state: 'staging',
-    }
-    const manifestPath = path.join(entryDirectory, MANIFEST_NAME)
+    const sourceGuard = await openWorkspaceParent(realWorkspace, item.fullPath, serviceError)
     try {
-      await writeJsonAtomic(manifestPath, manifest)
-      try {
-        await rename(item.fullPath, payloadPath)
-      } catch (error) {
-        if (error.code !== 'EXDEV') throw error
-        const temporaryPath = path.join(entryDirectory, COPY_NAME)
-        await copyAndVerify(item.fullPath, temporaryPath, copyFile)
-        // Keep the original until a verified copy is durably staged. The
-        // helper only removes the source after that condition holds.
-        const [sourceSnapshot, stagedSnapshot] = await Promise.all([
-          assertTreeCopyable(item.fullPath),
-          assertTreeCopyable(temporaryPath),
-        ])
-        if (!snapshotsEqual(sourceSnapshot, stagedSnapshot)) {
-          throw serviceError('文件在暂存期间发生变化，未移动到回收站', 'FILE_CHANGED')
-        }
-        await fs.rename(temporaryPath, payloadPath)
-        await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
-        await fs.rm(item.fullPath, { recursive: true, force: false })
-        return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
+      // Refuse a directory containing a symlink or special file. This operation
+      // moves hidden children too; it never follows links outside the workspace.
+      await assertTreeCopyable(item.fullPath)
+
+      const id = randomUUID()
+      const entryDirectory = path.join(trashDirectory, id)
+      const payloadPath = path.join(entryDirectory, PAYLOAD_NAME)
+      await fs.mkdir(entryDirectory, { mode: 0o700 })
+      const created = now()
+      const manifest = {
+        version: 1,
+        id,
+        workspaceId,
+        originalPath: item.relativePath,
+        type: item.stat.isDirectory() ? 'directory' : 'file',
+        createdAt: created.toISOString(),
+        expiresAt: new Date(created.getTime() + retentionDays * 24 * 60 * 60 * 1000).toISOString(),
+        state: 'staging',
       }
-      await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
-      return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
-    } catch (error) {
-      // If a post-move metadata update fails, put the payload back whenever
-      // the original name remains free. A staged payload stays visible through
-      // list() if rollback cannot be completed.
-      let payloadRetained = false
-      if (await existsNoFollow(payloadPath)) {
+      const manifestPath = path.join(entryDirectory, MANIFEST_NAME)
+      try {
+        await writeJsonAtomic(manifestPath, manifest)
         try {
-          const original = path.resolve(realWorkspace, item.relativePath.split('/').join(path.sep))
-          if (!(await existsNoFollow(original))) {
-            await rename(payloadPath, original)
-          } else {
+          await sourceGuard.check()
+          await assertSameEntry(item.fullPath, item.stat, serviceError)
+          await rename(item.fullPath, payloadPath)
+        } catch (error) {
+          if (error.code !== 'EXDEV') throw error
+          const temporaryPath = path.join(entryDirectory, COPY_NAME)
+          await copyAndVerify(item.fullPath, temporaryPath, copyFile)
+          // Keep the original until a verified copy is durably staged. The
+          // helper only removes the source after that condition holds.
+          const [sourceSnapshot, stagedSnapshot] = await Promise.all([
+            assertTreeCopyable(item.fullPath),
+            assertTreeCopyable(temporaryPath),
+          ])
+          if (!snapshotsEqual(sourceSnapshot, stagedSnapshot)) {
+            throw serviceError('文件在暂存期间发生变化，未移动到回收站', 'FILE_CHANGED')
+          }
+          await fs.rename(temporaryPath, payloadPath)
+          await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
+          await sourceGuard.check()
+          await assertSameEntry(item.fullPath, item.stat, serviceError)
+          await fs.rm(item.fullPath, { recursive: true, force: false })
+          return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
+        }
+        await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
+        return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
+      } catch (error) {
+        // If a post-move metadata update fails, put the payload back whenever
+        // the original name remains free. A staged payload stays visible through
+        // list() if rollback cannot be completed.
+        let payloadRetained = false
+        if (await existsNoFollow(payloadPath)) {
+          try {
+            const original = path.resolve(realWorkspace, item.relativePath.split('/').join(path.sep))
+            const payloadStat = await fs.lstat(payloadPath)
+            await moveEntryNoReplace(payloadPath, original, payloadStat, {
+              check: () => sourceGuard.check(),
+              errorFactory: serviceError,
+              conflictFactory: () => serviceError('原位置已有同名项目', 'CONFLICT'),
+              link: linkFile,
+            })
+          } catch {
             payloadRetained = true
           }
-        } catch {
-          payloadRetained = true
         }
+        if (!payloadRetained) await fs.rm(entryDirectory, { recursive: true, force: true }).catch(() => {})
+        throw error
       }
-      if (!payloadRetained) await fs.rm(entryDirectory, { recursive: true, force: true }).catch(() => {})
-      throw error
+    } finally {
+      await sourceGuard.close()
     }
   }
 
@@ -367,30 +380,66 @@ export function createTrashService(workspace, options = {}) {
     const payloadStat = await fs.lstat(payloadPath)
     if (payloadStat.isSymbolicLink()) throw serviceError('回收站内容无效', 'INVALID_TRASH_ENTRY')
     const target = await assertSafeRestorationParent(realWorkspace, manifest.originalPath)
-    if (await existsNoFollow(target)) throw serviceError('原位置已有同名项目，无法恢复', 'CONFLICT')
-
-    if (typeof rename === 'function') {
+    const workspaceGuard = await openWorkspaceParent(realWorkspace, target, serviceError)
+    let payloadGuard
+    try {
+      payloadGuard = await openWorkspaceParent(trashDirectory, payloadPath, serviceError)
+    } catch (error) {
+      await workspaceGuard.close()
+      throw error
+    }
+    const conflictFactory = () => serviceError('原位置已有同名项目，无法恢复', 'CONFLICT')
+    const checkParents = async () => {
+      await workspaceGuard.check()
+      await payloadGuard.check()
+    }
+    try {
+      if (typeof options.beforeRestoreCommit === 'function') {
+        await options.beforeRestoreCommit(manifest.originalPath)
+      }
       try {
-        await rename(payloadPath, target)
+        await moveEntryNoReplace(payloadPath, target, payloadStat, {
+          check: checkParents,
+          errorFactory: serviceError,
+          conflictFactory,
+          rename,
+          link: linkFile,
+        })
+        await payloadGuard.check()
         await fs.rm(entryDirectory, { recursive: true, force: false })
         return { success: true, path: manifest.originalPath }
       } catch (error) {
         if (error.code !== 'EXDEV') throw error
       }
-    }
 
-    // Recovery storage may live on another volume. Copy to a sibling staging
-    // path, verify the complete tree, then publish it at the original name.
-    const temporaryTarget = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.restoring`)
-    try {
-      await copyAndVerify(payloadPath, temporaryTarget, copyFile)
-      if (await existsNoFollow(target)) throw serviceError('原位置已有同名项目，无法恢复', 'CONFLICT')
-      await fs.rename(temporaryTarget, target)
-      await fs.rm(entryDirectory, { recursive: true, force: false })
-      return { success: true, path: manifest.originalPath }
-    } catch (error) {
-      if (await existsNoFollow(temporaryTarget)) await fs.rm(temporaryTarget, { recursive: true, force: true }).catch(() => {})
-      throw error
+      // Recovery storage may live on another volume. Copy to a sibling staging
+      // path, verify the complete tree, then publish it at the original name.
+      const temporaryTarget = path.join(path.dirname(target), `.${path.basename(target)}.${randomUUID()}.restoring`)
+      let temporaryStat
+      try {
+        await checkParents()
+        await copyAndVerify(payloadPath, temporaryTarget, copyFile)
+        temporaryStat = await fs.lstat(temporaryTarget)
+        await moveEntryNoReplace(temporaryTarget, target, temporaryStat, {
+          check: checkParents,
+          errorFactory: serviceError,
+          conflictFactory,
+          link: linkFile,
+        })
+        await payloadGuard.check()
+        await fs.rm(entryDirectory, { recursive: true, force: false })
+        return { success: true, path: manifest.originalPath }
+      } catch (error) {
+        try {
+          await checkParents()
+          if (temporaryStat) await assertSameEntry(temporaryTarget, temporaryStat, serviceError)
+          if (await existsNoFollow(temporaryTarget)) await fs.rm(temporaryTarget, { recursive: true, force: true })
+        } catch {}
+        throw error
+      }
+    } finally {
+      await payloadGuard.close()
+      await workspaceGuard.close()
     }
   }
 
