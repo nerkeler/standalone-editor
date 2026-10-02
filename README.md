@@ -20,7 +20,7 @@ Standalone Editor 是一款在浏览器中运行的本地文档工作台。它�
 
 ## 快速开始
 
-建议使用 Node.js 22（与 CI 环境一致）和 npm。macOS / Linux 可在终端运行：
+建议使用 Node.js 22.12.0 或更高版本和 npm。前端的 Vite 7 要求该 Node.js 版本；macOS / Linux 可在终端运行：
 
 ~~~bash
 git clone https://github.com/nerkeler/standalone-editor.git
@@ -104,13 +104,15 @@ flowchart LR
 | `frontend/` | React、Vite、TipTap 工作台 |
 | `backend/` | Express、工作区校验、文件读写与恢复 |
 | [技术参考](docs/reference.md) | API、ZIP 导入限制、恢复规则、环境变量与跨平台目录选择 |
+| [运行、更新与回退](docs/release-runtime.md) | 构建产物运行、服务监督、更新和回退 |
+| [前端依赖维护](docs/dependency-maintenance.md) | Node.js 最低版本、依赖升级、审计和离线约束 |
 | [产品方向](PRODUCT.md) · [视觉方向](DESIGN.md) | 设计原则与界面约定 |
 
 运行现有检查：
 
 ~~~bash
 (cd backend && npm test)
-(cd frontend && npm run test:unit && npm run build && npm run test:browser)
+(cd frontend && npm run test:unit && npm run build && npm run test:browser && npm run test:production-smoke)
 ~~~
 
 浏览器回归测试需要 Chrome 或 Chromium；本地未能自动找到时，可通过 `CHROME_PATH` 指定浏览器可执行文件。CI 在 Ubuntu 和 Windows 运行后端测试，在 Ubuntu 运行前端单元测试、构建与浏览器测试。

@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useRef } from 'react'
 import { Alert, Button, Modal, Breadcrumb, Spin } from 'antd'
-import { FolderOpenOutlined, ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
+import { FolderOpenOutlined, FileOutlined, ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api, setWorkspaceContext } from '../api'
 
 const DIRS_API = '/api/dirs'
@@ -110,14 +110,18 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-      height: '100vh', gap: 32, padding: 24,
+      minHeight: '100dvh', gap: 32,
+      padding: 'max(clamp(16px, 4vw, 32px), env(safe-area-inset-top)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-right)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-bottom)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-left))',
     }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700 }}>📝 在线编辑器</h1>
+      <h1 style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 28, fontWeight: 700 }}>
+        <FolderOpenOutlined aria-hidden="true" style={{ color: 'var(--color-primary)' }} />
+        <span>在线编辑器</span>
+      </h1>
 
       <div style={{
         background: 'var(--color-bg-card)', borderRadius: 16,
-        padding: '32px 40px', boxShadow: 'var(--shadow-lg)',
-        display: 'flex', flexDirection: 'column', gap: 20, minWidth: 380,
+        padding: 'clamp(20px, 6vw, 32px) clamp(18px, 7vw, 40px)', boxShadow: 'var(--shadow-lg)',
+        display: 'flex', flexDirection: 'column', gap: 20, width: 'min(100%, 480px)',
       }}>
         {diagnostic && (
           <Alert
@@ -171,6 +175,7 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
 
       {/* 目录选择器弹窗 */}
       <Modal
+        className="workspace-picker-modal"
         title="选择工作目录"
         open={pickerVisible}
         onCancel={closePicker}
@@ -179,7 +184,7 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
         okButtonProps={{ disabled: pickerLoading || confirming || !pickerData?.canSelect }}
         okText="确认选择"
         cancelText="取消"
-        width={560}
+        width="min(560px, calc(100vw - 32px))"
       >
         {pickerError && <div role="alert" style={{ padding: '6px 8px', fontSize: 12, color: 'var(--color-danger)', background: 'color-mix(in srgb, var(--color-danger) 12%, var(--color-bg-card))', borderRadius: 4, marginBottom: 8 }}>{pickerError}</div>}
 
@@ -207,49 +212,66 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
 
         {/* 面包屑 + 返回按钮；路径由后端生成，前端不拼接平台分隔符。 */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-          <Button size="small" icon={<ArrowLeftOutlined />} onClick={goUp} disabled={pickerLoading || !pickerData?.canGoUp}>返回</Button>
+              <Button size="small" icon={<ArrowLeftOutlined />} onClick={goUp} disabled={pickerLoading || !pickerData?.canGoUp} aria-label="返回上级目录">返回</Button>
           <Breadcrumb
             separator={pickerData?.separator || '/'}
             items={(pickerData?.breadcrumb || []).map((item, index, all) => ({
               key: item.path,
               title: (
-                <a
-                  style={{ fontWeight: index === all.length - 1 ? 700 : 400 }}
-                  onClick={() => {
-                    if (!pickerLoading && item.canNavigate && item.path !== pickerData.path) loadPickerDir(item.path)
-                  }}
-                >
-                  {item.name}
-                </a>
+                index === all.length - 1 ? (
+                  <span aria-current="page" style={{ fontWeight: 700 }}>{item.name}</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="welcome-breadcrumb-button"
+                    disabled={pickerLoading || !item.canNavigate}
+                    onClick={() => {
+                      if (!pickerLoading && item.canNavigate && item.path !== pickerData.path) loadPickerDir(item.path)
+                    }}
+                  >
+                    {item.name}
+                  </button>
+                )
               ),
             }))}
           />
         </div>
 
         {/* 目录列表 */}
-        <div style={{ maxHeight: 360, overflowY: 'auto', border: '1px solid var(--color-border)', borderRadius: 8, padding: '4px 0' }}>
+        <div
+          role="group"
+          aria-label="当前目录内容"
+          aria-busy={pickerLoading}
+          style={{ maxHeight: 'min(360px, 50dvh)', overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', border: '1px solid var(--color-border)', borderRadius: 8, padding: '4px 0' }}
+        >
           {pickerLoading ? (
             <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
           ) : !pickerData || pickerData.entries?.length === 0 ? (
             <div style={{ textAlign: 'center', padding: 32, color: 'var(--color-text-secondary)' }}>空目录</div>
           ) : (
             pickerData.entries.map(entry => (
-              <div
+              <button
+                type="button"
                 key={entry.path}
                 onClick={() => enterDir(entry)}
+                disabled={entry.type !== 'dir' || entry.canNavigate === false}
+                aria-label={entry.type === 'dir' ? `打开文件夹 ${entry.name}` : `${entry.name}，文件`}
+                title={entry.type === 'dir' ? `打开文件夹 ${entry.name}` : entry.name}
+                className="welcome-directory-entry"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 8,
-                  padding: '10px 12px', cursor: 'pointer',
+                  width: '100%', minHeight: 44, padding: '10px 12px', cursor: entry.type === 'dir' && entry.canNavigate !== false ? 'pointer' : 'default',
+                  border: 0, background: 'transparent', textAlign: 'left', font: 'inherit',
                   fontSize: 14,
                   opacity: entry.type === 'dir' && entry.canNavigate === false ? 0.5 : 1,
                 }}
-                onMouseEnter={e => e.currentTarget.style.background = 'var(--color-surface-hover)'}
-                onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
               >
-                <FolderOpenOutlined style={{ color: entry.type === 'dir' ? 'var(--color-warning)' : 'var(--color-text-secondary)', fontSize: 18 }} />
-                <span style={{ flex: 1, color: 'var(--color-text)' }}>{entry.name}</span>
+                {entry.type === 'dir'
+                  ? <FolderOpenOutlined aria-hidden="true" style={{ color: 'var(--color-warning)', fontSize: 18 }} />
+                  : <FileOutlined aria-hidden="true" style={{ color: 'var(--color-text-secondary)', fontSize: 16 }} />}
+                <span style={{ minWidth: 0, flex: 1, overflowWrap: 'anywhere', color: 'var(--color-text)' }}>{entry.name}</span>
                 {entry.type === 'file' && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>文件</span>}
-              </div>
+              </button>
             ))
           )}
         </div>

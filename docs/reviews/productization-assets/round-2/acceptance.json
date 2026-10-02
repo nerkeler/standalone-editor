@@ -1,0 +1,131 @@
+{
+  "capturedAt": "2026-10-02T00:21:58.190Z",
+  "platform": "darwin",
+  "checks": {
+    "tasks": [
+      {
+        "display": "grid",
+        "marker": "none",
+        "checkTop": 347.59375,
+        "textTop": 345.03125,
+        "checkWidth": 16,
+        "text": "整理一份结构清晰的文档"
+      },
+      {
+        "display": "grid",
+        "marker": "none",
+        "checkTop": 380.375,
+        "textTop": 377.8125,
+        "checkWidth": 16,
+        "text": "验证自动保存与历史恢复"
+      },
+      {
+        "display": "grid",
+        "marker": "none",
+        "checkTop": 413.15625,
+        "textTop": 410.59375,
+        "checkWidth": 16,
+        "text": "这是一条需要在窄屏自然换行的任务，复选框应始终与首行文字对齐，同时让下面的段落有稳定的阅读节奏。"
+      }
+    ],
+    "autosaveTask": true,
+    "tableGridTabStops": 1,
+    "tableArrowFocus": "1 行 1 列",
+    "tableFocusReturned": true,
+    "renameEscapeRestoresInput": true,
+    "menuInitialFocus": "menuitem",
+    "menuEscapeRestoresInput": true,
+    "directoryRows": [
+      {
+        "tag": "BUTTON",
+        "disabled": false,
+        "label": "打开文件夹 chrome"
+      },
+      {
+        "tag": "BUTTON",
+        "disabled": false,
+        "label": "打开文件夹 notes"
+      },
+      {
+        "tag": "BUTTON",
+        "disabled": false,
+        "label": "打开文件夹 recovery"
+      },
+      {
+        "tag": "BUTTON",
+        "disabled": true,
+        "label": "workspace.json，文件"
+      }
+    ],
+    "directoryEnter": true,
+    "directoryConfirm": true,
+    "mobileOverflow": {
+      "width": 390,
+      "scroll": 390,
+      "body": 390
+    },
+    "mobileTargets": [
+      {
+        "label": "切换到浅色模式",
+        "width": 32,
+        "height": 36
+      },
+      {
+        "label": "打开目录",
+        "width": 44,
+        "height": 44
+      },
+      {
+        "label": "查看大纲",
+        "width": 44,
+        "height": 44
+      },
+      {
+        "label": "隐藏工具栏",
+        "width": 34,
+        "height": 44
+      },
+      {
+        "label": "加粗",
+        "width": 44,
+        "height": 44
+      },
+      {
+        "label": "斜体",
+        "width": 44,
+        "height": 44
+      },
+      {
+        "label": "当前段落样式：正文",
+        "width": 92,
+        "height": 44
+      },
+      {
+        "label": "更多格式",
+        "width": 88,
+        "height": 44
+      },
+      {
+        "label": "插入表格",
+        "width": 44,
+        "height": 44
+      },
+      {
+        "label": "切换到源码编辑",
+        "width": 65,
+        "height": 44
+      },
+      {
+        "label": "隐藏工具栏",
+        "width": 44,
+        "height": 44
+      }
+    ],
+    "reflowOverflow": true,
+    "imageHandle": {
+      "width": 44,
+      "height": 44
+    }
+  },
+  "coldWorkbenchMs": 219
+}

@@ -1,0 +1,14 @@
+
+> standalone-editor-frontend@1.0.0 test:production-smoke
+> node --test --test-concurrency=1 --test-reporter=spec tests/production-smoke.browser.test.js tests/lazy-editor-error.browser.test.js
+
+✔ a real lazy Editor chunk 404 renders the reload error boundary (527.380791ms)
+✔ production build opens, autosaves, serves relative images, and downloads original attachment bytes (3946.6075ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 8526.385958

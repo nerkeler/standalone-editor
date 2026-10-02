@@ -1,0 +1,364 @@
+{
+  "reviewDate": "2026-10-01",
+  "head": "dc5da9dafe136649f74676613fc5a6322ce54257",
+  "node": "v22.22.3",
+  "backend": {
+    "tests": 120,
+    "pass": 118,
+    "skip": 2,
+    "fail": 0
+  },
+  "frontendUnit": {
+    "tests": 61,
+    "pass": 61,
+    "fail": 0
+  },
+  "browserCombined": {
+    "tests": 51,
+    "pass": 49,
+    "fail": 2,
+    "note": "Two opt-in visual tests timeout from inherited mobile viewport"
+  },
+  "visualIndividualReruns": {
+    "screenshots": 1,
+    "interactive": 1,
+    "pass": 2
+  },
+  "build": {
+    "mainMinifiedKB": 2091.78,
+    "mainGzipKB": 679.88,
+    "sourceChunkMinifiedKB": 59.03,
+    "sourceChunkGzipKB": 19.6
+  },
+  "synthetic2000FileBenchmark": {
+    "listMs": [
+      7,
+      6,
+      5
+    ],
+    "noMatchSearchMs": [
+      209,
+      198,
+      225
+    ],
+    "scope": "local temporary SSD workspace, synthetic ~5KB files"
+  },
+  "audit": {
+    "frontend": {
+      "counts": {
+        "info": 0,
+        "low": 1,
+        "moderate": 37,
+        "high": 7,
+        "critical": 0,
+        "total": 45
+      },
+      "rootAdvisoryPackages": [
+        {
+          "name": "@babel/core",
+          "severity": "low",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "@babel/core: Arbitrary File Read via sourceMappingURL Comment",
+              "url": "https://github.com/advisories/GHSA-4x5r-pxfx-6jf8"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "@tiptap/core",
+          "severity": "moderate",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "Tiptap: mergeAttributes() turns an own __proto__ key into inherited executable DOM attributes",
+              "url": "https://github.com/advisories/GHSA-cp6q-959q-f8rh"
+            }
+          ],
+          "fixAvailable": {
+            "name": "@tiptap/extension-link",
+            "version": "3.31.3",
+            "isSemVerMajor": true
+          }
+        },
+        {
+          "name": "axios",
+          "severity": "high",
+          "isDirect": true,
+          "advisories": [
+            {
+              "title": "Axios: Regular Expression Denial of Service (ReDoS) via Cookie Name Injection",
+              "url": "https://github.com/advisories/GHSA-hfxv-24rg-xrqf"
+            },
+            {
+              "title": "Allocation of Resources Without Limits or Throttling in Axios",
+              "url": "https://github.com/advisories/GHSA-777c-7fjr-54vf"
+            },
+            {
+              "title": "Axios: Proxy-Authorization Credential Leak to Origin Server Across HTTP-to-HTTPS Redirect in Axios Node.js HTTP Adapter",
+              "url": "https://github.com/advisories/GHSA-p92q-9vqr-4j8v"
+            },
+            {
+              "title": "Axios: Proxy-Authorization header leaks to redirect target when proxy is re-evaluated to direct connection",
+              "url": "https://github.com/advisories/GHSA-j5f8-grm9-p9fc"
+            },
+            {
+              "title": "axios Vulnerable to Full Man-in-the-Middle via Prototype Pollution Gadget in `config.proxy`",
+              "url": "https://github.com/advisories/GHSA-35jp-ww65-95wh"
+            },
+            {
+              "title": "axios has DoS & Header Injection via Prototype Pollution Read-Side Gadgets in axios merge functions",
+              "url": "https://github.com/advisories/GHSA-898c-q2cr-xwhg"
+            },
+            {
+              "title": "Axios has a Patch Bypass: Proxy-Authorization Header Injection via Prototype Pollution — Incomplete Null-Prototype Fix",
+              "url": "https://github.com/advisories/GHSA-654m-c8p4-x5fp"
+            },
+            {
+              "title": "axios's shouldBypassProxy does not recognize IPv4-mapped IPv6 addresses, allowing NO_PROXY bypass (incomplete fix for CVE-2025-62718)",
+              "url": "https://github.com/advisories/GHSA-pjwm-pj3p-43mv"
+            },
+            {
+              "title": "Axios: Prototype pollution auth subfields can inject Basic auth",
+              "url": "https://github.com/advisories/GHSA-xj6q-8x83-jv6g"
+            },
+            {
+              "title": "Axios: Prototype pollution gadgets can alter axios request construction",
+              "url": "https://github.com/advisories/GHSA-mmx7-hfxf-jppx"
+            },
+            {
+              "title": "Axios: Deep formToJSON Key Recursion Can Cause Denial of Service",
+              "url": "https://github.com/advisories/GHSA-pmv8-rq9r-6j72"
+            },
+            {
+              "title": "Axios: HTTP/2 streamed uploads bypass `maxBodyLength`",
+              "url": "https://github.com/advisories/GHSA-mwf2-3pr3-8698"
+            },
+            {
+              "title": "Axios Node HTTP adapter can use an inherited proxy after interceptor config cloning",
+              "url": "https://github.com/advisories/GHSA-gcfj-64vw-6mp9"
+            },
+            {
+              "title": "Axios: Nested axios option objects can consume polluted prototype values",
+              "url": "https://github.com/advisories/GHSA-7q8q-rj6j-mhjq"
+            },
+            {
+              "title": "Axios: Fetch adapter `ReadableStream` uploads bypass `maxBodyLength`",
+              "url": "https://github.com/advisories/GHSA-jqh4-m9w3-8hp9"
+            },
+            {
+              "title": "Axios: NO_PROXY bypass for 0.0.0.0 local addresses in axios",
+              "url": "https://github.com/advisories/GHSA-f4gw-2p7v-4548"
+            },
+            {
+              "title": "Axios: Excessive recursion in formDataToJSON can cause denial of service",
+              "url": "https://github.com/advisories/GHSA-42h9-826w-cgv3"
+            },
+            {
+              "title": "Axios form serializer maxDepth bypass via {} metatoken",
+              "url": "https://github.com/advisories/GHSA-hcpx-6fm6-wx23"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "baseline-browser-mapping",
+          "severity": "moderate",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "baseline-browser-mapping process termination on invalid input causes denial of service",
+              "url": "https://github.com/advisories/GHSA-w5vr-8v7q-w6rv"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "browserslist",
+          "severity": "high",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "Browserslist: Unbounded memory growth (no cache eviction) via distinct query results, leading to eventual OOM",
+              "url": "https://github.com/advisories/GHSA-c83g-rgw3-j3cx"
+            },
+            {
+              "title": "Browserslist: Uncaught crash / prototype write via untrusted browserslist-stats.json custom stats (normalizeStats)",
+              "url": "https://github.com/advisories/GHSA-73wf-gq98-2v4g"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "esbuild",
+          "severity": "moderate",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "esbuild enables any website to send any requests to the development server and read the response",
+              "url": "https://github.com/advisories/GHSA-67mh-4wv8-2f99"
+            }
+          ],
+          "fixAvailable": {
+            "name": "vite",
+            "version": "8.3.1",
+            "isSemVerMajor": true
+          }
+        },
+        {
+          "name": "form-data",
+          "severity": "high",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "form-data: CRLF injection in form-data via unescaped multipart field names and filenames",
+              "url": "https://github.com/advisories/GHSA-hmw2-7cc7-3qxx"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "linkify-it",
+          "severity": "high",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "LinkifyIt#match scan loop has quadratic algorithmic complexity",
+              "url": "https://github.com/advisories/GHSA-22p9-wv53-3rq4"
+            },
+            {
+              "title": "linkify-it: Quadratic-complexity DoS via the `mailto:` validator scan-loop on attacker text",
+              "url": "https://github.com/advisories/GHSA-v245-v573-v5vm"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "markdown-it",
+          "severity": "moderate",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "markdown-it: Quadratic complexity DoS in smartquotes rule via replaceAt string operations",
+              "url": "https://github.com/advisories/GHSA-6v5v-wf23-fmfq"
+            },
+            {
+              "title": "markdown-it linkify: true has two quadratic paths, so a few hundred KB of markdown blocks the event loop for tens of seconds",
+              "url": "https://github.com/advisories/GHSA-253c-mchw-3w2r"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "nanoid",
+          "severity": "high",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "nanoid: non-secure generators can loop indefinitely with negative size",
+              "url": "https://github.com/advisories/GHSA-28wg-ghj8-5hjv"
+            },
+            {
+              "title": "nanoid: custom generators can loop indefinitely when size is zero",
+              "url": "https://github.com/advisories/GHSA-2v37-7h3g-55p8"
+            },
+            {
+              "title": "nanoid: Integer Overflow or Wraparound",
+              "url": "https://github.com/advisories/GHSA-xwg4-73v4-xw9w"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "postcss",
+          "severity": "high",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "PostCSS: Arbitrary file read and information disclosure via attacker-controlled sourceMappingURL in CSS comments",
+              "url": "https://github.com/advisories/GHSA-6g55-p6wh-862q"
+            },
+            {
+              "title": "PostCSS: incomplete fix of GHSA-6g55-p6wh-862q — attacker-controlled sourceMappingURL reads arbitrary .map files when `from` is unset",
+              "url": "https://github.com/advisories/GHSA-fxqj-rqcc-2cmp"
+            },
+            {
+              "title": "PostCSS: Path Traversal in Previous Source Map Auto-Loading (sourceMappingURL) leads to Arbitrary .map File Disclosure",
+              "url": "https://github.com/advisories/GHSA-r28c-9q8g-f849"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "vite",
+          "severity": "high",
+          "isDirect": true,
+          "advisories": [
+            {
+              "title": "Vite Vulnerable to Path Traversal in Optimized Deps `.map` Handling",
+              "url": "https://github.com/advisories/GHSA-4w7w-66w2-5vf9"
+            },
+            {
+              "title": "launch-editor: NTLMv2 hash disclosure via UNC path handling on Windows",
+              "url": "https://github.com/advisories/GHSA-v6wh-96g9-6wx3"
+            },
+            {
+              "title": "vite: `server.fs.deny` bypass on Windows alternate paths",
+              "url": "https://github.com/advisories/GHSA-fx2h-pf6j-xcff"
+            }
+          ],
+          "fixAvailable": {
+            "name": "vite",
+            "version": "8.3.1",
+            "isSemVerMajor": true
+          }
+        }
+      ]
+    },
+    "backend": {
+      "counts": {
+        "info": 0,
+        "low": 1,
+        "moderate": 1,
+        "high": 0,
+        "critical": 0,
+        "total": 2
+      },
+      "rootAdvisoryPackages": [
+        {
+          "name": "body-parser",
+          "severity": "low",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "body-parser vulnerable to denial of service when invalid limit value silently disables size enforcement",
+              "url": "https://github.com/advisories/GHSA-v422-hmwv-36x6"
+            }
+          ],
+          "fixAvailable": true
+        },
+        {
+          "name": "qs",
+          "severity": "moderate",
+          "isDirect": false,
+          "advisories": [
+            {
+              "title": "qs has a remotely triggerable DoS: qs.stringify crashes with TypeError on null/undefined entries in comma-format arrays when encodeValuesOnly is set",
+              "url": "https://github.com/advisories/GHSA-q8mj-m7cp-5q26"
+            },
+            {
+              "title": "qs array-limit bypass via bracket-key comma parsing",
+              "url": "https://github.com/advisories/GHSA-x5fp-wj9c-mxmx"
+            },
+            {
+              "title": "qs: Denial of Service via Attacker Controlled isBuffer",
+              "url": "https://github.com/advisories/GHSA-4mjr-xmp4-gh2g"
+            }
+          ],
+          "fixAvailable": true
+        }
+      ]
+    }
+  }
+}

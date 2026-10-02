@@ -1,16 +1,14 @@
-import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react'
-import { Tree, Button, Modal, Input, message, Tooltip, Dropdown } from 'antd'
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react'
+import { Button, Modal, Input, message, Tooltip, Dropdown } from 'antd'
 import {
-  FileOutlined, FolderOpenOutlined, PlusOutlined, UploadOutlined, SaveOutlined,
-  CloseOutlined, CheckSquareOutlined, TableOutlined, MoreOutlined, DeleteOutlined,
-  SwapOutlined, BoldOutlined, ItalicOutlined, StrikethroughOutlined,
-  UnorderedListOutlined, OrderedListOutlined, LinkOutlined, ExpandOutlined,
-  ShrinkOutlined, HolderOutlined, ArrowLeftOutlined, EditOutlined, MenuOutlined,
-  NodeIndexOutlined, CodeOutlined, ApiOutlined, AppstoreOutlined,
-  AlignLeftOutlined, DownOutlined,
+  FileOutlined, FolderOpenOutlined, PlusOutlined, SaveOutlined,
+  CloseOutlined, MoreOutlined, DeleteOutlined, SwapOutlined,
+  ArrowLeftOutlined, EditOutlined, MenuOutlined,
+  NodeIndexOutlined, ApiOutlined, AppstoreOutlined,
   CheckOutlined, LoadingOutlined, CloseCircleOutlined, ReloadOutlined,
   ReadOutlined, FileAddOutlined, FolderAddOutlined, SearchOutlined,
-  ZoomInOutlined, ZoomOutOutlined, WarningOutlined, HistoryOutlined
+  ZoomInOutlined, ZoomOutOutlined, WarningOutlined, HistoryOutlined,
+  UploadOutlined
 } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
 import StarterKit from '@tiptap/starter-kit'
@@ -19,15 +17,11 @@ import Link from '@tiptap/extension-link'
 import Placeholder from '@tiptap/extension-placeholder'
 import TaskList from '@tiptap/extension-task-list'
 import TaskItem from '@tiptap/extension-task-item'
-import { Table } from '@tiptap/extension-table'
-import { TableRow } from '@tiptap/extension-table-row'
-import { TableCell } from '@tiptap/extension-table-cell'
-import { TableHeader } from '@tiptap/extension-table-header'
+import { Table, TableRow, TableCell, TableHeader } from '@tiptap/extension-table'
 import Heading from '@tiptap/extension-heading'
 import Strike from '@tiptap/extension-strike'
 import { api as axios } from '../api'
-import { marked } from 'marked'
-import Turndown from 'turndown'
+import { readJsonStorage, readStorage, writeStorage } from '../safeStorage.js'
 import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
@@ -36,22 +30,24 @@ import { analyzeMarkdownSource } from './markdownDiagnostics.js'
 import { getMarkdownSourceOutline } from './markdownSourceOutline.js'
 import { proposeSafeMarkdownRepair } from './safeMarkdownNormalization.js'
 import { isPermissionDenied, requestErrorMessage } from '../requestErrorMessage'
-import { TableInsertButton, TableContextTools } from './TableControls'
-import { parseImagePresentationComment, formatImagePresentationComment } from './imagePresentation.js'
+import { TableContextTools } from './TableControls'
 import ImageControls from './ImageControls'
 import { createSearchCoordinator } from '../searchCoordinator'
-import {
-  createUploadedImageReference,
-  isExternalImageReference,
-  resolveMarkdownImageReference,
-} from '../markdownImagePaths'
+import { createUploadedImageReference } from '../markdownImagePaths'
+import { createMarkdownCodec } from './markdownCodec'
 import { MAX_EDITABLE_MARKDOWN_BYTES, isEditableMarkdownSize, utf8ByteLength } from '../markdownSize'
 import DocumentTabs from './DocumentTabs'
 import { ConflictModal, HistoryModal, RecoveryAlternativesModal, TrashModal } from './EditorRecoveryModals'
+import useWorkspaceRecovery from './useWorkspaceRecovery.js'
+import FileTree from './FileTree'
+import ContextActionMenu from './ContextActionMenu'
+import OutlinePanel, { OutlineList } from './OutlinePanel'
+import WorkbenchToolbar from './WorkbenchToolbar'
 import './Editor.css'
 
 const lowlight = createLowlight(common)
 const MarkdownSourceEditor = lazy(() => import('./MarkdownSourceEditor'))
+const markdownCodec = createMarkdownCodec()
 
 const API = '/api/workspace'
 
@@ -140,161 +136,6 @@ function markdownRepairPreview(before, after) {
     return line.length > 110 ? `${line.slice(0, 107)}…` : line || '(空行)'
   }
   return { before: linePreview(sourceBefore), after: linePreview(sourceAfter) }
-}
-
-function markdownToHtml(markdown, imageIdentity, documentPath) {
-  const html = marked.parse(markdown || '')
-  if (typeof DOMParser === 'undefined') return html
-  const doc = new DOMParser().parseFromString(html, 'text/html')
-  const headingTokens = []
-  const collectHeadings = tokens => {
-    for (const token of tokens || []) {
-      if (token.type === 'heading') headingTokens.push(token)
-      collectHeadings(token.tokens)
-      for (const item of token.items || []) collectHeadings(item.tokens)
-    }
-  }
-  collectHeadings(marked.lexer(markdown || ''))
-  const renderedHeadings = Array.from(doc.querySelectorAll('h1,h2,h3,h4,h5,h6'))
-  headingTokens.forEach((token, index) => {
-    const sourceLine = String(token.raw || '').split(/\r?\n/, 1)[0]
-    if (/^ {0,3}#{1,6}[\t ]+\d+\\\./.test(sourceLine)) {
-      renderedHeadings[index]?.setAttribute('data-markdown-escaped-numbering-dot', 'true')
-    }
-  })
-  doc.querySelectorAll('ul').forEach(list => {
-    const items = Array.from(list.children).filter(node => node.nodeName === 'LI')
-    if (!items.length || !items.every(item => item.querySelector('input[type="checkbox"]'))) return
-    list.setAttribute('data-type', 'taskList')
-    items.forEach(item => {
-      const checkbox = item.querySelector('input[type="checkbox"]')
-      item.setAttribute('data-type', 'taskItem')
-      item.setAttribute('data-checked', String(Boolean(checkbox?.checked)))
-      checkbox?.remove()
-    })
-  })
-  // Markdown image paths stay relative on disk. Resolve them against the
-  // document directory only while rendering; the image endpoint validates
-  // that the requested path is an image inside the active workspace.
-  doc.querySelectorAll('img[src]').forEach(image => {
-    const source = image.getAttribute('src') || ''
-    // Only attributes generated below may carry the Markdown source value;
-    // do not trust similarly named attributes from raw HTML in the document.
-    image.removeAttribute('data-markdown-src')
-    image.removeAttribute('data-markdown-title')
-    if (isExternalImageReference(source)) return
-    const reference = resolveMarkdownImageReference(source, documentPath, imageIdentity)
-    image.setAttribute('data-markdown-src', reference?.markdownSrc || source)
-    const title = image.getAttribute('title')
-    if (title) image.setAttribute('data-markdown-title', title)
-    image.setAttribute('src', reference?.url || 'about:blank')
-  })
-  // Metadata belongs to the immediately preceding image node, not its URL.
-  // Duplicate image paths therefore retain independent display settings.
-  const comments = doc.createTreeWalker(doc.body, NodeFilter.SHOW_COMMENT)
-  const imageComments = []
-  while (comments.nextNode()) imageComments.push(comments.currentNode)
-  imageComments.forEach(comment => {
-    const metadata = parseImagePresentationComment(comment.nodeValue)
-    const legacy = String(comment.nodeValue || '').trim().match(/^zoom:(\d+)$/)
-    const image = comment.previousSibling
-    if (image?.nodeName !== 'IMG' || (!metadata && !legacy)) return
-    if (metadata) {
-      image.setAttribute('data-image-width', String(metadata.width))
-      image.setAttribute('data-image-align', metadata.align)
-    } else image.setAttribute('data-legacy-zoom', legacy[1])
-    comment.remove()
-  })
-  return doc.body.innerHTML
-}
-
-function createMarkdownSerializer() {
-  const td = new Turndown({
-    headingStyle: 'atx',
-    codeBlockStyle: 'fenced',
-    bulletListMarker: '-',
-    emDelimiter: '*',
-    strongDelimiter: '**',
-  })
-  td.addRule('editorStrike', {
-    filter: ['del', 's'],
-    replacement: content => `~~${content}~~`,
-  })
-  td.addRule('editorImagePath', {
-    filter: node => node.nodeName === 'IMG' && node.hasAttribute('data-markdown-src'),
-    replacement: (_content, node) => {
-      const source = node.getAttribute('data-markdown-src') || ''
-      const alt = (node.getAttribute('alt') || '').replace(/\\/g, '\\\\').replace(/\]/g, '\\]')
-      const title = node.getAttribute('data-markdown-title')
-      const formattedTitle = title ? ` "${title.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : ''
-      const presentation = formatImagePresentationComment(node.getAttribute('data-image-width'), node.getAttribute('data-image-align'))
-      const legacy = node.getAttribute('data-legacy-zoom')
-        ? `<!-- zoom:${node.getAttribute('data-legacy-zoom')} -->` : ''
-      return source ? `![${alt}](${source}${formattedTitle})${legacy}${presentation}` : ''
-    },
-  })
-  td.addRule('editorTaskItem', {
-    filter: node => node.nodeName === 'LI' && node.parentNode?.getAttribute('data-type') === 'taskList',
-    replacement: (content, node) => {
-      const checked = node.getAttribute('data-checked') === 'true' ? 'x' : ' '
-      return `- [${checked}] ${content.trim()}\n`
-    },
-  })
-  td.addRule('editorTaskList', {
-    filter: node => node.nodeName === 'UL' && node.getAttribute('data-type') === 'taskList',
-    replacement: content => `\n${content.trim()}\n`,
-  })
-  td.addRule('editorNumberedHeading', {
-    filter: node => /^H[1-6]$/.test(node.nodeName) && /^\s*\d+\./.test(node.textContent || ''),
-    replacement: (content, node) => {
-      const level = Number(node.nodeName.slice(1))
-      const plainNumbering = content.replace(/^(\s*\d+)\\\./, '$1.')
-      const numbering = node.hasAttribute('data-markdown-escaped-numbering-dot')
-        ? plainNumbering.replace(/^(\s*\d+)\./, '$1\\.')
-        : plainNumbering
-      return `${'#'.repeat(level)} ${numbering}\n\n`
-    },
-  })
-  td.addRule('editorTable', {
-    filter: 'table',
-    replacement: (content, node) => {
-      const rows = Array.from(node.querySelectorAll('tr')).map(row => {
-        const cells = Array.from(row.querySelectorAll('th,td'))
-        return {
-          cells,
-          values: cells.map(cell =>
-            td.turndown(cell.innerHTML).trim().replace(/\|/g, '\\|').replace(/\n+/g, '<br>')
-          ),
-        }
-      }).filter(row => row.values.length)
-      if (!rows.length) return ''
-      const columns = Math.max(...rows.map(row => row.values.length))
-      const normalized = rows.map(row => Array.from({ length: columns }, (_, index) => row.values[index] || ''))
-      const alignments = Array.from({ length: columns }, (_, index) => {
-        const values = rows
-          .map(row => row.cells[index]?.getAttribute('align')?.toLowerCase())
-          .filter(value => ['left', 'center', 'right'].includes(value))
-        return values.length && values.every(value => value === values[0]) ? values[0] : null
-      })
-      const separator = alignments.map(alignment => {
-        if (alignment === 'left') return ':---'
-        if (alignment === 'right') return '---:'
-        if (alignment === 'center') return ':---:'
-        return '---'
-      })
-      const lines = [
-        `| ${normalized[0].join(' | ')} |`,
-        `| ${separator.join(' | ')} |`,
-        ...normalized.slice(1).map(row => `| ${row.join(' | ')} |`),
-      ]
-      return `\n${lines.join('\n')}\n`
-    },
-  })
-  return td
-}
-
-function htmlToMarkdown(html) {
-  return createMarkdownSerializer().turndown(html || '')
 }
 
 const MarkdownImage = Image.extend({
@@ -474,22 +315,42 @@ function collectFolders(nodes, excludePath) {
   }))
 }
 
+function menuAnchorPosition(event, fallbackElement) {
+  const clientX = Number(event?.clientX) || 0
+  const clientY = Number(event?.clientY) || 0
+  if (clientX || clientY) return { x: clientX, y: clientY }
+  const rect = fallbackElement?.getBoundingClientRect?.()
+  return rect
+    ? { x: rect.left + Math.min(rect.width / 2, 20), y: rect.bottom }
+    : { x: 12, y: 12 }
+}
+
 // ========== 主组件 ==========
 
-export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) {
+export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, themeToggle }) {
   const [tree, setTree] = useState([])
   const [selectedKey, setSelectedKey] = useState('')
+  const selectedTreeKeys = useMemo(() => [selectedKey], [selectedKey])
   const [openFiles, setOpenFiles] = useState([])
   const [activeFile, setActiveFile] = useState('')
-  const [tabMenu, setTabMenu] = useState({ visible: false, x: 0, y: 0, target: '' })
+  const [tabMenu, setTabMenu] = useState({ visible: false, x: 0, y: 0, target: '', restoreFocusTo: null })
   const [createModal, setCreateModal] = useState({ open: false, parent: '', type: 'file' })
   const [createName, setCreateName] = useState('')
   const [uploading, setUploading] = useState(false)
   const imageInputRef = useRef(null)
-  const [contextMenu, setContextMenu] = useState({ visible: false, node: null, x: 0, y: 0 })
+  const [contextMenu, setContextMenu] = useState({ visible: false, node: null, x: 0, y: 0, restoreFocusTo: null })
   const [moveModal, setMoveModal] = useState({ open: false, node: null })
   const [moveTarget, setMoveTarget] = useState('')
+  const moveTreeSelectedKeys = useMemo(() => moveTarget ? [moveTarget] : [], [moveTarget])
   const [moveBusy, setMoveBusy] = useState(false)
+  const fileTreeHandlersRef = useRef({})
+  const fileTreeSelect = useCallback((...args) => fileTreeHandlersRef.current.select?.(...args), [])
+  const fileTreeDrop = useCallback((...args) => fileTreeHandlersRef.current.drop?.(...args), [])
+  const fileTreeContextMenu = useCallback((...args) => fileTreeHandlersRef.current.contextMenu?.(...args), [])
+  const fileTreeRenameStart = useCallback((...args) => fileTreeHandlersRef.current.renameStart?.(...args), [])
+  const fileTreeRenameConfirm = useCallback((...args) => fileTreeHandlersRef.current.renameConfirm?.(...args), [])
+  const fileTreeRenameCancel = useCallback((...args) => fileTreeHandlersRef.current.renameCancel?.(...args), [])
+  const moveTreeSelect = useCallback((...args) => fileTreeHandlersRef.current.moveSelect?.(...args), [])
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
   const [markdownRepairProposal, setMarkdownRepairProposal] = useState(null)
@@ -504,10 +365,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [isMobile, setIsMobile] = useState(false)
   const [showSidebar] = useState(true)
   const [showToolbar, setShowToolbar] = useState(true)
+  const [directoryMenuOpen, setDirectoryMenuOpen] = useState(false)
   const [sidebarView, setSidebarView] = useState('tree')
   const [showOutline, setShowOutline] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(() => {
-    const stored = parseInt(localStorage.getItem('sidebarWidth') || '280', 10)
+    const storedWidth = readStorage('sidebarWidth')
+    const stored = parseInt(storedWidth.ok ? (storedWidth.value || '280') : '280', 10)
     return Math.max(220, Math.min(520, Number.isFinite(stored) ? stored : 280))
   })
   const sidebarWidthRef = useRef(sidebarWidth)
@@ -527,32 +390,45 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const [conflictReview, setConflictReview] = useState(null)
   const [historyModal, setHistoryModal] = useState({ open: false, path: '', entries: [], loading: false })
   const [trashModalOpen, setTrashModalOpen] = useState(false)
-  const [trashItems, setTrashItems] = useState([])
-  const [trashItemsWorkspaceKey, setTrashItemsWorkspaceKey] = useState('')
-  const [trashLoadingState, setTrashLoadingState] = useState({ workspaceKey: '', loading: false })
-  const [trashMutationBusy, setTrashMutationBusy] = useState(false)
-  const [recoveryStatsState, setRecoveryStatsState] = useState({ workspaceKey: '', stats: null, loading: false })
   const [recoveryModalOpen, setRecoveryModalOpen] = useState(false)
   const recoveryWorkspaceKey = `${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}:${workspaceInfo?.workspace || workspace || ''}`
   const recoveryWorkspaceKeyRef = useRef(recoveryWorkspaceKey)
-  const recoveryStatsRequestRef = useRef(0)
-  const trashRequestRef = useRef(0)
   recoveryWorkspaceKeyRef.current = recoveryWorkspaceKey
-  const recoveryStats = recoveryStatsState.workspaceKey === recoveryWorkspaceKey ? recoveryStatsState.stats : null
-  const recoveryStatsLoading = recoveryStatsState.workspaceKey === recoveryWorkspaceKey && recoveryStatsState.loading
-  const visibleTrashItems = trashItemsWorkspaceKey === recoveryWorkspaceKey ? trashItems : []
-  const trashLoading = trashLoadingState.workspaceKey === recoveryWorkspaceKey && trashLoadingState.loading
+  const {
+    trashItems: visibleTrashItems,
+    trashLoading,
+    mutationBusy: trashMutationBusy,
+    stats: recoveryStats,
+    statsLoading: recoveryStatsLoading,
+    createIntent: createRecoveryIntent,
+    isIntentCurrent: isRecoveryIntentCurrent,
+    runIntent: runRecoveryIntent,
+  } = useWorkspaceRecovery({ api: axios, workspaceKey: recoveryWorkspaceKey, workspaceInfo })
 
   useEffect(() => {
-    recoveryStatsRequestRef.current += 1
-    setRecoveryStatsState({ workspaceKey: recoveryWorkspaceKey, stats: null, loading: false })
-    trashRequestRef.current += 1
-    setTrashItems([])
-    setTrashItemsWorkspaceKey(recoveryWorkspaceKey)
-    setTrashLoadingState({ workspaceKey: recoveryWorkspaceKey, loading: false })
-    setTrashMutationBusy(false)
     setTrashModalOpen(false)
   }, [recoveryWorkspaceKey])
+
+  const reportRecoveryRefresh = useCallback((result, requestedWorkspaceKey) => {
+    if (requestedWorkspaceKey !== recoveryWorkspaceKeyRef.current || result?.currentWorkspace !== true) return
+    if (result.trash?.reason === 'request-failed') {
+      message.error('读取回收站失败：' + requestErrorMessage(result.trash.error, '请求失败'))
+    }
+    if (result.stats?.reason === 'request-failed') {
+      message.error('读取恢复数据空间统计失败：' + requestErrorMessage(result.stats.error, '请求失败'))
+    }
+  }, [])
+
+  const refreshTrashAndRecoveryStats = useCallback(async () => {
+    const intent = createRecoveryIntent('refresh')
+    if (!intent) return { ok: false, reason: 'stale-workspace', currentWorkspace: false }
+    const result = await runRecoveryIntent(intent)
+    const requestedWorkspaceKey = intent.workspaceKey
+    const currentWorkspace = isRecoveryIntentCurrent(intent) && result?.currentWorkspace === true
+    const scopedResult = { ...result, currentWorkspace }
+    reportRecoveryRefresh(scopedResult, requestedWorkspaceKey)
+    return scopedResult
+  }, [createRecoveryIntent, isRecoveryIntentCurrent, reportRecoveryRefresh, runRecoveryIntent])
 
   // The editor renders one document at a time, but every open tab keeps its
   // own Markdown draft. Refs make save callbacks independent of React's
@@ -590,6 +466,27 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const suppressEditorUpdateRef = useRef(false)
   const handleImageUploadRef = useRef(null)
 
+  const markEditorInteracted = useCallback(() => {
+    setEditorInteracted(true)
+    return false
+  }, [])
+  const handleEditorPaste = useCallback((_view, event) => {
+    const items = Array.from(event.clipboardData?.items || [])
+    const imageItem = items.find(item => item.type.startsWith('image/'))
+    if (!imageItem) return false
+    event.preventDefault()
+    const file = imageItem.getAsFile()
+    if (file) handleImageUploadRef.current?.(file)
+    return true
+  }, [])
+  const editorProps = useMemo(() => ({
+    handleDOMEvents: {
+      click: markEditorInteracted,
+      focusin: markEditorInteracted,
+      paste: handleEditorPaste,
+    },
+  }), [handleEditorPaste, markEditorInteracted])
+
   useEffect(() => { activeFileRef.current = activeFile }, [activeFile])
   useEffect(() => { workspaceInfoRef.current = workspaceInfo }, [workspaceInfo])
   useEffect(() => { openFilesRef.current = openFiles }, [openFiles])
@@ -624,8 +521,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     if (workspaceInfo?.workspaceId) {
       // App normally installs this context before mounting Editor. This
       // fallback also makes a direct Editor mount use the supplied identity.
-      localStorage.setItem('editor_workspace_info', JSON.stringify(workspaceInfo))
-      localStorage.setItem('editor_workspace', workspaceInfo.workspace || workspace)
+      writeStorage('editor_workspace_info', JSON.stringify(workspaceInfo))
+      writeStorage('editor_workspace', workspaceInfo.workspace || workspace)
     }
   }, [workspaceInfo, workspace])
 
@@ -642,15 +539,16 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   }, [])
 
   const editor = useEditor({
+    editorProps,
     extensions: [
-      StarterKit.configure({ heading: false, strike: false, codeBlock: false }),
+      StarterKit.configure({ heading: false, strike: false, codeBlock: false, link: false, underline: false }),
       MarkdownHeading.configure({ levels: [1, 2, 3, 4, 5, 6] }),
       CodeBlockLowlight.configure({ lowlight, defaultLanguage: 'plaintext' }),
       MarkdownImage.configure({ inline: false, allowBase64: true }),
       Link.configure({ openOnClick: false }),
       Placeholder.configure({ placeholder: '' }),
       TaskList,
-      TaskItem.configure({ nested: true }),
+      TaskItem.configure({ nested: true, HTMLAttributes: { 'data-type': 'taskItem' } }),
       Table.configure({ resizable: true }),
       TableRow,
       MarkdownTableCell,
@@ -709,15 +607,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     return () => editor.off('selectionUpdate', rerender)
   }, [editor])
 
-  useEffect(() => {
-    if (!editor) return
-    const markInteraction = () => setEditorInteracted(true)
-    const dom = editor.view.dom
-    dom.addEventListener('click', markInteraction)
-    dom.addEventListener('focusin', markInteraction)
-    return () => { dom.removeEventListener('click', markInteraction); dom.removeEventListener('focusin', markInteraction) }
-  }, [editor])
-
   // 键盘快捷键
   useEffect(() => {
     if (!editor) return
@@ -737,29 +626,19 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     return () => window.removeEventListener('keydown', handler)
   }, [editor, activeFile])
 
-  // TipTap paste handler — use a ref so it always sees the current tab.
-  useEffect(() => {
-    if (!editor) return
-    const handlePaste = event => {
-      const items = Array.from(event.clipboardData?.items || [])
-      const imageItem = items.find(item => item.type.startsWith('image/'))
-      if (!imageItem) return
-      event.preventDefault()
-      const file = imageItem.getAsFile()
-      if (file) handleImageUploadRef.current?.(file)
-    }
-    const dom = editor.view.dom
-    dom.addEventListener('paste', handlePaste)
-    return () => dom.removeEventListener('paste', handlePaste)
-  }, [editor])
-
   const loadTree = useCallback(async () => {
+    const intent = createRecoveryIntent('refresh')
+    if (!intent) return false
     try {
       const res = await axios.get(API, { params: { recursive: '1' } })
+      if (!isRecoveryIntentCurrent(intent)) return false
       setTree(buildTree(res.data || []))
       setExpandedKeys(prev => prev.filter(key => findNode(buildTree(res.data || []), key)))
-    } catch {}
-  }, [])
+      return true
+    } catch {
+      return false
+    }
+  }, [createRecoveryIntent, isRecoveryIntentCurrent])
 
   // 搜索文件：输入立即更新，网络请求由 coordinator 防抖并忽略过期响应。
   const handleSearch = useCallback(q => {
@@ -786,25 +665,60 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const handleExpand = useCallback(keys => setExpandedKeys(keys), [])
 
-  useEffect(() => { loadTree() }, [loadTree])
+  const handleFileTreeSelect = (keys, node) => {
+    if (node?.type !== 'file') return
+    setSelectedKey(node.path)
+    setMobileSidebarOpen(false)
+    handleFileOpen(node)
+  }
 
-  useEffect(() => {
-    const handler = () => {
-      setContextMenu(p => ({ ...p, visible: false }))
-      setTabMenu(p => ({ ...p, visible: false }))
+  const handleFileTreeDrop = info => {
+    const target = info.node
+    const draggedKey = info.dragNodesKeys[0]
+    const draggedNode = findNode(tree, draggedKey)
+    const targetNode = findNode(tree, target.key)
+    if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
+    if (draggedNode.path.startsWith(target.key + '/')) {
+      message.warning('不能移动到自己的子目录')
+      return
     }
-    document.addEventListener('click', handler)
-    return () => document.removeEventListener('click', handler)
+    if (draggedNode.path !== target.key) handleMove(draggedNode, target.key)
+  }
+
+  const openNodeContextMenu = (node, event, restoreFocusTo) => {
+    const position = menuAnchorPosition(event, restoreFocusTo)
+    setTabMenu(menu => ({ ...menu, visible: false }))
+    setContextMenu({ visible: true, node, ...position, restoreFocusTo })
+  }
+
+  const openTabContextMenu = (target, event) => {
+    event.preventDefault()
+    const restoreFocusTo = event.currentTarget?.querySelector?.('[role="tab"]') || event.currentTarget
+    const position = menuAnchorPosition(event, restoreFocusTo)
+    setContextMenu(menu => ({ ...menu, visible: false }))
+    setTabMenu({ visible: true, target, ...position, restoreFocusTo })
+  }
+
+  const closeNodeContextMenu = useCallback(() => {
+    setContextMenu(menu => ({ ...menu, visible: false }))
   }, [])
+
+  const closeTabContextMenu = useCallback(() => {
+    setTabMenu(menu => ({ ...menu, visible: false }))
+  }, [])
+
+  useEffect(() => { loadTree() }, [loadTree])
 
   const setEditorMarkdown = useCallback((content, documentPath = activeFileRef.current) => {
     if (!editor) return
     suppressEditorUpdateRef.current = true
     try {
-      // setContent(..., false) does not emit an update. Keep the guard only
-      // around the synchronous replacement so an immediate user keystroke
-      // cannot be mistaken for a programmatic update and silently ignored.
-      editor.commands.setContent(markdownToHtml(content, workspaceInfoRef.current, documentPath), false)
+      // The codec adapter feeds the editor's HTML representation into TipTap.
+      // Keep the guard around replacement so no programmatic update becomes a draft.
+      editor.commands.setContent(markdownCodec.toEditorHtml(content, {
+        imageIdentity: workspaceInfoRef.current,
+        documentPath,
+      }), { emitUpdate: false })
     } finally {
       suppressEditorUpdateRef.current = false
     }
@@ -812,7 +726,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
 
   const serializeCurrentEditor = useCallback(() => {
     if (!editor) return ''
-    return htmlToMarkdown(editor.getHTML())
+    return markdownCodec.fromEditorHtml(editor.getHTML())
   }, [editor])
 
   const captureCurrentDraft = useCallback(() => {
@@ -1752,7 +1666,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     setUploading(true)
     try {
       const res = await axios.post(`${API}/upload`, formData)
-      const info = workspaceInfo || JSON.parse(localStorage.getItem('editor_workspace_info') || 'null') || {}
+      const cachedWorkspace = readJsonStorage('editor_workspace_info', null)
+      const info = workspaceInfo || (cachedWorkspace.ok && cachedWorkspace.value) || {}
       const reference = createUploadedImageReference(res.data.path, targetFile, info)
       if (!reference) throw new Error('上传图片路径无效')
       if (
@@ -1809,77 +1724,24 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         }
       }
       await loadTree()
-      await Promise.all([loadTrash(), loadRecoveryStats()])
+      await refreshTrashAndRecoveryStats()
       message.success(`已移入回收站：${node.path}。可从回收站恢复`)
     } catch (error) {
       message.error('移入回收站失败：' + (error.response?.data?.error || error.message))
     }
   }
 
-  const loadTrash = useCallback(async () => {
-    const requestId = ++trashRequestRef.current
-    const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
-    setTrashLoadingState({ workspaceKey: requestedWorkspaceKey, loading: true })
-    try {
-      const res = await axios.get(`${API}/trash`)
-      if (
-        trashRequestRef.current === requestId &&
-        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
-      ) {
-        setTrashItems(Array.isArray(res.data?.items) ? res.data.items : [])
-        setTrashItemsWorkspaceKey(requestedWorkspaceKey)
-      }
-      return true
-    } catch (error) {
-      if (
-        trashRequestRef.current === requestId &&
-        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
-      ) message.error('读取回收站失败：' + (error.response?.data?.error || error.message))
-      return false
-    } finally {
-      if (
-        trashRequestRef.current === requestId &&
-        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
-      ) setTrashLoadingState({ workspaceKey: requestedWorkspaceKey, loading: false })
-    }
-  }, [])
-
-  const loadRecoveryStats = useCallback(async () => {
-    const requestId = ++recoveryStatsRequestRef.current
-    const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
-    setRecoveryStatsState(current => ({
-      workspaceKey: requestedWorkspaceKey,
-      stats: current.workspaceKey === requestedWorkspaceKey ? current.stats : null,
-      loading: true,
-    }))
-    try {
-      const res = await axios.get(`${API}/recovery/stats`)
-      if (
-        recoveryStatsRequestRef.current === requestId &&
-        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
-      ) {
-        setRecoveryStatsState({ workspaceKey: requestedWorkspaceKey, stats: res.data, loading: false })
-      }
-      return true
-    } catch (error) {
-      if (
-        recoveryStatsRequestRef.current === requestId &&
-        recoveryWorkspaceKeyRef.current === requestedWorkspaceKey
-      ) {
-        setRecoveryStatsState({ workspaceKey: requestedWorkspaceKey, stats: null, loading: false })
-        message.error('读取恢复数据空间统计失败：' + (error.response?.data?.error || error.message))
-      }
-      return false
-    }
-  }, [])
-
-  const refreshTrashAndRecoveryStats = useCallback(async () => {
-    await Promise.all([loadTrash(), loadRecoveryStats()])
-  }, [loadRecoveryStats, loadTrash])
-
   const handleDeleteHistory = useCallback(entry => {
     const path = historyModal.path
     if (!path || !entry?.id) return
+    const intent = createRecoveryIntent('refresh')
+    if (!intent) return
+    const identityConfig = {
+      headers: {
+        'X-Workspace-Id': intent.workspaceId,
+        'X-Workspace-Version': String(intent.workspaceVersion),
+      },
+    }
     Modal.confirm({
       title: '永久删除这个历史版本？',
       content: `将永久删除「${path}」的这条历史版本，无法从编辑器恢复。当前文档内容不会被删除或修改。`,
@@ -1887,45 +1749,62 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: async () => {
+        if (!isRecoveryIntentCurrent(intent)) return
         setHistoryModal(current => current.path === path ? { ...current, loading: true } : current)
         try {
-          await axios.delete(`${API}/file/history`, { params: { path, id: entry.id } })
+          await axios.delete(`${API}/file/history`, { params: { path, id: entry.id }, ...identityConfig })
+          if (!isRecoveryIntentCurrent(intent)) return
           message.success('已永久删除这条历史版本；当前文档保持不变')
         } catch (error) {
-          message.error('删除历史版本失败：' + (error.response?.data?.error || error.message))
+          if (!isRecoveryIntentCurrent(intent)) return
+          message.error('删除历史版本失败：' + requestErrorMessage(error, '请求失败'))
         }
+        if (!isRecoveryIntentCurrent(intent)) return
         try {
           const [updated] = await Promise.all([
-            axios.get(`${API}/file/history`, { params: { path } }),
-            loadRecoveryStats(),
+            axios.get(`${API}/file/history`, { params: { path }, ...identityConfig }),
+            refreshTrashAndRecoveryStats(),
           ])
+          if (!isRecoveryIntentCurrent(intent)) return
           setHistoryModal(current => current.path === path
             ? { ...current, entries: updated.data.history || [], loading: false }
             : current)
         } catch (error) {
+          if (!isRecoveryIntentCurrent(intent)) return
           setHistoryModal(current => current.path === path ? { ...current, loading: false } : current)
-          message.error('刷新版本历史失败：' + (error.response?.data?.error || error.message))
+          message.error('刷新版本历史失败：' + requestErrorMessage(error, '请求失败'))
         }
       },
     })
-  }, [historyModal.path, loadRecoveryStats])
+  }, [createRecoveryIntent, historyModal.path, isRecoveryIntentCurrent, refreshTrashAndRecoveryStats])
 
   const handleOpenTrash = useCallback(async () => {
     setTrashModalOpen(true)
-    await Promise.all([loadTrash(), loadRecoveryStats()])
-  }, [loadRecoveryStats, loadTrash])
+    await refreshTrashAndRecoveryStats()
+  }, [refreshTrashAndRecoveryStats])
 
   const handleRestoreTrashItem = useCallback(async item => {
-    try {
-      await axios.post(`${API}/trash/restore`, { id: item.id })
-      await Promise.all([loadTree(), loadTrash(), loadRecoveryStats()])
-      message.success(`已从回收站恢复：${item.path}`)
-    } catch (error) {
-      message.error('恢复失败：' + (error.response?.data?.error || error.message))
+    const intent = createRecoveryIntent('restore-trash', { id: item?.id })
+    if (!intent) return
+    const result = await runRecoveryIntent(intent)
+    if (!isRecoveryIntentCurrent(intent) || result.currentWorkspace !== true) return
+    if (!result.ok) {
+      if (result.reason === 'busy') {
+        message.warning('另一个回收站操作正在进行，请稍后重试')
+      } else if (result.reason === 'request-failed') {
+        message.error('恢复失败：' + requestErrorMessage(result.error, '请求失败'))
+      }
+      return
     }
-  }, [loadRecoveryStats, loadTrash, loadTree])
+    await loadTree()
+    if (!isRecoveryIntentCurrent(intent)) return
+    reportRecoveryRefresh(result.refresh, intent.workspaceKey)
+    message.success(`已从回收站恢复：${item.path}`)
+  }, [createRecoveryIntent, isRecoveryIntentCurrent, loadTree, reportRecoveryRefresh, runRecoveryIntent])
 
   const handlePurgeExpiredTrash = useCallback(() => {
+    const intent = createRecoveryIntent('purge-expired')
+    if (!intent) return
     Modal.confirm({
       title: '永久清理已过期回收站项目？',
       content: '只会清理已过期的项目。确认后会永久删除这些数据，无法从编辑器恢复；未过期项目会保留。',
@@ -1933,22 +1812,26 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: async () => {
-        setTrashMutationBusy(true)
-        try {
-          const res = await axios.post(`${API}/trash/purge-expired`)
-          message.success(`已永久清理 ${Number(res.data?.purged || 0).toLocaleString()} 个过期项目`)
-        } catch (error) {
-          message.error('清理过期项目失败：' + (error.response?.data?.error || error.message))
-        } finally {
-          await refreshTrashAndRecoveryStats()
-          setTrashMutationBusy(false)
+        if (!isRecoveryIntentCurrent(intent)) return
+        const result = await runRecoveryIntent(intent)
+        if (!isRecoveryIntentCurrent(intent) || result.currentWorkspace !== true) return
+        if (!result.ok) {
+          if (result.reason === 'busy') message.warning('另一个回收站操作正在进行，请稍后重试')
+          else if (result.reason === 'request-failed') {
+            message.error('清理过期项目失败：' + requestErrorMessage(result.error, '请求失败'))
+          }
+          return
         }
+        reportRecoveryRefresh(result.refresh, intent.workspaceKey)
+        message.success(`已永久清理 ${Number(result.data?.purged || 0).toLocaleString()} 个过期项目`)
       },
     })
-  }, [refreshTrashAndRecoveryStats])
+  }, [createRecoveryIntent, isRecoveryIntentCurrent, reportRecoveryRefresh, runRecoveryIntent])
 
   const handlePermanentlyDeleteTrashItem = useCallback(item => {
     if (!item?.id) return
+    const intent = createRecoveryIntent('delete-trash', { id: item.id })
+    if (!intent) return
     Modal.confirm({
       title: `永久删除「${item.path}」？`,
       content: `这会永久删除回收站中的「${item.path}」及其内容，无法从编辑器恢复。该路径已归档的历史版本会保留，可在“已删除文件的历史版本”中单独查看或删除。`,
@@ -1956,19 +1839,21 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       cancelText: '取消',
       okButtonProps: { danger: true },
       onOk: async () => {
-        setTrashMutationBusy(true)
-        try {
-          await axios.delete(`${API}/trash`, { params: { id: item.id } })
-          message.success(`已永久删除：${item.path}`)
-        } catch (error) {
-          message.error('永久删除回收站项目失败：' + (error.response?.data?.error || error.message))
-        } finally {
-          await refreshTrashAndRecoveryStats()
-          setTrashMutationBusy(false)
+        if (!isRecoveryIntentCurrent(intent)) return
+        const result = await runRecoveryIntent(intent)
+        if (!isRecoveryIntentCurrent(intent) || result.currentWorkspace !== true) return
+        if (!result.ok) {
+          if (result.reason === 'busy') message.warning('另一个回收站操作正在进行，请稍后重试')
+          else if (result.reason === 'request-failed') {
+            message.error('永久删除回收站项目失败：' + requestErrorMessage(result.error, '请求失败'))
+          }
+          return
         }
+        reportRecoveryRefresh(result.refresh, intent.workspaceKey)
+        message.success(`已永久删除：${item.path}`)
       },
     })
-  }, [refreshTrashAndRecoveryStats])
+  }, [createRecoveryIntent, isRecoveryIntentCurrent, reportRecoveryRefresh, runRecoveryIntent])
 
   const confirmMoveReferenceImpacts = async (oldPath, newPath) => {
     const loadingKey = 'move-reference-preflight'
@@ -2135,6 +2020,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     setTimeout(() => renameInputRef.current?.select(), 50)
   }
 
+  const handleRenameCancel = () => {
+    setRenameValue('')
+    setRenamingPath(null)
+  }
+
   const handleRenameConfirm = async () => {
     if (!renamingPath || !renameValue.trim()) { setRenamingPath(null); return }
     const parts = renamingPath.split('/')
@@ -2209,52 +2099,63 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
     }, 100)
   }
 
-  const renderTreeNodes = (nodes) =>
-    nodes.map(node => {
-      const isRenaming = renamingPath === node.path
-      const title = isRenaming ? (
-        <input
-          autoFocus ref={renameInputRef}
-          value={renameValue}
-          onChange={e => setRenameValue(e.target.value)}
-          onKeyDown={e => { if (e.key === 'Enter') handleRenameConfirm(); if (e.key === 'Escape') setRenamingPath(null) }}
-          onBlur={handleRenameConfirm}
-          onClick={e => e.stopPropagation()}
-          style={{ padding: '1px 4px', fontSize: 13, width: '100%', border: '1px solid var(--color-primary)', borderRadius: 4, outline: 'none', background: 'var(--color-bg-card)', color: 'var(--color-text)' }}
-        />
-      ) : (
-        <div
-          style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0, overflow: 'hidden', paddingLeft: node.type === 'file' ? 20 : 0 }}
-          onClick={node.type === 'file' ? e => { e.stopPropagation(); handleFileOpen(node); if (isMobile) setMobileSidebarOpen(false) } : undefined}
-          onContextMenu={e => { e.preventDefault(); e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
-        >
-          {node.type === 'dir' ? <FolderOpenOutlined style={{ color: 'var(--color-warning)' }} /> : <FileOutlined style={{ color: 'var(--color-file)' }} />}
-          <span title={node.name} style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{node.name}</span>
-          <span
-            className="tree-node-more"
-            onClick={e => { e.stopPropagation(); setContextMenu({ visible: true, node, x: e.clientX, y: e.clientY }) }}
-            style={{ opacity: 0, cursor: 'pointer', fontSize: 14 }}
-          ><MoreOutlined /></span>
-        </div>
-      )
-      if (node.type === 'dir') {
-        const hasChildren = node.children && node.children.length > 0
-        return { key: node.path, title, ...node, isLeaf: false, ...(hasChildren ? { children: renderTreeNodes(node.children) } : {}) }
-      }
-      return { key: node.path, title, ...node, isLeaf: true }
-    })
-
-  const tbBtn = (active, color) => ({
-    size: 'small',
-    style: {
-      fontWeight: 700, fontSize: 13, borderRadius: 6, height: 34, minWidth: 34, padding: '0 8px',
-      background: active ? 'var(--color-surface-selected)' : 'transparent',
-      color: active ? 'var(--color-primary)' : (color || 'var(--color-text)'),
-      border: 'none', transition: 'all 0.15s',
+  const nodeContextItems = contextMenu.node ? [
+    ...(contextMenu.node.type === 'dir' ? [
+      { key: 'create-folder', label: '在此创建文件夹', icon: <FolderOpenOutlined />, onSelect: () => setCreateModal({ open: true, parent: contextMenu.node.path, type: 'dir' }) },
+      { key: 'create-file', label: '在此创建文件', icon: <FileOutlined />, onSelect: () => setCreateModal({ open: true, parent: contextMenu.node.path, type: 'file' }) },
+      { key: 'divider', type: 'divider' },
+    ] : []),
+    { key: 'rename', label: '重命名', icon: <EditOutlined />, onSelect: () => handleRenameStart(contextMenu.node) },
+    { key: 'move', label: '移动到...', icon: <SwapOutlined />, onSelect: () => { setMoveModal({ open: true, node: contextMenu.node }); setMoveTarget('') } },
+    {
+      key: 'delete', label: '移入回收站', icon: <DeleteOutlined />, danger: true,
+      onSelect: () => Modal.confirm({
+        title: `将「${contextMenu.node.name}」移入回收站？`,
+        content: contextMenu.node.type === 'dir' ? '整个文件夹及其中内容会一起移入回收站，可从回收站恢复。' : '文件会移入回收站，可从回收站恢复。',
+        okText: '移入回收站', cancelText: '取消', okButtonProps: { danger: true },
+        onOk: () => handleDelete(contextMenu.node),
+      }),
     },
-  })
+  ] : []
 
-  const moveFolderTree = moveModal.node ? collectFolders(tree, moveModal.node.path) : []
+  const tabContextItems = [
+    { key: 'close', label: '关闭当前', icon: <CloseOutlined />, onSelect: () => handleClose(tabMenu.target) },
+    { key: 'close-others', label: '关闭其他', icon: <FileOutlined />, onSelect: async () => {
+      const target = tabMenu.target
+      await closeTabGroup(openFiles.filter(file => file !== target))
+      await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' })
+    } },
+    { key: 'close-left', label: '关闭左侧', icon: <SwapOutlined />, onSelect: async () => {
+      const target = tabMenu.target
+      const index = openFiles.indexOf(target)
+      await closeTabGroup(openFiles.slice(0, index))
+      await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' })
+    } },
+    { key: 'close-right', label: '关闭右侧', icon: <EditOutlined />, onSelect: async () => {
+      const target = tabMenu.target
+      const index = openFiles.indexOf(target)
+      await closeTabGroup(openFiles.slice(index + 1))
+      await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' })
+    } },
+  ]
+
+  const moveFolderTree = useMemo(
+    () => moveModal.node ? collectFolders(tree, moveModal.node.path) : [],
+    [moveModal.node, tree],
+  )
+  useLayoutEffect(() => {
+    fileTreeHandlersRef.current = {
+      select: handleFileTreeSelect,
+      drop: handleFileTreeDrop,
+      contextMenu: openNodeContextMenu,
+      renameStart: handleRenameStart,
+      renameConfirm: handleRenameConfirm,
+      renameCancel: handleRenameCancel,
+      moveSelect: (_keys, node) => {
+        if (node?.type === 'dir') setMoveTarget(node.path)
+      },
+    }
+  })
   const activeConflict = activeFile ? fileConflicts[activeFile] : null
   const activeLargeMarkdown = largeMarkdownView?.path === activeFile ? largeMarkdownView : null
   const tabDirtyState = isDirty
@@ -2283,41 +2184,6 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
   const activeSaveStatus = activeLargeMarkdown ? (activeLargeMarkdown.hasUnsavedDraft ? 'error' : 'saved') : activeFile
     ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
     : 'idle'
-  const headingItems = [
-    { key: 'paragraph', label: '正文' },
-    { key: 'heading-1', label: '标题 1' },
-    { key: 'heading-2', label: '标题 2' },
-    { key: 'heading-3', label: '标题 3' },
-    { key: 'heading-4', label: '标题 4' },
-    { key: 'heading-5', label: '标题 5' },
-    { key: 'heading-6', label: '标题 6' },
-  ]
-  const activeHeading = [1, 2, 3, 4, 5, 6].find(level => editor?.isActive('heading', { level }))
-  const activeHeadingLabel = activeHeading ? `标题 ${activeHeading}` : '正文'
-  const mobileToolbarItems = [
-    { key: 'strike', label: '删除线', icon: <StrikethroughOutlined /> },
-    { key: 'bullet-list', label: '无序列表', icon: <UnorderedListOutlined /> },
-    { key: 'ordered-list', label: '有序列表', icon: <OrderedListOutlined /> },
-    { key: 'task-list', label: '任务列表', icon: <CheckSquareOutlined /> },
-    { type: 'divider' },
-    { key: 'blockquote', label: '引用', icon: <HolderOutlined /> },
-    { key: 'code-block', label: '代码块', icon: <ApiOutlined /> },
-    { key: 'link', label: '插入链接', icon: <LinkOutlined /> },
-    { key: 'image', label: '上传图片', icon: <UploadOutlined /> },
-  ]
-  const applyMobileToolbarAction = ({ key }) => {
-    if (showSourceRef.current && key !== 'image') return
-    const chain = editor?.chain().focus()
-    if (key === 'strike') chain?.toggleStrike().run()
-    if (key === 'bullet-list') chain?.toggleBulletList().run()
-    if (key === 'ordered-list') chain?.toggleOrderedList().run()
-    if (key === 'task-list') chain?.toggleTaskList().run()
-    if (key === 'blockquote') chain?.toggleBlockquote().run()
-    if (key === 'code-block') chain?.toggleCodeBlock().run()
-    if (key === 'link') handleInsertLink()
-    if (key === 'image') imageInputRef.current?.click()
-  }
-
   return (
     <div
       id="editor-root"
@@ -2326,7 +2192,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         display: 'flex',
         ...(isMobile
           ? { position: 'fixed', top: 0, left: 0, right: 0, bottom: 0 }
-          : { height: 'calc(100vh - 0px)', padding: 0 }),
+          : { height: '100dvh', padding: 0 }),
         gap: isMobile ? 0 : 0,
         overflow: 'hidden',
         background: 'var(--color-bg)',
@@ -2353,6 +2219,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                   <Tooltip title="新建文件"><Button size="small" icon={<FileAddOutlined />} onClick={() => setCreateModal({ open: true, parent: '', type: 'file' })} aria-label="新建文件" title="新建文件" /></Tooltip>
                   <Dropdown
                     trigger={['click']}
+                    open={directoryMenuOpen}
+                    onOpenChange={setDirectoryMenuOpen}
                     menu={{
                       items: [
                         { key: 'expand', label: isAllExpanded ? '全部折叠' : '全部展开', icon: <MenuOutlined /> },
@@ -2376,7 +2244,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                       },
                     }}
                   >
-                    <Tooltip title="更多目录操作"><Button size="small" icon={<MoreOutlined />} aria-label="更多目录操作" /></Tooltip>
+                    <Tooltip title="更多目录操作"><Button size="small" icon={<MoreOutlined />} aria-label="更多目录操作" aria-haspopup="menu" aria-expanded={directoryMenuOpen} /></Tooltip>
                   </Dropdown>
                 </div>
               </div>
@@ -2395,34 +2263,34 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                     <div style={{ padding: '8px 4px', fontSize: 12, color: 'var(--color-text-secondary)' }}>无结果</div>
                   )}
                   {searchResults.map(r => (
-                    <div key={r.path} onClick={() => handleFileOpen({ path: r.path, name: r.name, type: 'file' })}
-                      style={{ padding: '6px 8px', cursor: 'pointer', borderRadius: 6, fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                      onMouseEnter={e => e.currentTarget.style.background = 'var(--color-surface-hover)'}
-                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                    <button type="button" className="search-result" key={r.path} onClick={() => handleFileOpen({ path: r.path, name: r.name, type: 'file' })}>
                       <FileOutlined style={{ color: 'var(--color-file)', marginRight: 6 }} />
-                      <span style={{ fontWeight: 500 }}>{r.name}</span>
-                      {r.preview && <div style={{ fontSize: 11, color: 'var(--color-text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', marginLeft: 20 }}>{r.preview}</div>}
-                    </div>
+                      <span className="search-result-copy">
+                        <span className="search-result-name">{r.name}</span>
+                        {r.preview && <span className="search-result-preview">{r.preview}</span>}
+                      </span>
+                    </button>
                   ))}
                 </div>
               )}
               <div className="tree-scroll" style={{ flex: '1 1 0%', minHeight: 0, minWidth: 0, overflowX: 'hidden', overflowY: 'auto', padding: '0 8px 8px' }}>
-                <Tree
-                  treeData={renderTreeNodes(tree)}
-                  selectedKeys={[selectedKey]}
+                <FileTree
+                  aria-label="文件目录"
+                  nodes={tree}
+                  selectedKeys={selectedTreeKeys}
                   expandedKeys={expandedKeys}
                   onExpand={handleExpand}
-                  expandAction="click"
                   draggable
-                  onDrop={info => {
-                    const target = info.node
-                    const draggedKey = info.dragNodesKeys[0]
-                    const draggedNode = findNode(tree, draggedKey)
-                    const targetNode = findNode(tree, target.key)
-                    if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
-                    if (draggedNode.path.startsWith(target.key + '/')) { message.warning('不能移动到自己的子目录'); return }
-                    if (draggedNode.path !== target.key) handleMove(draggedNode, target.key)
-                  }}
+                  onSelect={fileTreeSelect}
+                  onContextMenu={fileTreeContextMenu}
+                  onDrop={fileTreeDrop}
+                  renamingPath={renamingPath}
+                  renameValue={renameValue}
+                  renameInputRef={renameInputRef}
+                  onRenameChange={setRenameValue}
+                  onRenameStart={fileTreeRenameStart}
+                  onRenameConfirm={fileTreeRenameConfirm}
+                  onRenameCancel={fileTreeRenameCancel}
                 />
               </div>
             </>
@@ -2435,29 +2303,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                 <span style={{ fontSize: 13, color: 'var(--color-text-secondary)', fontWeight: 600 }}>大纲</span>
                 {activeFile && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginLeft: 4, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>— {activeFile.split('/').pop()}</span>}
               </div>
-              <div style={{ flex: 1, overflow: 'auto', padding: '8px' }}>
-                {visibleOutlineItems.length === 0 && (
-                  <div style={{ padding: '24px', textAlign: 'center', color: 'var(--color-text-secondary)', fontSize: 13 }}>当前文档无标题</div>
-                )}
-                {visibleOutlineItems.map((item, i) => (
-                  <div
-                    key={i}
-                    onClick={() => goToOutlineItem(item)}
-                    style={{
-                      padding: '6px 8px', fontSize: 13, cursor: 'pointer',
-                      paddingLeft: 8 + (item.level - 1) * 14,
-                      color: 'var(--color-text)',
-                      borderRadius: 6, marginBottom: 2,
-                      display: 'flex', alignItems: 'center', gap: 6,
-                    }}
-                    onMouseEnter={e => e.currentTarget.style.background = 'var(--color-surface-hover)'}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
-                  >
-                    <span style={{ fontSize: 10, color: 'var(--color-text-secondary)', fontWeight: 700, minWidth: 14 }}>H{item.level}</span>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.text}</span>
-                  </div>
-                ))}
-              </div>
+              <OutlineList className="sidebar-outline-items" items={visibleOutlineItems} onSelect={goToOutlineItem} />
             </>
           )}
           <div className="workspace-status" style={{ flexShrink: 0, padding: '4px 12px 6px', borderTop: '1px solid var(--color-border)', background: 'var(--color-bg-muted)' }}>
@@ -2488,7 +2334,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             isDraggingRef.current = false
             document.body.style.cursor = ''
             document.body.style.userSelect = ''
-            localStorage.setItem('sidebarWidth', String(sidebarWidthRef.current))
+            writeStorage('sidebarWidth', String(sidebarWidthRef.current))
             window.removeEventListener('mousemove', handleMouseMove)
             window.removeEventListener('mouseup', handleMouseUp)
           }
@@ -2538,43 +2384,31 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             {recoveryAlternativeCount > 0 && <Tooltip title={`其他恢复草稿（${recoveryAlternativeCount}）`}><Button aria-label="打开其他恢复草稿" size="small" icon={<HistoryOutlined />} onClick={() => { setMobileSidebarOpen(false); setRecoveryModalOpen(true) }} /></Tooltip>}
           </div>
           {sidebarView === 'outline' ? (
-            <div className="mobile-outline-list" aria-label="文档大纲">
-              {visibleOutlineItems.length === 0 && <div className="outline-empty">当前文档还没有标题</div>}
-              {visibleOutlineItems.map((item, i) => (
-                <button
-                  type="button"
-                  className="outline-item"
-                  key={`${item.pos}-${i}`}
-                  style={{ paddingLeft: 10 + (item.level - 1) * 14 }}
-                  onClick={() => {
-                    goToOutlineItem(item)
-                    setMobileSidebarOpen(false)
-                  }}
-                  title={item.text}
-                >
-                  <span className="outline-level">H{item.level}</span>
-                  <span>{item.text || '无标题'}</span>
-                </button>
-              ))}
-            </div>
+            <OutlineList
+              className="mobile-outline-list"
+              items={visibleOutlineItems}
+              onSelect={item => {
+                goToOutlineItem(item)
+                setMobileSidebarOpen(false)
+              }}
+            />
           ) : (
-            <Tree
-              treeData={renderTreeNodes(tree)}
-              selectedKeys={[selectedKey]}
+            <FileTree
+              aria-label="文件目录"
+              nodes={tree}
+              selectedKeys={selectedTreeKeys}
               expandedKeys={expandedKeys}
               onExpand={handleExpand}
-              expandAction="click"
-              onSelect={(keys) => {
-                if (keys.length > 0) setMobileSidebarOpen(false)
-              }}
-              onDrop={info => {
-                const target = info.node
-                const draggedKey = info.dragNodesKeys[0]
-                const draggedNode = findNode(tree, draggedKey)
-                const targetNode = findNode(tree, target.key)
-                if (!draggedNode || !targetNode || targetNode.type !== 'dir') return
-                handleMove(draggedNode, target.key)
-              }}
+              onSelect={fileTreeSelect}
+              onContextMenu={fileTreeContextMenu}
+              onDrop={fileTreeDrop}
+              renamingPath={renamingPath}
+              renameValue={renameValue}
+              renameInputRef={renameInputRef}
+              onRenameChange={setRenameValue}
+              onRenameStart={fileTreeRenameStart}
+              onRenameConfirm={fileTreeRenameConfirm}
+              onRenameCancel={fileTreeRenameCancel}
             />
           )}
           <div style={{ marginTop: 4, padding: '4px 10px 6px', borderRadius: 8, background: 'var(--color-bg-muted)', border: '1px solid var(--color-border)' }}>
@@ -2590,12 +2424,14 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
         statsLoading={recoveryStatsLoading}
         stats={recoveryStats}
         formatBytes={formatRecoveryBytes}
-        onRetryStats={loadRecoveryStats}
+        onRetryStats={refreshTrashAndRecoveryStats}
         mutationBusy={trashMutationBusy}
         loading={trashLoading}
         onPurgeExpired={handlePurgeExpiredTrash}
         onOrphanHistoryChange={async change => {
-          await refreshTrashAndRecoveryStats()
+          const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
+          const result = await refreshTrashAndRecoveryStats()
+          if (requestedWorkspaceKey !== recoveryWorkspaceKeyRef.current || result.currentWorkspace !== true) return
           if (change?.type === 'restore') await loadTree()
         }}
         onRestore={handleRestoreTrashItem}
@@ -2739,127 +2575,30 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
             </div>
           ) : (
             <>
-              {showToolbar && !isMobile && (
-                <div className="editor-toolbar" role="toolbar" aria-label="编辑工具栏">
-                  {!showSource && <>
-                  <div className="toolbar-group toolbar-format-group">
-                    <Tooltip title="加粗 (⌘/Ctrl+B)"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
-                    <Tooltip title="斜体 (⌘/Ctrl+I)"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
-                    <Tooltip title="删除线"><Button aria-label="删除线" {...tbBtn(editor?.isActive('strike') || false)} onClick={() => editor?.chain().focus().toggleStrike().run()} icon={<StrikethroughOutlined />} /></Tooltip>
-                    <Dropdown
-                      trigger={['click']}
-                      menu={{
-                        items: headingItems,
-                        selectable: false,
-                        onClick: ({ key }) => {
-                          const chain = editor?.chain().focus()
-                          if (!chain) return
-                          if (key === 'paragraph') chain.setParagraph().run()
-                          else chain.toggleHeading({ level: Number(key.split('-')[1]) }).run()
-                        },
-                      }}
-                    >
-                      <Button className="heading-picker" aria-label={`当前段落样式：${activeHeadingLabel}`} {...tbBtn(Boolean(activeHeading), 'var(--color-text)')}>
-                        <span>{activeHeadingLabel}</span><DownOutlined />
-                      </Button>
-                    </Dropdown>
-                  </div>
-                  <span className="toolbar-divider" aria-hidden="true" />
-                  <div className="toolbar-group">
-                    <Tooltip title="无序列表"><Button aria-label="无序列表" {...tbBtn(editor?.isActive('bulletList') || false)} onClick={() => editor?.chain().focus().toggleBulletList().run()} icon={<UnorderedListOutlined />} /></Tooltip>
-                    <Tooltip title="有序列表"><Button aria-label="有序列表" {...tbBtn(editor?.isActive('orderedList') || false)} onClick={() => editor?.chain().focus().toggleOrderedList().run()} icon={<OrderedListOutlined />} /></Tooltip>
-                    <Tooltip title="任务列表"><Button aria-label="任务列表" {...tbBtn(editor?.isActive('taskList') || false)} onClick={() => editor?.chain().focus().toggleTaskList().run()} icon={<CheckSquareOutlined />} /></Tooltip>
-                  </div>
-                  <span className="toolbar-divider" aria-hidden="true" />
-                  <div className="toolbar-group">
-                    <Tooltip title="引用"><Button aria-label="引用" {...tbBtn(editor?.isActive('blockquote') || false)} onClick={() => editor?.chain().focus().toggleBlockquote().run()} icon={<HolderOutlined />} /></Tooltip>
-                    <Tooltip title="代码块"><Button aria-label="代码块" {...tbBtn(editor?.isActive('codeBlock') || false)} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<ApiOutlined />} /></Tooltip>
-                    <Tooltip title="插入链接"><Button aria-label="插入链接" {...tbBtn(editor?.isActive('link') || false)} onClick={handleInsertLink} icon={<LinkOutlined />} /></Tooltip>
-                    <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
-                  </div>
-                  </>}
-                  <div className="toolbar-group">
-                    <Tooltip title="上传图片"><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} onClick={() => imageInputRef.current?.click()} /></Tooltip>
-                  </div>
-                  <span className="toolbar-spacer" />
-                  <div className="toolbar-group toolbar-view-group">
-                    <Tooltip title={showSource ? '编辑' : '源码'}>
-                      <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
-                        <span className="mode-button-label">{showSource ? '编辑' : '源码'}</span>
-                      </Button>
-                    </Tooltip>
-                    {!isMobile && <Tooltip title={showOutline ? '隐藏右侧大纲' : '显示右侧大纲'}>
-                      <Button aria-label={showOutline ? '隐藏右侧大纲' : '显示右侧大纲'} {...tbBtn(showOutline, 'var(--color-text-secondary)')} onClick={() => setShowOutline(v => !v)} icon={<ReadOutlined />} />
-                    </Tooltip>}
-                    <Tooltip title={editorFullscreen ? '退出专注模式' : '专注模式'}><Button aria-label={editorFullscreen ? '退出专注模式' : '进入专注模式'} {...tbBtn(editorFullscreen, 'var(--color-text-secondary)')} onClick={() => setEditorFullscreen(v => !v)} icon={editorFullscreen ? <ShrinkOutlined /> : <ExpandOutlined />} /></Tooltip>
-                    <Tooltip title="隐藏工具栏"><Button aria-label="隐藏工具栏" {...tbBtn(false, 'var(--color-text-secondary)')} onClick={() => setShowToolbar(false)} icon={<AlignLeftOutlined />} /></Tooltip>
-                  </div>
-                </div>
-              )}
-
-              {showToolbar && isMobile && (
-                <div className="mobile-toolbar" role="toolbar" aria-label="移动端编辑工具栏">
-                  {!showSource && <>
-                  <Tooltip title="加粗"><Button aria-label="加粗" {...tbBtn(editor?.isActive('bold') || false)} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
-                  <Tooltip title="斜体"><Button aria-label="斜体" {...tbBtn(editor?.isActive('italic') || false)} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
-                  <Dropdown
-                    trigger={['click']}
-                    menu={{
-                      items: headingItems,
-                      selectable: false,
-                      onClick: ({ key }) => {
-                        const chain = editor?.chain().focus()
-                        if (!chain) return
-                        if (key === 'paragraph') chain.setParagraph().run()
-                        else chain.toggleHeading({ level: Number(key.split('-')[1]) }).run()
-                      },
-                    }}
-                  >
-                    <Button className="heading-picker" aria-label={`当前段落样式：${activeHeadingLabel}`} {...tbBtn(Boolean(activeHeading), 'var(--color-text)')}>
-                      <span>{activeHeadingLabel}</span><DownOutlined />
-                    </Button>
-                  </Dropdown>
-                  <Dropdown
-                    trigger={['click']}
-                    menu={{ items: mobileToolbarItems, selectable: false, onClick: applyMobileToolbarAction }}
-                  >
-                    <Button className="mobile-more-formats" aria-label="更多格式" {...tbBtn(false, 'var(--color-text-secondary)')} icon={<MoreOutlined />}>更多格式</Button>
-                  </Dropdown>
-                  <TableInsertButton editor={editor} buttonProps={tbBtn(false)} onInsert={() => setEditorInteracted(true)} />
-                  </>}
-                  {showSource && <Tooltip title="上传图片"><Button aria-label="上传图片" {...tbBtn(false)} icon={<UploadOutlined />} loading={uploading} onClick={() => imageInputRef.current?.click()} /></Tooltip>}
-                  <span className="toolbar-spacer" />
-                  <Tooltip title={showSource ? '编辑' : '源码'}>
-                    <Button aria-label={showSource ? '编辑' : '源码'} disabled={fileLoading} {...tbBtn(showSource, 'var(--color-text-secondary)')} onClick={handleToggleSource} icon={showSource ? <EditOutlined /> : <CodeOutlined />}>
-                      <span className="mode-button-label">{showSource ? '编辑' : '源码'}</span>
-                    </Button>
-                  </Tooltip>
-                  <Tooltip title="隐藏工具栏"><Button aria-label="隐藏工具栏" {...tbBtn(false, 'var(--color-text-secondary)')} onClick={() => setShowToolbar(false)} icon={<AlignLeftOutlined />} /></Tooltip>
-                </div>
-              )}
-
-              {!showToolbar && !isMobile && (
-                <Button
-                  size="small"
-                  icon={<AlignLeftOutlined />}
-                  onClick={() => setShowToolbar(true)}
-                  title="显示工具栏"
-                  style={{ position: 'absolute', top: 8, right: 12, zIndex: 2, borderRadius: 6 }}
-                />
-              )}
+              <WorkbenchToolbar
+                editor={editor}
+                isMobile={isMobile}
+                showToolbar={showToolbar}
+                onToggleToolbar={() => setShowToolbar(value => !value)}
+                showSource={showSource}
+                fileLoading={fileLoading}
+                uploading={uploading}
+                onToggleSource={handleToggleSource}
+                onInsertLink={handleInsertLink}
+                onUploadImage={() => imageInputRef.current?.click()}
+                onTableInsert={() => setEditorInteracted(true)}
+                showOutline={showOutline}
+                onToggleOutline={() => setShowOutline(value => !value)}
+                editorFullscreen={editorFullscreen}
+                onToggleFullscreen={() => setEditorFullscreen(value => !value)}
+              />
 
               {/* 编辑区 */}
               {activeMarkdownRepair && (
                 <div className="markdown-repair-banner" role="region" aria-label="Markdown 修复建议">
                   <div className="markdown-repair-copy">
-                    <strong>发现可自动修复的 Markdown 写法</strong>
-                    <span>查看预览后确认；文件会立即修复并保存，确认前原文保持不变。</span>
-                    {markdownRepairChanges.length > 0 && (
-                      <ul>
-                        {markdownRepairChanges.slice(0, 3).map((change, index) => <li key={`${index}-${change}`}>{change}</li>)}
-                        {markdownRepairChanges.length > 3 && <li>另有 {markdownRepairChanges.length - 3} 项</li>}
-                      </ul>
-                    )}
+                    <strong>发现可安全规范的 Markdown 写法</strong>
+                    <span>先看一处预览。文件只会在确认后修复并保存；暂不修复会保留原文。</span>
                     {markdownRepairExample && (
                       <div className="markdown-repair-example" aria-label="修复前后预览">
                         <code>{markdownRepairExample.before}</code>
@@ -2867,14 +2606,22 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
                         <code>{markdownRepairExample.after}</code>
                       </div>
                     )}
-                    {markdownRepairDiagnostics.length > 0 ? (
-                      <span className="markdown-repair-remaining">
-                        修复后仍有 {markdownRepairDiagnostics.length} 处暂不支持的内容，保存后继续使用源码模式。
-                        {markdownRepairDiagnosticLabels.length > 0 ? ` 包括：${markdownRepairDiagnosticLabels.slice(0, 3).join('、')}${markdownRepairDiagnosticLabels.length > 3 ? '等' : ''}。` : ''}
-                      </span>
-                    ) : (
-                      <span className="markdown-repair-remaining">修复后没有剩余的源码保护内容，可使用富文本编辑。</span>
-                    )}
+                    <details className="markdown-repair-details">
+                      <summary>查看全部 {markdownRepairChanges.length} 项和修复后的保护状态</summary>
+                      {markdownRepairChanges.length > 0 && (
+                        <ul>
+                          {markdownRepairChanges.map((change, index) => <li key={`${index}-${change}`}>{change}</li>)}
+                        </ul>
+                      )}
+                      {markdownRepairDiagnostics.length > 0 ? (
+                        <span className="markdown-repair-remaining">
+                          修复后仍有 {markdownRepairDiagnostics.length} 处源码保护内容，保存后继续使用源码模式。
+                          {markdownRepairDiagnosticLabels.length > 0 ? ` 包括：${markdownRepairDiagnosticLabels.slice(0, 3).join('、')}${markdownRepairDiagnosticLabels.length > 3 ? '等' : ''}。` : ''}
+                        </span>
+                      ) : (
+                        <span className="markdown-repair-remaining">修复后没有剩余的源码保护内容，可使用富文本编辑。</span>
+                      )}
+                    </details>
                   </div>
                   <div className="markdown-repair-actions">
                     <Button size="small" disabled={markdownRepairSaving} onClick={handleCancelMarkdownRepair}>暂不修复</Button>
@@ -2887,7 +2634,13 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               )}
               {sourceModeRequired && (
                 <div role="status" className="source-fidelity-warning">
-                  <span>{sourceDiagnostics.length} 处内容需要源码保护。波浪线标出具体片段；悬停可查看原因。</span>
+                  <div className="source-fidelity-copy">
+                    <span>{sourceDiagnostics.length} 处内容需要源码保护。波浪线标出具体片段；悬停可查看原因。</span>
+                    <details>
+                      <summary>为什么使用源码模式？</summary>
+                      <p>这些可能是合法的 Markdown 写法，并不代表语法错误。源码模式保留原文，避免富文本转换改写内容。</p>
+                    </details>
+                  </div>
                   <Button size="small" onClick={() => sourceEditorRef.current?.nextProtected()} aria-label="跳转到下一个受保护位置">下一个位置（F8）</Button>
                 </div>
               )}
@@ -2948,7 +2701,8 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
               <Button size="small" danger disabled={!activeConflict.diskRevision} onClick={handleReloadDiskAfterConflict}>丢弃草稿并重载</Button>
             </div>
           )}
-          <div className="editor-statusbar" aria-label="文档状态栏">
+          <div className={`editor-statusbar${isMobile || editorFullscreen ? ' editor-statusbar-theme-slot' : ''}`} aria-label="文档状态栏">
+            <div className="editor-theme-slot">{themeToggle}</div>
             <div className="editor-file-location" title={activeFile || '尚未选择文件'}>
               <FileOutlined aria-hidden="true" />
               <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>
@@ -2977,39 +2731,12 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
       </div>
 
       {!isMobile && !editorFullscreen && showOutline && isMarkdownFile(activeFile) && (
-        <aside className="outline-panel" aria-label="文档大纲">
-          <div className="outline-panel-header">
-            <div>
-              <span className="outline-panel-title">文档大纲</span>
-              <span className="outline-panel-file">{activeFile.split('/').pop()}</span>
-            </div>
-            <Button
-              type="text"
-              size="small"
-              icon={<CloseOutlined />}
-              aria-label="隐藏右侧大纲"
-              onClick={() => setShowOutline(false)}
-            />
-          </div>
-          <div className="outline-panel-body">
-            {visibleOutlineItems.length === 0 && (
-              <div className="outline-empty">当前文档还没有标题</div>
-            )}
-            {visibleOutlineItems.map((item, i) => (
-              <button
-                type="button"
-                className="outline-item"
-                key={`${item.pos}-${i}`}
-                style={{ paddingLeft: 12 + (item.level - 1) * 14 }}
-                onClick={() => goToOutlineItem(item)}
-                title={item.text}
-              >
-                <span className="outline-level">H{item.level}</span>
-                <span>{item.text || '无标题'}</span>
-              </button>
-            ))}
-          </div>
-        </aside>
+        <OutlinePanel
+          items={visibleOutlineItems}
+          fileName={activeFile.split('/').pop()}
+          onSelect={goToOutlineItem}
+          onClose={() => setShowOutline(false)}
+        />
       )}
 
       {/* 新建 */}
@@ -3058,57 +2785,39 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange }) 
           }}>移动</Button>,
         ]}>
         <div style={{ border: '1px solid var(--color-border)', borderRadius: 6, padding: 8, maxHeight: 260, overflow: 'auto' }}>
-          <div onClick={() => setMoveTarget('')} style={{ padding: '4px 8px', borderRadius: 4, cursor: 'pointer', background: moveTarget === '' ? 'var(--color-surface-selected)' : 'transparent', color: 'var(--color-text-secondary)', marginBottom: 4, fontSize: 13 }}>
+          <button type="button" className="move-root-target" aria-pressed={moveTarget === ''} onClick={() => setMoveTarget('')}>
             <FolderOpenOutlined style={{ color: 'var(--color-warning)', marginRight: 4 }} />根目录
-          </div>
-          <Tree treeData={renderTreeNodes(moveFolderTree)} selectedKeys={[moveTarget]} onSelect={([key]) => setMoveTarget((key) || '')} />
+          </button>
+          <FileTree
+            aria-label="移动目标文件夹"
+            nodes={moveFolderTree}
+            selectedKeys={moveTreeSelectedKeys}
+            showActions={false}
+            onSelect={moveTreeSelect}
+          />
         </div>
       </Modal>
 
-      {/* 右键菜单 */}
       {contextMenu.visible && contextMenu.node && (
-        <div
-          style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, zIndex: 9999, background: 'var(--color-bg-card)', border: '1px solid var(--color-border)', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', padding: '4px 0', minWidth: 160 }}
-          onClick={e => e.stopPropagation()}
-        >
-          {contextMenu.node.type === 'dir' && (
-            <>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { setContextMenu(p => ({ ...p, visible: false })); setCreateModal({ open: true, parent: contextMenu.node.path, type: 'dir' }) }}>
-                <FolderOpenOutlined style={{ color: 'var(--color-warning)' }} />在此创建文件夹
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { setContextMenu(p => ({ ...p, visible: false })); setCreateModal({ open: true, parent: contextMenu.node.path, type: 'file' }) }}>
-                <FileOutlined style={{ color: 'var(--color-file)' }} />在此创建文件
-              </div>
-            </>
-          )}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => handleRenameStart(contextMenu.node)}>
-            <EditOutlined />重命名
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { setMoveModal({ open: true, node: contextMenu.node }); setMoveTarget(''); setContextMenu(p => ({ ...p, visible: false })) }}>
-            <SwapOutlined />移动到...
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13, color: 'var(--color-danger)' }} onClick={() => { setContextMenu(p => ({ ...p, visible: false })); Modal.confirm({ title: `将「${contextMenu.node.name}」移入回收站？`, content: contextMenu.node.type === 'dir' ? '整个文件夹及其中内容会一起移入回收站，可从回收站恢复。' : '文件会移入回收站，可从回收站恢复。', okText: '移入回收站', cancelText: '取消', okButtonProps: { danger: true }, onOk: () => handleDelete(contextMenu.node) }) }}>
-            <DeleteOutlined />删除
-          </div>
-        </div>
+        <ContextActionMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          label={`${contextMenu.node.name} 操作`}
+          items={nodeContextItems}
+          restoreFocusTo={contextMenu.restoreFocusTo}
+          onClose={closeNodeContextMenu}
+        />
       )}
       {tabMenu.visible && (
-        <div style={{ position: 'fixed', left: tabMenu.x, top: tabMenu.y, zIndex: 9999, background: 'var(--color-bg-card)', border: '1px solid var(--color-border)', borderRadius: 8, boxShadow: '0 4px 12px rgba(0,0,0,0.15)', padding: '4px 0', minWidth: 160 }} onContextMenu={(e) => { e.preventDefault() }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={() => { handleClose(tabMenu.target); setTabMenu(p => ({ ...p, visible: false })) }}>
-            <CloseOutlined />关闭当前
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={async () => { const target = tabMenu.target; await closeTabGroup(openFiles.filter(file => file !== target)); await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' }); setTabMenu(p => ({ ...p, visible: false })) }}>
-            <FileOutlined />关闭其他
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={async () => { const target = tabMenu.target; const idx = openFiles.indexOf(target); await closeTabGroup(openFiles.slice(0, idx)); await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' }); setTabMenu(p => ({ ...p, visible: false })) }}>
-            <SwapOutlined />关闭左侧
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', cursor: 'pointer', fontSize: 13 }} onClick={async () => { const target = tabMenu.target; const idx = openFiles.indexOf(target); await closeTabGroup(openFiles.slice(idx + 1)); await handleFileOpen({ path: target, name: target.split('/').pop(), type: 'file' }); setTabMenu(p => ({ ...p, visible: false })) }}>
-            <EditOutlined />关闭右侧
-          </div>
-        </div>
+        <ContextActionMenu
+          x={tabMenu.x}
+          y={tabMenu.y}
+          label="文档标签操作"
+          items={tabContextItems}
+          restoreFocusTo={tabMenu.restoreFocusTo}
+          onClose={closeTabContextMenu}
+        />
       )}
-      {tabMenu.visible && <div style={{ position: 'fixed', inset: 0, zIndex: 9998 }} onClick={() => setTabMenu(p => ({ ...p, visible: false }))} />}
     </div>
   )
 }

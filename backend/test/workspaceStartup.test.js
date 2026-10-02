@@ -34,7 +34,7 @@ async function startBackend(t, {
   allowAnyWorkspace = true,
   directoryRoots,
 } = {}) {
-  const source = `import { server } from './src/index.js'; server.once('listening', () => process.send({ port: server.address().port }));`
+  const source = `import { createBackend } from './src/index.js'; import { createHttpServer } from './src/httpServer.js'; const backend = createBackend(); await backend.initialize(); const server = createHttpServer(backend.app); server.once('listening', () => process.send({ port: server.address().port })); server.listen(0, '127.0.0.1');`
   const args = ['--input-type=module', '-e', source]
   if (cliWorkspace) args.push('standalone-editor-test', '--workspace', cliWorkspace)
   const env = {

@@ -1,0 +1,464 @@
+
+> standalone-editor-frontend@1.0.0 test:unit
+> node --test tests/markdown-image-paths.test.js tests/markdown-source-policy.test.js tests/markdown-diagnostics.test.js tests/image-presentation.test.js tests/search-coordinator.test.js tests/markdown-size.test.js tests/request-error-message.test.js tests/safe-storage.test.js tests/workspace-recovery.test.js
+
+TAP version 13
+# Subtest: portable image presentation comment parses and formats only bounded metadata
+ok 1 - portable image presentation comment parses and formats only bounded metadata
+  ---
+  duration_ms: 1.045417
+  type: 'test'
+  ...
+# Subtest: frontMatter points at its actual source span
+ok 2 - frontMatter points at its actual source span
+  ---
+  duration_ms: 4.6
+  type: 'test'
+  ...
+# Subtest: wikiLinks points at its actual source span
+ok 3 - wikiLinks points at its actual source span
+  ---
+  duration_ms: 2.761166
+  type: 'test'
+  ...
+# Subtest: footnotes points at its actual source span
+ok 4 - footnotes points at its actual source span
+  ---
+  duration_ms: 1.57175
+  type: 'test'
+  ...
+# Subtest: referenceLinks points at its actual source span
+ok 5 - referenceLinks points at its actual source span
+  ---
+  duration_ms: 0.24525
+  type: 'test'
+  ...
+# Subtest: escapedSyntax points at its actual source span
+ok 6 - escapedSyntax points at its actual source span
+  ---
+  duration_ms: 0.141167
+  type: 'test'
+  ...
+# Subtest: tableAlignment points at its actual source span
+ok 7 - tableAlignment points at its actual source span
+  ---
+  duration_ms: 0.25
+  type: 'test'
+  ...
+# Subtest: nestedLists points at its actual source span
+ok 8 - nestedLists points at its actual source span
+  ---
+  duration_ms: 0.398792
+  type: 'test'
+  ...
+# Subtest: rawHtml points at its actual source span
+ok 9 - rawHtml points at its actual source span
+  ---
+  duration_ms: 0.132625
+  type: 'test'
+  ...
+# Subtest: codeFenceMetadata points at its actual source span
+ok 10 - codeFenceMetadata points at its actual source span
+  ---
+  duration_ms: 0.254167
+  type: 'test'
+  ...
+# Subtest: code examples do not get compatibility warnings
+ok 11 - code examples do not get compatibility warnings
+  ---
+  duration_ms: 0.520917
+  type: 'test'
+  ...
+# Subtest: blockquote diagnostics underline the original nested-list, table, and fence metadata text
+ok 12 - blockquote diagnostics underline the original nested-list, table, and fence metadata text
+  ---
+  duration_ms: 0.357166
+  type: 'test'
+  ...
+# Subtest: loose ordinary unordered sublists stay rich-safe while lossy nesting stays protected
+ok 13 - loose ordinary unordered sublists stay rich-safe while lossy nesting stays protected
+  ---
+  duration_ms: 5.571916
+  type: 'test'
+  ...
+# Subtest: loose-list markers are matched inside their own top-level token after indented code
+ok 14 - loose-list markers are matched inside their own top-level token after indented code
+  ---
+  duration_ms: 0.113416
+  type: 'test'
+  ...
+# Subtest: aligned tables underline their actual delimiter rows, while paragraph lookalikes stay clear
+ok 15 - aligned tables underline their actual delimiter rows, while paragraph lookalikes stay clear
+  ---
+  duration_ms: 0.396167
+  type: 'test'
+  ...
+# Subtest: angle URL and email autolinks are reported as fixable Markdown, not raw HTML
+ok 16 - angle URL and email autolinks are reported as fixable Markdown, not raw HTML
+  ---
+  duration_ms: 0.089542
+  type: 'test'
+  ...
+# Subtest: ordinary links with angle destinations and titles are not confused with autolinks or HTML
+ok 17 - ordinary links with angle destinations and titles are not confused with autolinks or HTML
+  ---
+  duration_ms: 0.1685
+  type: 'test'
+  ...
+# Subtest: escaped decimal dots in ATX heading numbers stay rich-safe without hiding HTML warnings
+ok 18 - escaped decimal dots in ATX heading numbers stay rich-safe without hiding HTML warnings
+  ---
+  duration_ms: 0.448208
+  type: 'test'
+  ...
+# Subtest: non-autolink angle text is not classified as raw HTML or an autolink
+ok 19 - non-autolink angle text is not classified as raw HTML or an autolink
+  ---
+  duration_ms: 0.091875
+  type: 'test'
+  ...
+# Subtest: inline link titles are protected, while image titles remain supported
+ok 20 - inline link titles are protected, while image titles remain supported
+  ---
+  duration_ms: 0.068833
+  type: 'test'
+  ...
+# Subtest: Marked fallback protects quote structures nested under list indentation
+ok 21 - Marked fallback protects quote structures nested under list indentation
+  ---
+  duration_ms: 0.121417
+  type: 'test'
+  ...
+# Subtest: multiline reference links and definitions receive source diagnostics
+ok 22 - multiline reference links and definitions receive source diagnostics
+  ---
+  duration_ms: 0.140166
+  type: 'test'
+  ...
+# Subtest: multiline void HTML tags receive source diagnostics
+ok 23 - multiline void HTML tags receive source diagnostics
+  ---
+  duration_ms: 0.067833
+  type: 'test'
+  ...
+# Subtest: multiline references and raw HTML inside code remain unmarked
+ok 24 - multiline references and raw HTML inside code remain unmarked
+  ---
+  duration_ms: 0.081541
+  type: 'test'
+  ...
+# Subtest: quote fences and ordinary fences keep Markdown examples source-safe
+ok 25 - quote fences and ordinary fences keep Markdown examples source-safe
+  ---
+  duration_ms: 0.098125
+  type: 'test'
+  ...
+# Subtest: closing a quote fence keeps following Markdown diagnostics visible
+ok 26 - closing a quote fence keeps following Markdown diagnostics visible
+  ---
+  duration_ms: 0.05225
+  type: 'test'
+  ...
+# Subtest: editor-owned image presentation comment remains rich-safe
+ok 27 - editor-owned image presentation comment remains rich-safe
+  ---
+  duration_ms: 0.096042
+  type: 'test'
+  ...
+# Subtest: a single simple reference link normalizes once without changing rendered HTML
+ok 28 - a single simple reference link normalizes once without changing rendered HTML
+  ---
+  duration_ms: 0.511417
+  type: 'test'
+  ...
+# Subtest: multiple simple and multiline reference links produce one byte-preserving proposal
+ok 29 - multiple simple and multiline reference links produce one byte-preserving proposal
+  ---
+  duration_ms: 0.416166
+  type: 'test'
+  ...
+# Subtest: nested-label reference links are diagnosed and repaired only with equivalent Marked output
+ok 30 - nested-label reference links are diagnosed and repaired only with equivalent Marked output
+  ---
+  duration_ms: 0.259833
+  type: 'test'
+  ...
+# Subtest: collapsed, shortcut, image and relative references repair only resolved safe forms
+ok 31 - collapsed, shortcut, image and relative references repair only resolved safe forms
+  ---
+  duration_ms: 0.658041
+  type: 'test'
+  ...
+# Subtest: automatic URI and email links are proposed without changing rendered HTML
+ok 32 - automatic URI and email links are proposed without changing rendered HTML
+  ---
+  duration_ms: 0.25375
+  type: 'test'
+  ...
+# Subtest: unsafe references and unused definitions keep their source bytes
+ok 33 - unsafe references and unused definitions keep their source bytes
+  ---
+  duration_ms: 0.193334
+  type: 'test'
+  ...
+# Subtest: safe repairs preserve unrelated YAML and report it as a remaining diagnostic
+ok 34 - safe repairs preserve unrelated YAML and report it as a remaining diagnostic
+  ---
+  duration_ms: 0.186333
+  type: 'test'
+  ...
+# Subtest: dangling footnote-style text gets a stable escaped proposal; real definitions stay protected
+ok 35 - dangling footnote-style text gets a stable escaped proposal; real definitions stay protected
+  ---
+  duration_ms: 1.949208
+  type: 'test'
+  ...
+# Subtest: relative images resolve from nested documents and canonicalize to portable Markdown paths
+ok 36 - relative images resolve from nested documents and canonicalize to portable Markdown paths
+  ---
+  duration_ms: 1.508416
+  type: 'test'
+  ...
+# Subtest: percent-encoded Unicode and spaces are decoded for lookup and encoded in the media URL
+ok 37 - percent-encoded Unicode and spaces are decoded for lookup and encoded in the media URL
+  ---
+  duration_ms: 0.365667
+  type: 'test'
+  ...
+# Subtest: root asset uploads become relative to the active nested document
+ok 38 - root asset uploads become relative to the active nested document
+  ---
+  duration_ms: 0.670708
+  type: 'test'
+  ...
+# Subtest: literal percent characters are encoded once for Markdown and media URLs
+ok 39 - literal percent characters are encoded once for Markdown and media URLs
+  ---
+  duration_ms: 0.334042
+  type: 'test'
+  ...
+# Subtest: legacy asset URLs normalize to relative paths and discard stale workspace identity
+ok 40 - legacy asset URLs normalize to relative paths and discard stale workspace identity
+  ---
+  duration_ms: 0.304708
+  type: 'test'
+  ...
+# Subtest: relative query and fragment data survives mapping while workspace identity stays current
+ok 41 - relative query and fragment data survives mapping while workspace identity stays current
+  ---
+  duration_ms: 0.204
+  type: 'test'
+  ...
+# Subtest: escaping, malformed encoding, absolute paths and external URLs are not mapped into the workspace
+ok 42 - escaping, malformed encoding, absolute paths and external URLs are not mapped into the workspace
+  ---
+  duration_ms: 0.228958
+  type: 'test'
+  ...
+# Subtest: editable Markdown limit measures UTF-8 bytes at the inclusive boundary
+ok 43 - editable Markdown limit measures UTF-8 bytes at the inclusive boundary
+  ---
+  duration_ms: 6.172875
+  type: 'test'
+  ...
+# Subtest: multibyte Markdown is limited by encoded bytes rather than JavaScript characters
+ok 44 - multibyte Markdown is limited by encoded bytes rather than JavaScript characters
+  ---
+  duration_ms: 22.635209
+  type: 'test'
+  ...
+# Subtest: rich-safe fixture uses only syntax supported by the editor conversion chain
+ok 45 - rich-safe fixture uses only syntax supported by the editor conversion chain
+  ---
+  duration_ms: 11.850541
+  type: 'test'
+  ...
+# Subtest: source-required fixture covers every lossy syntax category
+ok 46 - source-required fixture covers every lossy syntax category
+  ---
+  duration_ms: 1.328
+  type: 'test'
+  ...
+# Subtest: Markdown examples inside code and inline code do not trigger source mode
+ok 47 - Markdown examples inside code and inline code do not trigger source mode
+  ---
+  duration_ms: 0.088625
+  type: 'test'
+  ...
+# Subtest: the editor-owned zoom annotation remains allowed while other HTML comments are guarded
+ok 48 - the editor-owned zoom annotation remains allowed while other HTML comments are guarded
+  ---
+  duration_ms: 0.116791
+  type: 'test'
+  ...
+# Subtest: table alignment is identified from Marked table tokens
+ok 49 - table alignment is identified from Marked table tokens
+  ---
+  duration_ms: 0.263334
+  type: 'test'
+  ...
+# Subtest: quoted lossy structures and conservative nested-list fallback require source mode
+ok 50 - quoted lossy structures and conservative nested-list fallback require source mode
+  ---
+  duration_ms: 0.372916
+  type: 'test'
+  ...
+# Subtest: plain blockquote structures and Markdown examples inside quote fences stay rich-safe
+ok 51 - plain blockquote structures and Markdown examples inside quote fences stay rich-safe
+  ---
+  duration_ms: 0.331958
+  type: 'test'
+  ...
+# Subtest: multiline reference forms and void HTML require source mode
+ok 52 - multiline reference forms and void HTML require source mode
+  ---
+  duration_ms: 0.375458
+  type: 'test'
+  ...
+# Subtest: multiline references and void HTML inside inline or fenced code stay rich-safe
+ok 53 - multiline references and void HTML inside inline or fenced code stay rich-safe
+  ---
+  duration_ms: 0.26575
+  type: 'test'
+  ...
+# Subtest: footnote definitions and references remain in source mode
+ok 54 - footnote definitions and references remain in source mode
+  ---
+  duration_ms: 0.544625
+  type: 'test'
+  ...
+# Subtest: API permission failures display a clear workspace access message
+ok 55 - API permission failures display a clear workspace access message
+  ---
+  duration_ms: 0.672833
+  type: 'test'
+  ...
+# Subtest: raw POSIX read-only errors are recognized even before API normalization
+ok 56 - raw POSIX read-only errors are recognized even before API normalization
+  ---
+  duration_ms: 0.084791
+  type: 'test'
+  ...
+# Subtest: other request failures retain the supplied fallback
+ok 57 - other request failures retain the supplied fallback
+  ---
+  duration_ms: 0.049916
+  type: 'test'
+  ...
+# Subtest: safe storage reports denied get, set, and remove operations without throwing
+ok 58 - safe storage reports denied get, set, and remove operations without throwing
+  ---
+  duration_ms: 0.801667
+  type: 'test'
+  ...
+# Subtest: safe storage identifies quota exhaustion and malformed JSON
+ok 59 - safe storage identifies quota exhaustion and malformed JSON
+  ---
+  duration_ms: 1.262375
+  type: 'test'
+  ...
+# Subtest: workspace context stays usable in memory when browser storage is denied
+ok 60 - workspace context stays usable in memory when browser storage is denied
+  ---
+  duration_ms: 55.116375
+  type: 'test'
+  ...
+# Subtest: malformed cached workspace JSON safely falls back to the legacy cached path
+ok 61 - malformed cached workspace JSON safely falls back to the legacy cached path
+  ---
+  duration_ms: 1.575417
+  type: 'test'
+  ...
+# Subtest: storage key enumeration failures are contained
+ok 62 - storage key enumeration failures are contained
+  ---
+  duration_ms: 0.3205
+  type: 'test'
+  ...
+# Subtest: debounces rapid input and sends the trimmed latest query once
+ok 63 - debounces rapid input and sends the trimmed latest query once
+  ---
+  duration_ms: 36.079625
+  type: 'test'
+  ...
+# Subtest: a late response cannot replace newer results and clearing is immediate
+ok 64 - a late response cannot replace newer results and clearing is immediate
+  ---
+  duration_ms: 5.693625
+  type: 'test'
+  ...
+# Subtest: clearing an in-flight query prevents its response from repopulating results
+ok 65 - clearing an in-flight query prevents its response from repopulating results
+  ---
+  duration_ms: 2.974042
+  type: 'test'
+  ...
+# Subtest: dispose cancels a pending debounce and ignores requests that finish later
+ok 66 - dispose cancels a pending debounce and ignores requests that finish later
+  ---
+  duration_ms: 28.6675
+  type: 'test'
+  ...
+# Subtest: a delayed destructive confirmation cannot mutate the newly selected workspace
+ok 67 - a delayed destructive confirmation cannot mutate the newly selected workspace
+  ---
+  duration_ms: 1.347375
+  type: 'test'
+  ...
+# Subtest: unmount invalidates pending recovery intents, including after a StrictMode-style remount
+ok 68 - unmount invalidates pending recovery intents, including after a StrictMode-style remount
+  ---
+  duration_ms: 0.687375
+  type: 'test'
+  ...
+# Subtest: a recovery response finishing after unmount cannot write state after reactivation
+ok 69 - a recovery response finishing after unmount cannot write state after reactivation
+  ---
+  duration_ms: 0.34925
+  type: 'test'
+  ...
+# Subtest: a completed mutation refreshes data and reports intent-level results without UI dependencies
+ok 70 - a completed mutation refreshes data and reports intent-level results without UI dependencies
+  ---
+  duration_ms: 0.303417
+  type: 'test'
+  ...
+# Subtest: refresh state updates preserve cached items, stats, and a running mutation
+ok 71 - refresh state updates preserve cached items, stats, and a running mutation
+  ---
+  duration_ms: 2.720375
+  type: 'test'
+  ...
+# Subtest: a request that finishes after a workspace switch cannot update recovery state
+ok 72 - a request that finishes after a workspace switch cannot update recovery state
+  ---
+  duration_ms: 0.176542
+  type: 'test'
+  ...
+# Subtest: an in-flight destructive action reports that it committed but does not refresh a different workspace
+ok 73 - an in-flight destructive action reports that it committed but does not refresh a different workspace
+  ---
+  duration_ms: 0.152667
+  type: 'test'
+  ...
+# Subtest: a failed trash mutation refreshes with its captured workspace identity and releases busy state
+ok 74 - a failed trash mutation refreshes with its captured workspace identity and releases busy state
+  ---
+  duration_ms: 0.284792
+  type: 'test'
+  ...
+# Subtest: a failed mutation does not update state when its refresh finishes after a workspace switch
+ok 75 - a failed mutation does not update state when its refresh finishes after a workspace switch
+  ---
+  duration_ms: 1.355042
+  type: 'test'
+  ...
+1..75
+# tests 75
+# suites 0
+# pass 75
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 117.216625

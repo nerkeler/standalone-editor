@@ -194,6 +194,9 @@ async function startChrome() {
 }
 
 async function setupPage() {
+  await connection.send('Emulation.setDeviceMetricsOverride', {
+    width: 1195, height: 751, deviceScaleFactor: 1, mobile: false,
+  })
   connection.acceptBeforeUnload = true
   try {
     await connection.send('Page.navigate', { url: `http://127.0.0.1:${frontendPort}/` })
@@ -207,10 +210,10 @@ async function setupPage() {
 
 async function openFile(fileName, expectedText = 'Markdown fidelity fixture') {
   await waitUntil(`${fileName} in file tree`, () => connection.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === ${JSON.stringify(fileName)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === ${JSON.stringify(fileName)})`,
   ))
   await connection.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.click();
     return Boolean(node);
   })()`)
@@ -233,6 +236,15 @@ async function appendToRichEditor(text) {
     return true;
   })()`)
   await connection.send('Input.insertText', { text })
+}
+
+async function pressKey(key, windowsVirtualKeyCode, { code = key, modifiers = 0 } = {}) {
+  await connection.send('Input.dispatchKeyEvent', {
+    type: 'keyDown', key, code, windowsVirtualKeyCode, modifiers,
+  })
+  await connection.send('Input.dispatchKeyEvent', {
+    type: 'keyUp', key, code, windowsVirtualKeyCode, modifiers,
+  })
 }
 
 async function selectImageFile(name, bytes) {
@@ -361,7 +373,7 @@ test('complex Markdown opens in source mode and rich conversion requires explici
   ))
   assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), fixture, 'saving without editing must leave all source syntax byte-for-byte intact')
 
-  await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
   await waitUntil('explicit rich conversion warning', () => connection.evaluate(
     `document.body.innerText.includes('此文档包含源码模式保护内容') && document.body.innerText.includes('仍切换到富文本')`,
   ))
@@ -442,7 +454,7 @@ test('source image upload inserts at the CodeMirror cursor, saves, and source ou
   assert.equal(await readFile(path.join(workspace, sourceFile), 'utf8'), saved)
   assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('after-switch.png')`), false)
 
-  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('rich file switched to source before upload', () => connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
   await connection.send('Fetch.enable', { patterns: [{ urlPattern: '*api/workspace/upload*', requestStage: 'Request' }] })
   connection.pauseNextWorkspaceUpload = true
@@ -450,7 +462,7 @@ test('source image upload inserts at the CodeMirror cursor, saves, and source ou
   const pausedModeUpload = await waitUntil('source upload to pause before mode switch', () => (
     connection.pausedFetchRequests.find(item => item.request?.method === 'POST' && item.request.url.includes('/api/workspace/upload') && item.requestId !== pausedUpload.requestId)
   ))
-  await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
   await waitUntil('rich mode restored while upload is pending', () => connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('Rich body')`))
   await connection.send('Fetch.continueRequest', { requestId: pausedModeUpload.requestId })
   await waitUntil('mode change to report no insertion', () => connection.evaluate(
@@ -490,21 +502,21 @@ test('renaming an open image updates its viewer address and title', async () => 
   await writeFile(path.join(workspace, original), imageBytes)
   await setupPage()
   await waitUntil('image in the file tree', () => connection.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(original)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(original)})`,
   ))
-  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.click()`)
+  await connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.click()`)
   await waitUntil('image viewer to load', () => connection.evaluate(
     `Boolean(document.querySelector('img[alt=${JSON.stringify(original)}]')?.src.includes(${JSON.stringify(original)}))`,
   ))
-  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }))`)
+  await connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(original)})?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }))`)
   await waitUntil('image rename action', () => connection.evaluate(
-    `Array.from(document.querySelectorAll('#editor-root div')).some(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)`,
+    `Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).some(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)`,
   ))
-  await connection.evaluate(`Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)?.click()`)
-  await waitUntil('inline filename input', () => connection.evaluate(`Boolean(document.querySelector('.ant-tree-title input'))`))
-  await connection.evaluate(`(() => { const input = document.querySelector('.ant-tree-title input'); input.focus(); input.select() })()`)
+  await connection.evaluate(`Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).find(item => item.innerText.trim() === '重命名' && item.getBoundingClientRect().width > 0)?.click()`)
+  await waitUntil('inline filename input', () => connection.evaluate(`Boolean(document.querySelector('.tree-rename-input'))`))
+  await connection.evaluate(`(() => { const input = document.querySelector('.tree-rename-input'); input.focus(); input.select() })()`)
   await connection.send('Input.insertText', { text: renamed })
-  await waitUntil('new filename in the input', () => connection.evaluate(`document.querySelector('.ant-tree-title input')?.value === ${JSON.stringify(renamed)}`))
+  await waitUntil('new filename in the input', () => connection.evaluate(`document.querySelector('.tree-rename-input')?.value === ${JSON.stringify(renamed)}`))
   await connection.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
   await connection.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
   await waitUntil('viewer to follow renamed image', () => connection.evaluate(
@@ -512,6 +524,87 @@ test('renaming an open image updates its viewer address and title', async () => 
   ))
   assert.deepEqual(await readFile(path.join(workspace, renamed)), imageBytes)
   await assert.rejects(readFile(path.join(workspace, original)), error => error.code === 'ENOENT')
+})
+
+test('file tree F2 cancel and Shift+F10 Escape restore rc-tree keyboard focus and navigation', async () => {
+  const directory = `000-keyboard-focus-${Date.now()}`
+  const fileName = 'opened-from-keyboard.md'
+  const filePath = `${directory}/${fileName}`
+  const content = '# Opened from tree keyboard\n'
+  await mkdir(path.join(workspace, directory), { recursive: true })
+  await writeFile(path.join(workspace, filePath), content)
+  await setupPage()
+
+  await waitUntil('new keyboard test folder to appear in the tree', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.dataset.path === ${JSON.stringify(directory)})`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.dataset.path === ${JSON.stringify(directory)})?.click()`)
+  await waitUntil('keyboard test file visible under expanded folder', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.dataset.path === ${JSON.stringify(filePath)})`,
+  ))
+  await connection.evaluate(`document.querySelector('.ant-tree input[tabindex]')?.focus()`)
+  await waitUntil('real rc-tree keyboard input to receive focus', () => connection.evaluate(
+    `(() => { const input = document.querySelector('.ant-tree input[tabindex]'); return Boolean(input && input.getAttribute('aria-label') === '文件目录键盘导航' && document.activeElement === input) })()`,
+  ))
+  const visibleTreePaths = await connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-treenode'))
+    .filter(row => row.getClientRects().length > 0)
+    .map(row => row.querySelector('[data-testid="file-tree-item"]')?.dataset.path)
+    .filter(Boolean)`)
+  assert.ok(visibleTreePaths.includes(directory), 'the expanded directory must be available to tree keyboard navigation')
+  let activePath = await connection.evaluate(`document.querySelector('.ant-tree-treenode-active [data-testid="file-tree-item"]')?.dataset.path || ''`)
+  for (let step = 0; activePath !== directory && step <= visibleTreePaths.length; step += 1) {
+    await pressKey('ArrowDown', 40)
+    await waitUntil('ArrowDown to move the active tree row', async () => {
+      const nextPath = await connection.evaluate(`document.querySelector('.ant-tree-treenode-active [data-testid="file-tree-item"]')?.dataset.path || ''`)
+      if (nextPath && nextPath !== activePath) {
+        activePath = nextPath
+        return true
+      }
+      return false
+    }, 1500)
+  }
+  assert.equal(activePath, directory, 'keyboard navigation should select the target directory before F2')
+
+  await pressKey('F2', 113)
+  await waitUntil('F2 to enter inline rename', () => connection.evaluate(`Boolean(document.querySelector('.tree-rename-input'))`))
+  const cancelledName = `cancelled-${Date.now()}`
+  await connection.evaluate(`(() => { const input = document.querySelector('.tree-rename-input'); input?.focus(); input?.select() })()`)
+  await connection.send('Input.insertText', { text: cancelledName })
+  await waitUntil('rename input to contain the unsaved candidate', () => connection.evaluate(
+    `document.querySelector('.tree-rename-input')?.value === ${JSON.stringify(cancelledName)}`,
+  ))
+  await pressKey('Escape', 27)
+  await waitUntil('Escape to cancel rename and restore the real tree input', () => connection.evaluate(
+    `(() => { const input = document.querySelector('.ant-tree input[tabindex]'); return !document.querySelector('.tree-rename-input') && input?.getAttribute('aria-label') === '文件目录键盘导航' && document.activeElement === input })()`,
+  ))
+  assert.equal(await readFile(path.join(workspace, filePath), 'utf8'), content, 'Escape must not rename or alter the file')
+  await assert.rejects(access(path.join(workspace, cancelledName)), error => error.code === 'ENOENT')
+
+  await pressKey('F10', 121, { modifiers: 8 })
+  await waitUntil('Shift+F10 to open the focused folder actions', () => connection.evaluate(
+    `Boolean(document.querySelector('.editor-context-menu[role="menu"] [role="menuitem"]'))`,
+  ))
+  await pressKey('Escape', 27)
+  await waitUntil('menu Escape to restore focus to the rc-tree input', () => connection.evaluate(
+    `(() => { const input = document.querySelector('.ant-tree input[tabindex]'); return !document.querySelector('.editor-context-menu') && input?.getAttribute('aria-label') === '文件目录键盘导航' && document.activeElement === input })()`,
+  ))
+
+  await pressKey('ArrowDown', 40)
+  await waitUntil('ArrowDown to activate the visible child file', () => connection.evaluate(
+    `document.querySelector('.ant-tree-treenode-active [data-testid="file-tree-item"]')?.dataset.path === ${JSON.stringify(filePath)}`,
+  ))
+  await pressKey('ArrowUp', 38)
+  await waitUntil('ArrowUp to navigate back to the parent folder', () => connection.evaluate(
+    `document.querySelector('.ant-tree-treenode-active [data-testid="file-tree-item"]')?.dataset.path === ${JSON.stringify(directory)}`,
+  ))
+  await pressKey('ArrowDown', 40)
+  await waitUntil('ArrowDown to reselect the child before opening', () => connection.evaluate(
+    `document.querySelector('.ant-tree-treenode-active [data-testid="file-tree-item"]')?.dataset.path === ${JSON.stringify(filePath)}`,
+  ))
+  await pressKey('Enter', 13)
+  await waitUntil('Enter to open the active file from the tree', () => connection.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText.includes('Opened from tree keyboard')`,
+  ))
 })
 
 test('ordinary nested model bullets open in rich mode and keep their hierarchy after editing', async () => {
@@ -572,7 +665,23 @@ test('numbered Markdown heading dots survive rich editing and save without an op
   assert.equal(workspacePutCount(), initialPuts, 'opening the headings must not send a workspace PUT')
   assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
 
-  await appendToRichEditor(' 已编辑')
+  await connection.evaluate(`(() => {
+    const editor = document.querySelector('.ProseMirror')
+    const heading = Array.from(editor?.querySelectorAll('h3') || []).find(node => node.innerText.includes('普通标题'))
+    if (!editor || !heading) return false
+    editor.focus()
+    const range = document.createRange()
+    range.selectNodeContents(heading)
+    range.collapse(false)
+    const selection = window.getSelection()
+    selection.removeAllRanges()
+    selection.addRange(range)
+    return true
+  })()`)
+  await waitUntil('selection to target the ordinary third heading', () => connection.evaluate(
+    `window.getSelection()?.anchorNode?.parentElement?.closest('h3')?.innerText.includes('普通标题') || window.getSelection()?.anchorNode?.closest?.('h3')?.innerText.includes('普通标题')`,
+  ))
+  await connection.send('Input.insertText', { text: ' 已编辑' })
   await clickSave()
   const saved = await waitForDiskMarker(fileName, '已编辑')
   assert.match(saved, /### 1\\\. 第一部分/)
@@ -811,8 +920,8 @@ test('ordinary delimiter-like text stays rich while angle autolinks get a repair
   assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-fidelity-warning') || document.querySelector('.cm-protected-range'))`), false)
 
   await openFile(autolinkName, 'https://example.com')
-  await waitUntil('angle autolink to be offered as a repair', () => connection.evaluate(
-    `Boolean(document.querySelector('.markdown-repair-banner')?.innerText.includes('自动链接'))`,
+  await waitUntil('autolink repair proposal and its explicit actions', () => connection.evaluate(
+    `(() => { const banner = document.querySelector('.markdown-repair-banner'); const labels = Array.from(banner?.querySelectorAll('.markdown-repair-actions button') || []).map(button => button.innerText.trim()); return labels.includes('暂不修复') && labels.includes('确认修复并保存') })()`,
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.markdown-repair-banner')?.innerText.includes('原始 HTML')`), false)
   await waitUntil('autolink diagnostic range to mount in the source editor', () => connection.evaluate(
@@ -844,6 +953,60 @@ test('tab-indented unordered and nested ordered tasks are protected in source mo
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), nestedTasks)
   assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false)
+})
+
+test('task checkboxes align with wrapped Chinese text and checked state survives save and reopen', async () => {
+  const fileName = 'task-layout-persistence.md'
+  const switchFile = 'task-layout-switch.md'
+  const longTaskText = '这条较长的中文待办用于检查复选框是否与正文首行对齐，并确认文字换行后仍保持清晰易读。'.repeat(8)
+  const source = `- [ ] ${longTaskText}\n- [x] 已完成的中文任务\n`
+  await writeFile(path.join(workspace, fileName), source)
+  await writeFile(path.join(workspace, switchFile), '# Switch away from task list\n')
+  await setupPage()
+  await openFile(fileName, '这条较长的中文待办')
+
+  await waitUntil('rich task items with live node view attributes', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror li[data-type="taskItem"]').length === 2`,
+  ))
+  const layout = await connection.evaluate(`(() => {
+    const items = Array.from(document.querySelectorAll('.ProseMirror li[data-type="taskItem"]'));
+    const checkbox = items[0]?.querySelector(':scope > label input[type="checkbox"]');
+    const paragraph = items[0]?.querySelector(':scope > div > p');
+    if (!checkbox || !paragraph) return null;
+    const checkboxRect = checkbox.getBoundingClientRect();
+    const paragraphRect = paragraph.getBoundingClientRect();
+    return {
+      count: items.length,
+      firstChecked: checkbox.checked,
+      completedChecked: items[1]?.querySelector(':scope > label input[type="checkbox"]')?.checked,
+      firstLineTopDelta: Math.abs(checkboxRect.top - paragraphRect.top),
+      paragraphHeight: paragraphRect.height,
+      lineHeight: Number.parseFloat(getComputedStyle(paragraph).lineHeight),
+      listMarker: getComputedStyle(items[0].parentElement).listStyleType,
+    };
+  })()`)
+  assert.equal(layout.count, 2)
+  assert.equal(layout.firstChecked, false)
+  assert.equal(layout.completedChecked, true)
+  assert.ok(layout.firstLineTopDelta < 12, `checkbox and first text line should align (delta ${layout.firstLineTopDelta}px)`)
+  assert.ok(layout.paragraphHeight > layout.lineHeight * 1.5, 'the Chinese task text should wrap to multiple lines')
+  assert.equal(layout.listMarker, 'none', 'task list should not render an extra bullet marker')
+
+  await connection.evaluate(`document.querySelector('.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"]')?.click()`)
+  await waitUntil('first task to become checked in the editor', () => connection.evaluate(
+    `document.querySelector('.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"]')?.checked === true`,
+  ))
+  await waitUntil('checked task Markdown to persist', async () => {
+    const saved = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    return saved.includes(`- [x] ${longTaskText}`) ? saved : null
+  })
+
+  await openFile(switchFile, 'Switch away from task list')
+  await openFile(fileName, '这条较长的中文待办')
+  await waitUntil('checked state to reload from disk', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror li[data-type="taskItem"]')[0]?.querySelector(':scope > label input[type="checkbox"]')?.checked === true && document.querySelectorAll('.ProseMirror li[data-type="taskItem"]')[1]?.querySelector(':scope > label input[type="checkbox"]')?.checked === true`,
+  ))
+  assert.ok((await readFile(path.join(workspace, fileName), 'utf8')).includes(`- [x] ${longTaskText}`))
 })
 
 test('source-mode edits preserve the original Markdown bytes around the edit', async () => {
@@ -902,7 +1065,7 @@ test('nested Markdown images render through workspace media and stay relative th
   await setupPage()
 
   await waitUntil('docs folder in tree', () => connection.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === 'docs')`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === 'docs')`,
   ))
   await connection.evaluate(`document.querySelector('[aria-label="更多目录操作"]')?.click()`)
   await waitUntil('directory actions menu to open', () => connection.evaluate(
@@ -910,7 +1073,7 @@ test('nested Markdown images render through workspace media and stay relative th
   ))
   await connection.evaluate(`Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).find(node => node.innerText.trim() === '全部展开')?.click()`)
   await waitUntil('nested Markdown file visible after expand all', () => connection.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === 'relative-images.md')`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === 'relative-images.md')`,
   ))
   await openFile('relative-images.md', 'MARKDOWN_IMAGE_FIXTURE')
   await waitUntil('relative image nodes in rich editor', () => connection.evaluate(
@@ -937,12 +1100,12 @@ test('nested Markdown images render through workspace media and stay relative th
   assert.equal(rendered[4].markdownSrc, '../../../outside.png')
   assert.equal(rendered[4].title, '越界标题')
 
-  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('nested source editor', () => connection.evaluate(
     `Boolean(document.querySelector('.source-editor .cm-content'))`,
   ))
   assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), original)
-  await connection.evaluate(`document.querySelector('[aria-label="编辑"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
   await waitUntil('nested rich editor after source round trip', () => connection.evaluate(
     `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="../../images/%E5%B0%81%20%E9%9D%A2.png"]'))`,
   ))
@@ -1012,7 +1175,7 @@ test('nested Markdown images render through workspace media and stay relative th
   assert.deepEqual(await readFile(path.join(workspace, 'docs', 'topic', 'assets', uploadName)), imageBytes)
   assert.doesNotMatch(saved, /\/api\/workspace\/(?:media|assets)\//)
 
-  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('saved relative image Markdown in source mode', () => connection.evaluate(
     `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify('assets/%E6%96%B0%E5%9B%BE%E7%89%87.png')})`,
   ))
@@ -1080,7 +1243,21 @@ test('explicit left alignment survives rich table editing, save, and reopen', as
   assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening an aligned table must not rewrite source')
   assert.equal(workspacePutCount(), initialPuts, 'opening an aligned table must not send a workspace PUT')
 
-  await appendToRichEditor(' 已编辑')
+  const selectedCell = await connection.evaluate(`(() => {
+    const editor = document.querySelector('.ProseMirror');
+    const cell = editor?.querySelector('table td');
+    if (!editor || !cell) return false;
+    editor.focus();
+    const range = document.createRange();
+    range.selectNodeContents(cell);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  })()`)
+  assert.equal(selectedCell, true, 'the edit must target a body cell in the aligned table')
+  await connection.send('Input.insertText', { text: ' 已编辑' })
   await clickSave()
   const saved = await waitForDiskMarker(fileName, '已编辑')
   assert.match(saved, /^\| :--- \| :--- \| :--- \|$/m, 'saving should retain explicit left alignment delimiters')
@@ -1137,6 +1314,29 @@ test('table picker chooses dimensions and contextual tools add rows and columns'
     const content = await readFile(path.join(workspace, fileName), 'utf8')
     return content.split('\n').filter(line => line.startsWith('|')).length === 6
   })
+})
+
+test('table picker has one roving tab stop and Escape restores focus to its trigger', async () => {
+  const fileName = 'table-picker-keyboard.md'
+  await writeFile(path.join(workspace, fileName), '# Table picker keyboard fixture\n')
+  await setupPage()
+  await openFile(fileName, 'Table picker keyboard fixture')
+
+  await connection.evaluate(`document.querySelector('.editor-toolbar [aria-label="插入表格"]')?.click()`)
+  await waitUntil('keyboard table picker and initial focused cell', () => connection.evaluate(
+    `Boolean(document.querySelector('.table-insert-panel[role="dialog"]') && document.activeElement?.getAttribute('aria-label') === '1 行 1 列')`,
+  ))
+  const initialStops = await connection.evaluate(`Array.from(document.querySelectorAll('.table-size-grid button')).filter(button => button.tabIndex === 0).length`)
+  assert.equal(initialStops, 1, '64 dimension buttons should expose one tab stop')
+
+  await pressKey('ArrowRight', 39)
+  await waitUntil('ArrowRight to move the active table dimension cell', () => connection.evaluate(
+    `document.activeElement?.getAttribute('aria-label') === '1 行 2 列' && document.querySelectorAll('.table-size-grid button[tabindex="0"]').length === 1`,
+  ))
+  await pressKey('Escape', 27)
+  await waitUntil('Escape to close the table picker and restore the trigger', () => connection.evaluate(
+    `(() => { const panel = document.querySelector('.table-insert-panel'); const rect = panel?.getBoundingClientRect(); const style = panel ? getComputedStyle(panel) : null; const hidden = !panel || !rect || rect.width === 0 || rect.height === 0 || style.visibility === 'hidden' || style.display === 'none'; return hidden && document.activeElement === document.querySelector('.editor-toolbar [aria-label="插入表格"]') })()`,
+  ))
 })
 
 test('mobile directory keeps long nested filenames inside its frame', async () => {

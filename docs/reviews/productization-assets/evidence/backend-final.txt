@@ -1,0 +1,807 @@
+
+> standalone-editor-backend@1.0.0 test
+> node --test
+
+TAP version 13
+# Subtest: backend instances keep workspace and recovery configuration isolated
+ok 1 - backend instances keep workspace and recovery configuration isolated
+  ---
+  duration_ms: 139.536667
+  type: 'test'
+  ...
+# Subtest: POSIX allow-list boundaries distinguish roots from similarly named siblings
+ok 2 - POSIX allow-list boundaries distinguish roots from similarly named siblings
+  ---
+  duration_ms: 0.3285
+  type: 'test'
+  ...
+# Subtest: Windows drive and UNC paths work when exercised on macOS
+ok 3 - Windows drive and UNC paths work when exercised on macOS
+  ---
+  duration_ms: 0.758791
+  type: 'test'
+  ...
+# Subtest: configured roots use the host delimiter and ancestors are browseable only
+ok 4 - configured roots use the host delimiter and ancestors are browseable only
+  ---
+  duration_ms: 0.164208
+  type: 'test'
+  ...
+# Subtest: default candidates expose platform-specific user and mount locations
+ok 5 - default candidates expose platform-specific user and mount locations
+  ---
+  duration_ms: 0.146916
+  type: 'test'
+  ...
+# Subtest: default POSIX root allows any descendant and explicit roots remain the only path policy
+ok 6 - default POSIX root allows any descendant and explicit roots remain the only path policy
+  ---
+  duration_ms: 0.09375
+  type: 'test'
+  ...
+# Subtest: explicit Linux roots stay narrow and preserve explicitly allowed filesystem roots
+ok 7 - explicit Linux roots stay narrow and preserve explicitly allowed filesystem roots
+  ---
+  duration_ms: 0.079375
+  type: 'test'
+  ...
+# Subtest: CORS accepts the proxy request host on any frontend address and rejects another origin
+ok 8 - CORS accepts the proxy request host on any frontend address and rejects another origin
+  ---
+  duration_ms: 143.9095
+  type: 'test'
+  ...
+# Subtest: CORS accepts an explicitly configured cross-origin frontend
+ok 9 - CORS accepts an explicitly configured cross-origin frontend
+  ---
+  duration_ms: 102.783209
+  type: 'test'
+  ...
+# Subtest: file API requires revisions, returns structured conflicts, and restores guarded history
+ok 10 - file API requires revisions, returns structured conflicts, and restores guarded history
+  ---
+  duration_ms: 191.860167
+  type: 'test'
+  ...
+# Subtest: read-only directories remain selectable while unreadable listing and denied writes return permission errors
+ok 11 - read-only directories remain selectable while unreadable listing and denied writes return permission errors
+  ---
+  duration_ms: 109.263791
+  type: 'test'
+  ...
+# Subtest: large Markdown stays read-only, restore and writes are blocked, and downloads stream unchanged bytes
+ok 12 - large Markdown stays read-only, restore and writes are blocked, and downloads stream unchanged bytes
+  ---
+  duration_ms: 188.70125
+  type: 'test'
+  ...
+# Subtest: file API confines text editing to valid Markdown and downloads attachment bytes unchanged
+ok 13 - file API confines text editing to valid Markdown and downloads attachment bytes unchanged
+  ---
+  duration_ms: 129.003916
+  type: 'test'
+  ...
+# Subtest: trash and ZIP routes honor workspace identity, preserve hidden files, and handle collisions and limits
+ok 14 - trash and ZIP routes honor workspace identity, preserve hidden files, and handle collisions and limits
+  ---
+  duration_ms: 110.20275
+  type: 'test'
+  ...
+# Subtest: atomic writes preserve private file permissions
+ok 15 - atomic writes preserve private file permissions
+  ---
+  duration_ms: 25.231209
+  type: 'test'
+  ...
+# Subtest: atomic writes honor a read-only file even when its parent directory is writable
+ok 16 - atomic writes honor a read-only file even when its parent directory is writable
+  ---
+  duration_ms: 4.249958
+  type: 'test'
+  ...
+# Subtest: new atomic writes default to owner-only permissions
+ok 17 - new atomic writes default to owner-only permissions
+  ---
+  duration_ms: 15.257667
+  type: 'test'
+  ...
+# Subtest: write, sync, rename, and link failures preserve the old file and remove only owned temporaries
+    # Subtest: stat
+    ok 1 - stat
+      ---
+      duration_ms: 12.822542
+      type: 'test'
+      ...
+    # Subtest: write
+    ok 2 - write
+      ---
+      duration_ms: 15.988625
+      type: 'test'
+      ...
+    # Subtest: sync
+    ok 3 - sync
+      ---
+      duration_ms: 10.344583
+      type: 'test'
+      ...
+    # Subtest: rename
+    ok 4 - rename
+      ---
+      duration_ms: 26.344917
+      type: 'test'
+      ...
+    # Subtest: link
+    ok 5 - link
+      ---
+      duration_ms: 6.39975
+      type: 'test'
+      ...
+    1..5
+ok 18 - write, sync, rename, and link failures preserve the old file and remove only owned temporaries
+  ---
+  duration_ms: 72.853916
+  type: 'test'
+  ...
+# Subtest: failed cleanup reports the error and leaves a replacement inode untouched
+ok 19 - failed cleanup reports the error and leaves a replacement inode untouched
+  ---
+  duration_ms: 22.9515
+  type: 'test'
+  ...
+# Subtest: uploads keep binary bytes and refuse replacement
+ok 20 - uploads keep binary bytes and refuse replacement
+  ---
+  duration_ms: 4.237041
+  type: 'test'
+  ...
+# Subtest: Markdown uploads detach stale path history before creating the new file
+ok 21 - Markdown uploads detach stale path history before creating the new file
+  ---
+  duration_ms: 27.8625
+  type: 'test'
+  ...
+# Subtest: trees expose regular attachments but omit special files and Markdown search includes .markdown
+ok 22 - trees expose regular attachments but omit special files and Markdown search includes .markdown
+  ---
+  duration_ms: 11.504958
+  type: 'test'
+  ...
+# Subtest: recursive tree uses the workspace-relative shape and omits hidden and symlink entries
+ok 23 - recursive tree uses the workspace-relative shape and omits hidden and symlink entries
+  ---
+  duration_ms: 4.540166
+  type: 'test'
+  ...
+# Subtest: workspace file presence checks ignore hidden, symlink, and empty directory entries
+ok 24 - workspace file presence checks ignore hidden, symlink, and empty directory entries
+  ---
+  duration_ms: 2.742416
+  type: 'test'
+  ...
+# Subtest: recursive tree keeps readable siblings when one child directory is unreadable
+ok 25 - recursive tree keeps readable siblings when one child directory is unreadable
+  ---
+  duration_ms: 2.48925
+  type: 'test'
+  ...
+# Subtest: recursive tree handles a large flat and nested workspace
+ok 26 - recursive tree handles a large flat and nested workspace
+  ---
+  duration_ms: 146.132583
+  type: 'test'
+  ...
+# Subtest: workspace search keeps name and Markdown matching, previews and tree order
+ok 27 - workspace search keeps name and Markdown matching, previews and tree order
+  ---
+  duration_ms: 8.043583
+  type: 'test'
+  ...
+# Subtest: workspace search omits external symlink content and caps results at 100
+ok 28 - workspace search omits external symlink content and caps results at 100
+  ---
+  duration_ms: 60.30675
+  type: 'test'
+  ...
+# Subtest: versioned writes reject a stale client and preserve the current disk revision
+ok 29 - versioned writes reject a stale client and preserve the current disk revision
+  ---
+  duration_ms: 26.116834
+  type: 'test'
+  ...
+# Subtest: repeated versioned writes with identical bytes preserve history, mtime, and permissions
+ok 30 - repeated versioned writes with identical bytes preserve history, mtime, and permissions
+  ---
+  duration_ms: 15.971791
+  type: 'test'
+  ...
+# Subtest: versioned writes reject external changes and require an explicit revision
+ok 31 - versioned writes reject external changes and require an explicit revision
+  ---
+  duration_ms: 1.82675
+  type: 'test'
+  ...
+# Subtest: null revision creates only absent files; restore uses the same current-revision guard
+ok 32 - null revision creates only absent files; restore uses the same current-revision guard
+  ---
+  duration_ms: 31.547167
+  type: 'test'
+  ...
+# Subtest: restoring a history entry that matches current bytes succeeds without adding history
+ok 33 - restoring a history entry that matches current bytes succeeds without adding history
+  ---
+  duration_ms: 17.641667
+  type: 'test'
+  ...
+# Subtest: deleting one history record preserves the current file and returns not found when repeated
+ok 34 - deleting one history record preserves the current file and returns not found when repeated
+  ---
+  duration_ms: 15.566208
+  type: 'test'
+  ...
+# Subtest: history deletion rejects invalid paths and IDs and cannot cross file or workspace buckets
+ok 35 - history deletion rejects invalid paths and IDs and cannot cross file or workspace buckets
+  ---
+  duration_ms: 15.4275
+  type: 'test'
+  ...
+# Subtest: history deletion rejects corrupt records and symlinks without removing another record
+ok 36 - history deletion rejects corrupt records and symlinks without removing another record
+  ---
+  duration_ms: 14.44825
+  type: 'test'
+  ...
+# Subtest: history is private, preserves file mode, and a history storage failure aborts replacement
+ok 37 - history is private, preserves file mode, and a history storage failure aborts replacement
+  ---
+  duration_ms: 9.054375
+  type: 'test'
+  ...
+# Subtest: recovery storage cannot resolve inside the workspace, including through a symlink
+ok 38 - recovery storage cannot resolve inside the workspace, including through a symlink
+  ---
+  duration_ms: 1.788083
+  type: 'test'
+  ...
+# Subtest: missing recovery-root components stay ordered for history writes and statistics
+ok 39 - missing recovery-root components stay ordered for history writes and statistics
+  ---
+  duration_ms: 10.799375
+  type: 'test'
+  ...
+# Subtest: multi-level missing recovery roots inside the workspace are rejected on write
+ok 40 - multi-level missing recovery roots inside the workspace are rejected on write
+  ---
+  duration_ms: 2.454125
+  type: 'test'
+  ...
+# Subtest: file moves migrate source history and preserve old destination history as an orphan
+ok 41 - file moves migrate source history and preserve old destination history as an orphan
+  ---
+  duration_ms: 41.082208
+  type: 'test'
+  ...
+# Subtest: move refuses a destination created after its initial collision check
+ok 42 - move refuses a destination created after its initial collision check
+  ---
+  duration_ms: 14.525541
+  type: 'test'
+  ...
+# Subtest: file move uses an exclusive verified copy when hard links are unavailable
+ok 43 - file move uses an exclusive verified copy when hard links are unavailable
+  ---
+  duration_ms: 1.651458
+  type: 'test'
+  ...
+# Subtest: directory move refuses a populated destination created after its initial check
+ok 44 - directory move refuses a populated destination created after its initial check
+  ---
+  duration_ms: 12.622208
+  type: 'test'
+  ...
+# Subtest: move rejects a source parent replaced by a symlink during history archiving
+ok 45 - move rejects a source parent replaced by a symlink during history archiving
+  ---
+  duration_ms: 13.450417
+  type: 'test'
+  ...
+# Subtest: trash history is separated from same-path files and remains restorable after path reuse
+ok 46 - trash history is separated from same-path files and remains restorable after path reuse
+  ---
+  duration_ms: 27.328
+  type: 'test'
+  ...
+# Subtest: directory trash archives each Markdown history and trash restore reattaches only conflict-free paths
+ok 47 - directory trash archives each Markdown history and trash restore reattaches only conflict-free paths
+  ---
+  duration_ms: 24.690208
+  type: 'test'
+  ...
+# Subtest: deleting the final history record removes the empty active bucket
+ok 48 - deleting the final history record removes the empty active bucket
+  ---
+  duration_ms: 9.595625
+  type: 'test'
+  ...
+# Subtest: orphan histories preview as strict UTF-8, restore with revisions, and delete within one workspace
+ok 49 - orphan histories preview as strict UTF-8, restore with revisions, and delete within one workspace
+  ---
+  duration_ms: 21.341458
+  type: 'test'
+  ...
+# Subtest: failed history archive leaves active records intact for the caller to roll back
+ok 50 - failed history archive leaves active records intact for the caller to roll back
+  ---
+  duration_ms: 8.901291
+  type: 'test'
+  ...
+# Subtest: Markdown previews become read-only above 5 MiB and stop reading above 10 MiB
+ok 51 - Markdown previews become read-only above 5 MiB and stop reading above 10 MiB
+  ---
+  duration_ms: 19.79025
+  type: 'test'
+  ...
+# Subtest: history restore bounds Base64 before decoding even when legacy size metadata is missing
+ok 52 - history restore bounds Base64 before decoding even when legacy size metadata is missing
+  ---
+  duration_ms: 53.267583
+  type: 'test'
+  ...
+# Subtest: binary streams enforce image types and close the opened handle on cancellation
+ok 53 - binary streams enforce image types and close the opened handle on cancellation
+  ---
+  duration_ms: 1.147125
+  type: 'test'
+  ...
+# Subtest: binary streams stay within the opened size for concurrent append and empty files
+ok 54 - binary streams stay within the opened size for concurrent append and empty files
+  ---
+  duration_ms: 1.465334
+  type: 'test'
+  ...
+# Subtest: Markdown reference scanner handles inline and reference links while skipping code
+ok 55 - Markdown reference scanner handles inline and reference links while skipping code
+  ---
+  duration_ms: 1.900917
+  type: 'test'
+  ...
+# Subtest: move preflight finds incoming and outgoing relative references but ignores external URLs
+ok 56 - move preflight finds incoming and outgoing relative references but ignores external URLs
+  ---
+  duration_ms: 27.50575
+  type: 'test'
+  ...
+# Subtest: directory preflight preserves references whose document and target move together, but reports outside inbound links
+ok 57 - directory preflight preserves references whose document and target move together, but reports outside inbound links
+  ---
+  duration_ms: 10.476834
+  type: 'test'
+  ...
+# Subtest: same-directory rename with only external references has no preflight warning
+ok 58 - same-directory rename with only external references has no preflight warning
+  ---
+  duration_ms: 13.211042
+  type: 'test'
+  ...
+# Subtest: move preflight names Markdown files too large to inspect instead of treating them as clear
+ok 59 - move preflight names Markdown files too large to inspect instead of treating them as clear
+  ---
+  duration_ms: 11.039333
+  type: 'test'
+  ...
+# Subtest: workspace media route serves nested images safely and preserves the legacy asset route
+ok 60 - workspace media route serves nested images safely and preserves the legacy asset route
+  ---
+  duration_ms: 208.465291
+  type: 'test'
+  ...
+# Subtest: upload limits reject abusive multipart fields and allow the full editor form
+ok 61 - upload limits reject abusive multipart fields and allow the full editor form
+  ---
+  duration_ms: 132.065917
+  type: 'test'
+  ...
+# Subtest: same-level asset upload returns the normalized permission error for a read-only directory
+ok 62 - same-level asset upload returns the normalized permission error for a read-only directory
+  ---
+  duration_ms: 107.939792
+  type: 'test'
+  ...
+# Subtest: filesystem permission failures have a stable 403 response
+ok 63 - filesystem permission failures have a stable 403 response
+  ---
+  duration_ms: 0.523084
+  type: 'test'
+  ...
+# Subtest: permission failures wrapped by workspace config retain their system cause
+ok 64 - permission failures wrapped by workspace config retain their system cause
+  ---
+  duration_ms: 0.050625
+  type: 'test'
+  ...
+# Subtest: a genuine EPERM cause wrapped by workspace config remains a permission response
+ok 65 - a genuine EPERM cause wrapped by workspace config remains a permission response
+  ---
+  duration_ms: 0.077958
+  type: 'test'
+  ...
+# Subtest: unrelated filesystem errors keep their existing handling
+ok 66 - unrelated filesystem errors keep their existing handling
+  ---
+  duration_ms: 0.044459
+  type: 'test'
+  ...
+# Subtest: recovery API is workspace-guarded, reports stored bytes, and cleans only on explicit requests
+ok 67 - recovery API is workspace-guarded, reports stored bytes, and cleans only on explicit requests
+  ---
+  duration_ms: 243.554
+  type: 'test'
+  ...
+# Subtest: orphan-history API previews, restores, isolates path reuse, and survives trash deletion
+ok 68 - orphan-history API previews, restores, isolates path reuse, and survives trash deletion
+  ---
+  duration_ms: 276.460083
+  type: 'test'
+  ...
+# Subtest: recovery statistics count serialized storage bytes and isolate each workspace
+ok 69 - recovery statistics count serialized storage bytes and isolate each workspace
+  ---
+  duration_ms: 53.273916
+  type: 'test'
+  ...
+# Subtest: recovery statistics count archived history records without mixing workspace archives
+ok 70 - recovery statistics count archived history records without mixing workspace archives
+  ---
+  duration_ms: 25.472958
+  type: 'test'
+  ...
+# Subtest: recovery statistics skip symlink targets when measuring bytes
+ok 71 - recovery statistics skip symlink targets when measuring bytes
+  ---
+  duration_ms: 36.378958
+  type: 'test'
+  ...
+# Subtest: missing recovery storage has zero counts without creating directories
+ok 72 - missing recovery storage has zero counts without creating directories
+  ---
+  duration_ms: 1.311583
+  type: 'test'
+  ...
+# Subtest: missing root components stay in path order and cannot redirect the scan
+ok 73 - missing root components stay in path order and cannot redirect the scan
+  ---
+  duration_ms: 10.1895
+  type: 'test'
+  ...
+# Subtest: multi-level missing recovery paths inside the workspace are rejected
+ok 74 - multi-level missing recovery paths inside the workspace are rejected
+  ---
+  duration_ms: 6.8725
+  type: 'test'
+  ...
+# Subtest: a configured storage-root symlink is canonicalized while nested symlinks remain untraversed
+ok 75 - a configured storage-root symlink is canonicalized while nested symlinks remain untraversed
+  ---
+  duration_ms: 9.344625
+  type: 'test'
+  ...
+# Subtest: backend address log formats IPv6 and ordinary host URLs
+ok 76 - backend address log formats IPv6 and ordinary host URLs
+  ---
+  duration_ms: 0.289208
+  type: 'test'
+  ...
+# Subtest: development start script stops the other child when either service exits
+ok 77 - development start script stops the other child when either service exits
+  ---
+  duration_ms: 2596.158542
+  type: 'test'
+  ...
+# Subtest: production start mode rejects a missing frontend build clearly
+ok 78 - production start mode rejects a missing frontend build clearly
+  ---
+  duration_ms: 11.719833
+  type: 'test'
+  ...
+# Subtest: expired entries are removed only by the explicit purge operation
+ok 79 - expired entries are removed only by the explicit purge operation
+  ---
+  duration_ms: 45.677083
+  type: 'test'
+  ...
+# Subtest: permanent trash removal and expiry purge leave archived Markdown history intact
+ok 80 - permanent trash removal and expiry purge leave archived Markdown history intact
+  ---
+  duration_ms: 67.93175
+  type: 'test'
+  ...
+# Subtest: permanent removal requires a ready entry belonging to the selected workspace
+ok 81 - permanent removal requires a ready entry belonging to the selected workspace
+  ---
+  duration_ms: 32.884542
+  type: 'test'
+  ...
+# Subtest: permanent removal deletes selected storage without following nested symlinks
+ok 82 - permanent removal deletes selected storage without following nested symlinks
+  ---
+  duration_ms: 16.569042
+  type: 'test'
+  ...
+# Subtest: permanent removal refuses an entry directory replaced by an external symlink
+ok 83 - permanent removal refuses an entry directory replaced by an external symlink
+  ---
+  duration_ms: 8.099125
+  type: 'test'
+  ...
+# Subtest: trash stages directories with hidden contents outside the workspace and restores them
+ok 84 - trash stages directories with hidden contents outside the workspace and restores them
+  ---
+  duration_ms: 43.222875
+  type: 'test'
+  ...
+# Subtest: restore refuses to overwrite an item created at the original path
+ok 85 - restore refuses to overwrite an item created at the original path
+  ---
+  duration_ms: 13.819
+  type: 'test'
+  ...
+# Subtest: restore refuses a file created after parent validation
+ok 86 - restore refuses a file created after parent validation
+  ---
+  duration_ms: 22.883667
+  type: 'test'
+  ...
+# Subtest: file restore copies exclusively when hard links are unavailable
+ok 87 - file restore copies exclusively when hard links are unavailable
+  ---
+  duration_ms: 18.104
+  type: 'test'
+  ...
+# Subtest: restore refuses a directory populated after parent validation
+ok 88 - restore refuses a directory populated after parent validation
+  ---
+  duration_ms: 21.680666
+  type: 'test'
+  ...
+# Subtest: restore rejects a parent replaced by a symlink after validation
+ok 89 - restore rejects a parent replaced by a symlink after validation
+  ---
+  duration_ms: 23.322666
+  type: 'test'
+  ...
+# Subtest: trash rejects symlinks without moving the source
+ok 90 - trash rejects symlinks without moving the source
+  ---
+  duration_ms: 12.012875
+  type: 'test'
+  ...
+# Subtest: EXDEV uses a verified copy before removing the original
+ok 91 - EXDEV uses a verified copy before removing the original
+  ---
+  duration_ms: 33.986083
+  type: 'test'
+  ...
+# Subtest: a failed EXDEV copy leaves the source untouched and creates no trash entry
+ok 92 - a failed EXDEV copy leaves the source untouched and creates no trash entry
+  ---
+  duration_ms: 9.134125
+  type: 'test'
+  ...
+# Subtest: recovery storage inside the selected workspace is rejected
+ok 93 - recovery storage inside the selected workspace is rejected
+  ---
+  duration_ms: 2.915042
+  type: 'test'
+  ...
+# Subtest: only a missing config file means first launch
+ok 94 - only a missing config file means first launch
+  ---
+  duration_ms: 4.622791
+  type: 'test'
+  ...
+# Subtest: invalid config and unavailable saved workspaces are diagnosed without fallback
+ok 95 - invalid config and unavailable saved workspaces are diagnosed without fallback
+  ---
+  duration_ms: 3.942083
+  type: 'test'
+  ...
+# Subtest: configured workspace is canonicalized and checked for directory enumeration
+ok 96 - configured workspace is canonicalized and checked for directory enumeration
+  ---
+  duration_ms: 3.186541
+  type: 'test'
+  ...
+# Subtest: config save uses a sibling temp file, syncs it, and atomically replaces JSON
+ok 97 - config save uses a sibling temp file, syncs it, and atomically replaces JSON
+  ---
+  duration_ms: 9.693
+  type: 'test'
+  ...
+# Subtest: failed config rename preserves the old file and removes the temporary file
+ok 98 - failed config rename preserves the old file and removes the temporary file
+  ---
+  duration_ms: 9.304208
+  type: 'test'
+  ...
+# Subtest: config rename over a directory reports an invalid target independently of platform error codes
+ok 99 - config rename over a directory reports an invalid target independently of platform error codes
+  ---
+  duration_ms: 7.678
+  type: 'test'
+  ...
+# Subtest: workspace and recovery roots cannot contain one another, without creating paths
+ok 100 - workspace and recovery roots cannot contain one another, without creating paths
+  ---
+  duration_ms: 7.198625
+  type: 'test'
+  ...
+# Subtest: recovery containment follows existing symlink ancestors and uses configured defaults
+ok 101 - recovery containment follows existing symlink ancestors and uses configured defaults
+  ---
+  duration_ms: 5.350875
+  type: 'test'
+  ...
+# Subtest: first launch creates and persists the default workspace only when config is missing
+ok 102 - first launch creates and persists the default workspace only when config is missing
+  ---
+  duration_ms: 136.36475
+  type: 'test'
+  ...
+# Subtest: Linux default picker reaches arbitrary accessible paths and reports recovery overlap on filesystem root
+ok 103 - Linux default picker reaches arbitrary accessible paths and reports recovery overlap on filesystem root # SKIP Linux-only default picker policy
+  ---
+  duration_ms: 0.116375
+  type: 'test'
+  ...
+# Subtest: an explicitly allowed POSIX filesystem root is nonselectable when it contains recovery data
+ok 104 - an explicitly allowed POSIX filesystem root is nonselectable when it contains recovery data
+  ---
+  duration_ms: 105.256083
+  type: 'test'
+  ...
+# Subtest: explicit Linux directory roots still restrict picker browsing and workspace selection
+ok 105 - explicit Linux directory roots still restrict picker browsing and workspace selection # SKIP Linux-only directory picker policy
+  ---
+  duration_ms: 0.103917
+  type: 'test'
+  ...
+# Subtest: explicit CLI workspace can create a new directory after recovery preflight
+ok 106 - explicit CLI workspace can create a new directory after recovery preflight
+  ---
+  duration_ms: 78.826084
+  type: 'test'
+  ...
+# Subtest: an invalid default workspace is rejected before either path is created
+ok 107 - an invalid default workspace is rejected before either path is created
+  ---
+  duration_ms: 71.7845
+  type: 'test'
+  ...
+# Subtest: missing saved workspace keeps API alive at 503 until explicit selection
+ok 108 - missing saved workspace keeps API alive at 503 until explicit selection
+  ---
+  duration_ms: 91.749333
+  type: 'test'
+  ...
+# Subtest: invalid config is reported without default fallback and can be repaired by explicit selection
+ok 109 - invalid config is reported without default fallback and can be repaired by explicit selection
+  ---
+  duration_ms: 79.962
+  type: 'test'
+  ...
+# Subtest: startup and workspace selection reject recovery overlap before creating recovery storage
+ok 110 - startup and workspace selection reject recovery overlap before creating recovery storage
+  ---
+  duration_ms: 82.859458
+  type: 'test'
+  ...
+# Subtest: failed config rename does not switch the active workspace or version
+ok 111 - failed config rename does not switch the active workspace or version
+  ---
+  duration_ms: 79.250625
+  type: 'test'
+  ...
+# Subtest: concurrent workspace selections serialize config and in-memory version changes
+ok 112 - concurrent workspace selections serialize config and in-memory version changes
+  ---
+  duration_ms: 79.099333
+  type: 'test'
+  ...
+# Subtest: after first-run setup and explicit selection, a missing config never reactivates the default
+ok 113 - after first-run setup and explicit selection, a missing config never reactivates the default
+  ---
+  duration_ms: 90.4345
+  type: 'test'
+  ...
+# Subtest: retry never switches from an unavailable CLI workspace to another saved path
+ok 114 - retry never switches from an unavailable CLI workspace to another saved path
+  ---
+  duration_ms: 89.396083
+  type: 'test'
+  ...
+# Subtest: test/zipFixture.js
+ok 16 - test/zipFixture.js
+  ---
+  duration_ms: 29.089166
+  type: 'test'
+  ...
+# Subtest: imports UTF-8 stored and deflated Markdown and image entries byte for byte
+ok 116 - imports UTF-8 stored and deflated Markdown and image entries byte for byte
+  ---
+  duration_ms: 34.192334
+  type: 'test'
+  ...
+# Subtest: rejects traversal and Windows-invalid archive names before writing files
+ok 117 - rejects traversal and Windows-invalid archive names before writing files
+  ---
+  duration_ms: 5.949334
+  type: 'test'
+  ...
+# Subtest: rejects paths that normalize to the same destination
+ok 118 - rejects paths that normalize to the same destination
+  ---
+  duration_ms: 0.96625
+  type: 'test'
+  ...
+# Subtest: detects corrupted stored-entry CRC before publishing any file
+ok 119 - detects corrupted stored-entry CRC before publishing any file
+  ---
+  duration_ms: 3.890875
+  type: 'test'
+  ...
+# Subtest: rejects high compression ratios before decompressing a ZIP bomb entry
+ok 120 - rejects high compression ratios before decompressing a ZIP bomb entry
+  ---
+  duration_ms: 19.445417
+  type: 'test'
+  ...
+# Subtest: preflights existing targets before creating any imported files or directories
+ok 121 - preflights existing targets before creating any imported files or directories
+  ---
+  duration_ms: 3.366916
+  type: 'test'
+  ...
+# Subtest: rejects unsupported general-purpose flags and compression methods
+ok 122 - rejects unsupported general-purpose flags and compression methods
+  ---
+  duration_ms: 6.715125
+  type: 'test'
+  ...
+# Subtest: applies caller-supplied archive, entry, and expanded-size limits
+ok 123 - applies caller-supplied archive, entry, and expanded-size limits
+  ---
+  duration_ms: 0.645167
+  type: 'test'
+  ...
+# Subtest: rolls back an earlier committed file and created directories after a later commit failure
+ok 124 - rolls back an earlier committed file and created directories after a later commit failure
+  ---
+  duration_ms: 12.844834
+  type: 'test'
+  ...
+# Subtest: rollback leaves a concurrent replacement at a committed path untouched
+ok 125 - rollback leaves a concurrent replacement at a committed path untouched
+  ---
+  duration_ms: 8.164083
+  type: 'test'
+  ...
+# Subtest: rollback leaves a replaced import directory untouched
+ok 126 - rollback leaves a replaced import directory untouched
+  ---
+  duration_ms: 13.221667
+  type: 'test'
+  ...
+# Subtest: import rejects a parent replaced by a symlink before the next commit and avoids unsafe rollback
+ok 127 - import rejects a parent replaced by a symlink before the next commit and avoids unsafe rollback
+  ---
+  duration_ms: 20.10825
+  type: 'test'
+  ...
+1..127
+# tests 132
+# suites 0
+# pass 130
+# fail 0
+# cancelled 0
+# skipped 2
+# todo 0
+# duration_ms 2703.99075

@@ -1,0 +1,76 @@
+
+> standalone-editor-frontend@1.0.0 test:browser
+> node --test --test-concurrency=1 --test-reporter=spec tests/editor-save.browser.test.js tests/markdown-fidelity.browser.test.js tests/markdown-rich-safe.browser.test.js tests/workspace-validation.browser.test.js tests/chrome-startup.test.js
+
+✔ Chrome startup fails promptly with bounded stderr when CHROME_PATH exits early (727.100291ms)
+[chrome-startup] Recovered on attempt 2.
+Attempt 1 failed with profile /var/folders/6w/jrn2vj951c18d83g6gnlz0kh0000gn/T/standalone-editor-chrome-retry-fq9pfM/profile:
+Chrome exited before DevTools became ready (exit code 9, signal none).
+Chrome stderr (last 8000 characters):
+transient Chrome startup failure
+
+
+Attempt 2 reached DevTools on port 62331 with profile /var/folders/6w/jrn2vj951c18d83g6gnlz0kh0000gn/T/standalone-editor-chrome-retry-fq9pfM/profile-retry-iDf0rZ.
+✔ Chrome startup retries once with a fresh profile after a transient CHROME_PATH failure (533.195333ms)
+✔ an edit is persisted by the three-second autosave (4388.906ms)
+✔ denied browser storage leaves the workspace editable and the three-second server save working (3695.995417ms)
+✔ restoring history in source mode stays clean and does not schedule another save (4332.935792ms)
+✔ a denied workspace write explains the permission error and keeps the draft (613.354458ms)
+✔ Markdown larger than the preview cap opens read-only without a draft or autosave (4092.453875ms)
+✔ a late large-document response cannot block the next tab from editing (3664.426333ms)
+✔ a dirty draft survives a read-only transition and remains recoverable after close (1521.216125ms)
+✔ canceling a move reference warning does not flush an open draft or move the directory (11424.0485ms)
+✔ .markdown stays editable while attachments use a read-only byte download view (3710.69275ms)
+✔ a pending edit stays bound to its file when the user switches tabs (3563.363542ms)
+✔ two independent browser tabs cannot silently overwrite a newer save (7885.442834ms)
+✔ duplicating a tab with a cloned session id keeps each draft snapshot separate (1658.617667ms)
+✔ choosing an alternate recovery draft keeps the previous draft reachable (1047.71575ms)
+✔ switching workspace A to B and back keeps A recovery candidate separate (1743.066584ms)
+✔ trash UI can restore a deleted file to its original path (832.815417ms)
+✔ history dialog confirms per-version deletion without changing current documents (7967.59025ms)
+✔ trash dialog reports storage and limits permanent cleanup to confirmed expired items (8269.239708ms)
+✔ an external disk edit is detected before the browser can overwrite it (4120.226917ms)
+CRASH_RECOVERY_DIAGNOSTICS {"crashCommand":"no response within 750ms","chromePid":94371,"oldTargetListedAfterCrash":true,"rendererResponsiveAfterCrash":false,"closeStatus":"200 Target is closing","oldPagePutRequests":[],"recoveredPagePutRequests":[],"oldPageSaveTimers":1,"recoveredPageSaveTimers":0,"diskAt":["First file seed","First file seed","First file seed","First file seed","First file seed","First file seed"]}
+✔ a renderer crash restores the throttled draft without writing it blindly (5904.575833ms)
+✔ orphan history can be previewed, restored without silent overwrite, and explicitly deleted (2489.165416ms)
+✔ complex Markdown opens in source mode and rich conversion requires explicit warning confirmation (1746.076166ms)
+✔ source image upload inserts at the CodeMirror cursor, saves, and source outline tracks live headings (4386.546917ms)
+✔ document tabs can be selected with the keyboard without closing adjacent tabs (457.063625ms)
+✔ renaming an open image updates its viewer address and title (460.981459ms)
+✔ file tree F2 cancel and Shift+F10 Escape restore rc-tree keyboard focus and navigation (392.099333ms)
+✔ ordinary nested model bullets open in rich mode and keep their hierarchy after editing (806.8475ms)
+✔ numbered Markdown heading dots survive rich editing and save without an open-time write (786.39025ms)
+✔ lossy quote, reference, and multiline HTML syntax stays byte-identical on a no-op save (655.962167ms)
+✔ a titled Markdown link stays in source mode so editing cannot discard its title (446.862833ms)
+✔ opening and canceling a repair proposal never writes or schedules an autosave (3894.08ms)
+✔ switching from a source-mode repair proposal to another file stays clean past autosave (3970.2215ms)
+✔ confirming a repair saves once through CAS, records history, and removes the proposal (686.593875ms)
+✔ a stale disk revision blocks repair and retains the confirmed candidate for conflict review (446.452792ms)
+✔ closing during an immediate repair save waits for that save without issuing a duplicate PUT (552.108709ms)
+✔ ordinary delimiter-like text stays rich while angle autolinks get a repair diagnostic without writing (4271.141625ms)
+✔ tab-indented unordered and nested ordered tasks are protected in source mode (345.935875ms)
+✔ task checkboxes align with wrapped Chinese text and checked state survives save and reopen (3683.477ms)
+✔ source-mode edits preserve the original Markdown bytes around the edit (459.909042ms)
+✔ nested Markdown images render through workspace media and stay relative through editing and upload (3659.366667ms)
+✔ image width and alignment round-trip as adjacent portable metadata (837.679791ms)
+✔ explicit left alignment survives rich table editing, save, and reopen (820.633208ms)
+✔ legacy zoom stays attached to the correct image even when paths repeat (465.657209ms)
+✔ table picker chooses dimensions and contextual tools add rows and columns (513.785916ms)
+✔ table picker has one roving tab stop and Escape restores focus to its trigger (875.427875ms)
+✔ mobile directory keeps long nested filenames inside its frame (557.145208ms)
+✔ mobile image action opens the same file input (406.948583ms)
+✔ visual review snapshots on isolated workspace (1491.911959ms)
+✔ interactive visual review of source, table and image controls (2410.1295ms)
+✔ rich-safe Markdown opens rich, accepts an edit, and saves through the conversion chain (1184.66175ms)
+✔ Vite preserves the browser-facing Host and Origin for the backend (684.075708ms)
+✔ stale browser workspace is diagnostic only and retry enters editor only after /check succeeds (416.356334ms)
+✔ invalid saved config still allows directory browsing and shows recovery-root selection errors (1115.605625ms)
+✔ directory picker shows and follows Linux locations alongside roots (870.503792ms)
+ℹ tests 55
+ℹ suites 0
+ℹ pass 55
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 138099.422291

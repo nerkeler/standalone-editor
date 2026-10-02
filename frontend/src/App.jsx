@@ -1,10 +1,13 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react'
+import React, { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { ConfigProvider, theme as antdTheme } from 'antd'
 import Welcome from './pages/Welcome'
-import Editor from './pages/Editor'
 import { api, setWorkspaceContext } from './api'
 import ThemeToggle from './components/ThemeToggle'
+import EditorLoadErrorBoundary from './components/EditorLoadErrorBoundary'
 import { applyTheme, getInitialTheme, THEME_KEY } from './theme'
+import { writeStorage } from './safeStorage.js'
+
+const Editor = lazy(() => import('./pages/Editor'))
 
 function describeWorkspaceCheckError(error) {
   const payload = error?.response?.data || {}
@@ -40,7 +43,7 @@ export default function App() {
 
   useEffect(() => {
     applyTheme(theme)
-    try { localStorage.setItem(THEME_KEY, theme) } catch {}
+    writeStorage(THEME_KEY, theme)
   }, [theme])
 
   const validateWorkspace = useCallback(async () => {
@@ -94,6 +97,8 @@ export default function App() {
     return validateWorkspace()
   }, [validateWorkspace])
 
+  const toggleTheme = () => setTheme(current => current === 'dark' ? 'light' : 'dark')
+
   const content = checkingWorkspace
     ? <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在校验工作空间…</div>
     : !workspace
@@ -102,9 +107,13 @@ export default function App() {
           onRetry={validateWorkspace}
           onEnter={enterWorkspace}
         />
-      : <Editor workspace={workspace} workspaceInfo={workspaceInfo} onWorkspaceChange={enterWorkspace} />
+      : <EditorLoadErrorBoundary key={`${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}`}>
+          <Suspense fallback={<div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在加载编辑器…</div>}>
+            <Editor workspace={workspace} workspaceInfo={workspaceInfo} onWorkspaceChange={enterWorkspace}
+              themeToggle={<ThemeToggle theme={theme} onToggle={toggleTheme} />} />
+          </Suspense>
+        </EditorLoadErrorBoundary>
 
-  const toggleTheme = () => setTheme(current => current === 'dark' ? 'light' : 'dark')
   return (
     <ConfigProvider
       theme={{
@@ -117,7 +126,7 @@ export default function App() {
         },
       }}
     >
-      <ThemeToggle theme={theme} onToggle={toggleTheme} />
+      {!workspace && <ThemeToggle theme={theme} onToggle={toggleTheme} />}
       {content}
     </ConfigProvider>
   )

@@ -1,0 +1,612 @@
+{
+  "capturedAt": "2026-10-02T00:56:58.187Z",
+  "startedAt": "2026-10-02T00:56:38.257Z",
+  "purpose": "Local production-build UI performance measurement with a synthetic 3,000-note workspace. Not a NAS or real-mobile measurement.",
+  "environment": {
+    "platform": "Darwin 27.2.0 (arm64)",
+    "cpu": "Apple M5",
+    "logicalCpuCount": 10,
+    "node": "v22.22.3",
+    "chromePath": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "servingMode": "Express backend process serves the checked-in frontend/dist from one loopback origin; Vite was not started.",
+    "viewport": "1440x900 desktop emulation, scale factor 1, mobile false; headless Chrome.",
+    "cacheState": "Each repetition used a new Chrome user-data profile and CDP Network.setCacheDisabled(true). Browser HTTP cache was disabled; OS filesystem/page cache was not controlled and may be warm, especially on later repetitions.",
+    "fixtureStorage": "Temporary local workspace on the host filesystem, not a NAS. Backend recovery root and workspace config were also isolated under the run temp directory.",
+    "cleanup": "The script terminated only its spawned Express and Chrome child processes, then removed its unique temporary workspace/profile directory."
+  },
+  "fixtureSpec": {
+    "folders": 60,
+    "markdownFiles": 3000,
+    "bytesPerMarkdownFile": 2848,
+    "totalMarkdownBytes": 8544000,
+    "content": "Deterministic English placeholder text; target receives PerfUiInputMarker only during the autosave probe. No real notes."
+  },
+  "frontendDistManifest": [
+    {
+      "path": "assets/Editor-1b8I9uXY.css",
+      "bytes": 36386,
+      "sha256": "cbb80a73394464611240e1798285c8ca16c7cd4a434e39de7e07bc20463b549c",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    },
+    {
+      "path": "assets/Editor-DwNIwDgh.js",
+      "bytes": 1595904,
+      "sha256": "35017dd022cb9103d085f762d3bd3c45d5cc17d58e038d91a02a88dca7d3b4dc",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    },
+    {
+      "path": "assets/MarkdownSourceEditor-D2BPJyLV.js",
+      "bytes": 58872,
+      "sha256": "6f2bcfc3827e01bd49807381716ac87b9aa3e1cbe571da05064b4768e50378d4",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    },
+    {
+      "path": "assets/index-CQL055r5.js",
+      "bytes": 589333,
+      "sha256": "6356d3779b1e782ec44db7887f16fa87547b463d5479ac7b0ce07bcaddea8bda",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    },
+    {
+      "path": "assets/index-DCSe4Oan.css",
+      "bytes": 5299,
+      "sha256": "026c4b7abca9fbddc83e67080afb5fbdb5b06b932f565e5cada23b93dce00d04",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    },
+    {
+      "path": "index.html",
+      "bytes": 635,
+      "sha256": "d5cc52d47b765eb5c40c3e84d68eaf4be44cca993e57b4bb58f871da5dfc8450",
+      "modifiedAt": "2026-10-02T00:40:30.059Z"
+    }
+  ],
+  "repetitionsRequested": 3,
+  "successfulRepetitions": 3,
+  "failures": [],
+  "summary": {
+    "medianAcrossSuccessfulProfilesMs": {
+      "coldNavigationToInteractiveTree": 178,
+      "expandAllClickTo3000FileNodesInDom": 543,
+      "scrollInputToObservedNextAnimationFrame": 101,
+      "scrollRequestToEvent": 91.6,
+      "openNoteClickToEditableBody": 963,
+      "textInputToNextAnimationFrame": 429,
+      "inputToPersistMs": 3059,
+      "saveWaitDurationMs": 2630
+    },
+    "screenshotRepetition": 2,
+    "perProfile": [
+      {
+        "repetition": 1,
+        "timingsMs": {
+          "coldNavigationToInteractiveTree": 181,
+          "expandAllClickTo3000FileNodesInDom": 553,
+          "scrollInputToObservedNextAnimationFrame": 101,
+          "scrollRequestToEvent": 91.6,
+          "openNoteClickToEditableBody": 1002,
+          "textInputToNextAnimationFrame": 440,
+          "inputToPersistMs": 3069,
+          "saveWaitDurationMs": 2629
+        }
+      },
+      {
+        "repetition": 2,
+        "timingsMs": {
+          "coldNavigationToInteractiveTree": 178,
+          "expandAllClickTo3000FileNodesInDom": 543,
+          "scrollInputToObservedNextAnimationFrame": 116,
+          "scrollRequestToEvent": 96.9,
+          "openNoteClickToEditableBody": 953,
+          "textInputToNextAnimationFrame": 429,
+          "inputToPersistMs": 3059,
+          "saveWaitDurationMs": 2630
+        }
+      },
+      {
+        "repetition": 3,
+        "timingsMs": {
+          "coldNavigationToInteractiveTree": 174,
+          "expandAllClickTo3000FileNodesInDom": 534,
+          "scrollInputToObservedNextAnimationFrame": 98,
+          "scrollRequestToEvent": 88.6,
+          "openNoteClickToEditableBody": 963,
+          "textInputToNextAnimationFrame": 426,
+          "inputToPersistMs": 3059,
+          "saveWaitDurationMs": 2633
+        }
+      }
+    ]
+  },
+  "measurements": [
+    {
+      "repetition": 1,
+      "profile": "fresh Chrome profile 1",
+      "workspaceId": "isolated synthetic fixture 1",
+      "fixture": {
+        "generationMs": 81,
+        "folders": 60,
+        "markdownFiles": 3000,
+        "bytesPerFile": 2848,
+        "totalMarkdownBytes": 8544000,
+        "samplePath": "dir-00/note-0000.md"
+      },
+      "timingsMs": {
+        "coldNavigationToInteractiveTree": 181,
+        "expandAllClickTo3000FileNodesInDom": 553,
+        "scrollInputToObservedNextAnimationFrame": 101,
+        "scrollRequestToEvent": 91.6,
+        "openNoteClickToEditableBody": 1002,
+        "textInputToNextAnimationFrame": 440,
+        "inputToPersistMs": 3069,
+        "saveWaitDurationMs": 2629
+      },
+      "tree": {
+        "initial": {
+          "items": 60,
+          "keyboardLabel": "文件目录键盘导航"
+        },
+        "expanded": {
+          "files": 3000,
+          "folders": 60,
+          "total": 3060,
+          "treeElements": 58269,
+          "totalDocumentElements": 58428
+        },
+        "scroll": {
+          "requestedAt": 1046.3999999761581,
+          "startTop": 0,
+          "scrollHeight": 113232,
+          "clientHeight": 765,
+          "done": true,
+          "eventToRafMs": -12.069999999999936,
+          "requestToEventMs": 91.60000002384186,
+          "requestToRafMs": 79.53000002384192,
+          "endTop": 700
+        }
+      },
+      "textInput": {
+        "nextFrame": {
+          "startedAt": 2392.199999988079,
+          "done": true,
+          "mutationToRafMs": 190.0020000238419,
+          "requestToRafMs": 400.202000011921,
+          "visibleText": true
+        },
+        "hostInputToNextFrameMs": 440
+      },
+      "persistedSave": {
+        "confirmed": true,
+        "waitError": null,
+        "diskContainsInputMarker": true,
+        "diskPath": "/var/folders/6w/jrn2vj951c18d83g6gnlz0kh0000gn/T/standalone-editor-large-workspace-1H8Vus/run-1/notes/dir-00/note-0000.md",
+        "diskTail": " UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+        "editDiagnostics": {
+          "url": "http://127.0.0.1:60656/",
+          "bodyPresent": true,
+          "bodyEditable": true,
+          "bodyLength": 2864,
+          "bodyStarts": "BENCHMARK NOTE 00/0000\n\nBENCHMARK_OPEN_NOTE_0000 Synthetic local performance fixture; no user data.\n\nThis deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic place",
+          "bodyEnds": "to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+          "bodyHasInputMarker": true,
+          "activeTreePath": "dir-00/note-0000.md",
+          "activeTabText": "note-0000.md",
+          "status": {
+            "className": "save-status is-saving",
+            "text": "保存中"
+          },
+          "selection": {
+            "collapsed": true,
+            "anchorText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "anchorOffset": 2763,
+            "focusText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "focusOffset": 2763
+          }
+        },
+        "apiRequests": [
+          {
+            "url": "http://127.0.0.1:60656/api/workspace/check",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace?recursive=1",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "apiResponses": [
+          {
+            "url": "http://127.0.0.1:60656/api/workspace/check",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace?recursive=1",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60656/api/workspace",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          }
+        ],
+        "putRequests": [
+          {
+            "url": "http://127.0.0.1:60656/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "path": "dir-00/note-0000.md",
+        "elapsedAfterWaitStartedMs": 3069,
+        "pollIntervalMs": 80,
+        "description": "Filesystem polling lasted up to 10 seconds from immediately after CDP text input; successful detection is bounded by the maximum 80 ms poll interval."
+      },
+      "browser": {
+        "version": "Chrome/154.0.8037.93",
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+        "viewport": {
+          "width": 1440,
+          "height": 900,
+          "deviceScaleFactor": 1,
+          "mobileEmulation": false
+        },
+        "profileFresh": true,
+        "httpCacheDisabled": true,
+        "serviceWorkerOrDiskCacheResponses": [],
+        "runtimeErrors": [],
+        "consoleErrors": []
+      },
+      "chromeMetricsAfterSave": {
+        "JSHeapUsedMB": null
+      },
+      "invalidTimingFields": {
+        "scrollEventToNextAnimationFrame": "Invalid: used the RAF frame-start timestamp instead of performance.now() inside the RAF callback."
+      }
+    },
+    {
+      "repetition": 2,
+      "profile": "fresh Chrome profile 2",
+      "workspaceId": "isolated synthetic fixture 2",
+      "fixture": {
+        "generationMs": 82,
+        "folders": 60,
+        "markdownFiles": 3000,
+        "bytesPerFile": 2848,
+        "totalMarkdownBytes": 8544000,
+        "samplePath": "dir-00/note-0000.md"
+      },
+      "timingsMs": {
+        "coldNavigationToInteractiveTree": 178,
+        "expandAllClickTo3000FileNodesInDom": 543,
+        "scrollInputToObservedNextAnimationFrame": 116,
+        "scrollRequestToEvent": 96.9,
+        "openNoteClickToEditableBody": 953,
+        "textInputToNextAnimationFrame": 429,
+        "inputToPersistMs": 3059,
+        "saveWaitDurationMs": 2630
+      },
+      "tree": {
+        "initial": {
+          "items": 60,
+          "keyboardLabel": "文件目录键盘导航"
+        },
+        "expanded": {
+          "files": 3000,
+          "folders": 60,
+          "total": 3060,
+          "treeElements": 58269,
+          "totalDocumentElements": 58428
+        },
+        "scroll": {
+          "requestedAt": 1018.8000000119209,
+          "startTop": 0,
+          "scrollHeight": 113232,
+          "clientHeight": 765,
+          "done": true,
+          "eventToRafMs": -1.8999999880791165,
+          "requestToEventMs": 96.89999997615814,
+          "requestToRafMs": 94.99999998807903,
+          "endTop": 700
+        }
+      },
+      "textInput": {
+        "nextFrame": {
+          "startedAt": 2326.300000011921,
+          "done": true,
+          "mutationToRafMs": 190.53800001192076,
+          "requestToRafMs": 387.4379999880789,
+          "visibleText": true
+        },
+        "hostInputToNextFrameMs": 429
+      },
+      "persistedSave": {
+        "confirmed": true,
+        "waitError": null,
+        "diskContainsInputMarker": true,
+        "diskPath": "/var/folders/6w/jrn2vj951c18d83g6gnlz0kh0000gn/T/standalone-editor-large-workspace-1H8Vus/run-2/notes/dir-00/note-0000.md",
+        "diskTail": " UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+        "editDiagnostics": {
+          "url": "http://127.0.0.1:60717/",
+          "bodyPresent": true,
+          "bodyEditable": true,
+          "bodyLength": 2864,
+          "bodyStarts": "BENCHMARK NOTE 00/0000\n\nBENCHMARK_OPEN_NOTE_0000 Synthetic local performance fixture; no user data.\n\nThis deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic place",
+          "bodyEnds": "to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+          "bodyHasInputMarker": true,
+          "activeTreePath": "dir-00/note-0000.md",
+          "activeTabText": "note-0000.md",
+          "status": {
+            "className": "save-status is-saving",
+            "text": "保存中"
+          },
+          "selection": {
+            "collapsed": true,
+            "anchorText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "anchorOffset": 2763,
+            "focusText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "focusOffset": 2763
+          }
+        },
+        "apiRequests": [
+          {
+            "url": "http://127.0.0.1:60717/api/workspace/check",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace?recursive=1",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "apiResponses": [
+          {
+            "url": "http://127.0.0.1:60717/api/workspace/check",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace?recursive=1",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60717/api/workspace",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          }
+        ],
+        "putRequests": [
+          {
+            "url": "http://127.0.0.1:60717/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "path": "dir-00/note-0000.md",
+        "elapsedAfterWaitStartedMs": 3059,
+        "pollIntervalMs": 80,
+        "description": "Filesystem polling lasted up to 10 seconds from immediately after CDP text input; successful detection is bounded by the maximum 80 ms poll interval."
+      },
+      "browser": {
+        "version": "Chrome/154.0.8037.93",
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+        "viewport": {
+          "width": 1440,
+          "height": 900,
+          "deviceScaleFactor": 1,
+          "mobileEmulation": false
+        },
+        "profileFresh": true,
+        "httpCacheDisabled": true,
+        "serviceWorkerOrDiskCacheResponses": [],
+        "runtimeErrors": [],
+        "consoleErrors": []
+      },
+      "chromeMetricsAfterSave": {
+        "JSHeapUsedMB": null
+      },
+      "invalidTimingFields": {
+        "scrollEventToNextAnimationFrame": "Invalid: used the RAF frame-start timestamp instead of performance.now() inside the RAF callback."
+      }
+    },
+    {
+      "repetition": 3,
+      "profile": "fresh Chrome profile 3",
+      "workspaceId": "isolated synthetic fixture 3",
+      "fixture": {
+        "generationMs": 79,
+        "folders": 60,
+        "markdownFiles": 3000,
+        "bytesPerFile": 2848,
+        "totalMarkdownBytes": 8544000,
+        "samplePath": "dir-00/note-0000.md"
+      },
+      "timingsMs": {
+        "coldNavigationToInteractiveTree": 174,
+        "expandAllClickTo3000FileNodesInDom": 534,
+        "scrollInputToObservedNextAnimationFrame": 98,
+        "scrollRequestToEvent": 88.6,
+        "openNoteClickToEditableBody": 963,
+        "textInputToNextAnimationFrame": 426,
+        "inputToPersistMs": 3059,
+        "saveWaitDurationMs": 2633
+      },
+      "tree": {
+        "initial": {
+          "items": 60,
+          "keyboardLabel": "文件目录键盘导航"
+        },
+        "expanded": {
+          "files": 3000,
+          "folders": 60,
+          "total": 3060,
+          "treeElements": 58269,
+          "totalDocumentElements": 58428
+        },
+        "scroll": {
+          "requestedAt": 1008.2999999523163,
+          "startTop": 0,
+          "scrollHeight": 113232,
+          "clientHeight": 765,
+          "done": true,
+          "eventToRafMs": -4.867999976158217,
+          "requestToEventMs": 88.60000002384186,
+          "requestToRafMs": 83.73200004768364,
+          "endTop": 700
+        }
+      },
+      "textInput": {
+        "nextFrame": {
+          "startedAt": 2294.7999999523163,
+          "done": true,
+          "mutationToRafMs": 182.73800003576298,
+          "requestToRafMs": 380.5380000476839,
+          "visibleText": true
+        },
+        "hostInputToNextFrameMs": 426
+      },
+      "persistedSave": {
+        "confirmed": true,
+        "waitError": null,
+        "diskContainsInputMarker": true,
+        "diskPath": "/var/folders/6w/jrn2vj951c18d83g6gnlz0kh0000gn/T/standalone-editor-large-workspace-1H8Vus/run-3/notes/dir-00/note-0000.md",
+        "diskTail": " UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+        "editDiagnostics": {
+          "url": "http://127.0.0.1:60774/",
+          "bodyPresent": true,
+          "bodyEditable": true,
+          "bodyLength": 2864,
+          "bodyStarts": "BENCHMARK NOTE 00/0000\n\nBENCHMARK_OPEN_NOTE_0000 Synthetic local performance fixture; no user data.\n\nThis deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic place",
+          "bodyEnds": "to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This deterministic placeholder text exists only to approximate an ordinary Markdown note size for lo PerfUiInputMarker",
+          "bodyHasInputMarker": true,
+          "activeTreePath": "dir-00/note-0000.md",
+          "activeTabText": "note-0000.md",
+          "status": {
+            "className": "save-status is-saving",
+            "text": "保存中"
+          },
+          "selection": {
+            "collapsed": true,
+            "anchorText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "anchorOffset": 2763,
+            "focusText": "This deterministic placeholder text exists only to approximate an ordinary Markdown note size for local UI timing. This ",
+            "focusOffset": 2763
+          }
+        },
+        "apiRequests": [
+          {
+            "url": "http://127.0.0.1:60774/api/workspace/check",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace?recursive=1",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "method": "GET"
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "apiResponses": [
+          {
+            "url": "http://127.0.0.1:60774/api/workspace/check",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace?recursive=1",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace/file?path=dir-00%2Fnote-0000.md",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          },
+          {
+            "url": "http://127.0.0.1:60774/api/workspace",
+            "status": 200,
+            "fromDiskCache": false,
+            "fromServiceWorker": false
+          }
+        ],
+        "putRequests": [
+          {
+            "url": "http://127.0.0.1:60774/api/workspace",
+            "method": "PUT"
+          }
+        ],
+        "path": "dir-00/note-0000.md",
+        "elapsedAfterWaitStartedMs": 3059,
+        "pollIntervalMs": 80,
+        "description": "Filesystem polling lasted up to 10 seconds from immediately after CDP text input; successful detection is bounded by the maximum 80 ms poll interval."
+      },
+      "browser": {
+        "version": "Chrome/154.0.8037.93",
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36",
+        "viewport": {
+          "width": 1440,
+          "height": 900,
+          "deviceScaleFactor": 1,
+          "mobileEmulation": false
+        },
+        "profileFresh": true,
+        "httpCacheDisabled": true,
+        "serviceWorkerOrDiskCacheResponses": [],
+        "runtimeErrors": [],
+        "consoleErrors": []
+      },
+      "chromeMetricsAfterSave": {
+        "JSHeapUsedMB": null
+      },
+      "invalidTimingFields": {
+        "scrollEventToNextAnimationFrame": "Invalid: used the RAF frame-start timestamp instead of performance.now() inside the RAF callback."
+      }
+    }
+  ],
+  "measurementPhase": "before FileTree callback/memo optimization",
+  "measurementNotes": [
+    "This is the pre-optimization measurement set retained at the root agent’s request.",
+    "Three fresh profiles completed the full fixture, tree expansion, scroll, note-open, text input, PUT 200, and temporary-file save verification.",
+    "The field scrollEventToNextAnimationFrame was invalid: the probe subtracted the RAF frame-start timestamp from an event-handler timestamp. Do not use it; corrected callback timing is pending a post-build rerun.",
+    "Input-to-next-frame measurements were taken before the planned FileTree callback/memo optimization. Do not treat them as final post-optimization performance evidence.",
+    "The screenshot and editDiagnostics captured the transient “保存中” footer immediately after the marker appeared on disk. The observed PUT response was HTTP 200 and the disk marker was present; a later rerun will wait for the visible saved footer before screenshot capture."
+  ]
+}

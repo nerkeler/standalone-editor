@@ -1405,6 +1405,9 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
   validateExpectedRevision(expectedRevision)
   const location = await fileLocation(workspace, reqPath, { allowMissing: true })
   const { base, target, parent } = location
+  // Keeping filesystem operations local to this write also lets failure-path
+  // tests inject an individual syscall without changing process-wide fs state.
+  const io = options.fileSystem || fs
   const guard = await openWorkspaceParent(base, target, makeError)
   try {
     if (location.stat && location.stat.size > MAX_EDITABLE_MARKDOWN_BYTES) {
@@ -1426,13 +1429,23 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
 
     const temporary = path.join(parent, `.${name}.${randomUUID()}.tmp`)
     const mode = existing ? existing.mode : 0o600
+    let temporaryStat = null
+    let temporaryCreated = false
     try {
       await guard.check()
-      const handle = await fs.open(temporary, 'wx', mode)
-      const temporaryStat = await handle.stat()
+      const handle = await io.open(temporary, 'wx', mode)
+      temporaryCreated = true
       try {
+        // Always close the descriptor even if fstat itself fails. Without a
+        // verified identity the cleanup path will deliberately leave the
+        // pathname untouched instead of risking deletion of a replacement.
+        temporaryStat = await handle.stat()
         await handle.writeFile(bytes)
         await handle.chmod(mode)
+        // Flush the new contents and mode before making the pathname visible.
+        // Parent-directory syncing is intentionally omitted because opening
+        // and syncing directories is not portable across the supported OSes.
+        await handle.sync()
       } finally {
         await handle.close()
       }
@@ -1449,7 +1462,7 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
           const latestMode = latestStat.mode & 0o777
           if (latestMode !== mode) {
             await guard.check()
-            const temporaryHandle = await fs.open(temporary, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0))
+            const temporaryHandle = await io.open(temporary, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0))
             try {
               const opened = await temporaryHandle.stat()
               if (opened.dev !== temporaryStat.dev || opened.ino !== temporaryStat.ino) {
@@ -1470,23 +1483,43 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
         await fs.access(target, fsConstants.W_OK)
         await guard.check()
         await assertSameEntry(temporary, temporaryStat, makeError)
-        await fs.rename(temporary, target)
+        await io.rename(temporary, target)
       } else {
         // The null revision means create-if-absent. link is an atomic exclusive
         // install, so another creator cannot be silently overwritten.
         await guard.check()
         await assertSameEntry(temporary, temporaryStat, makeError)
-        await fs.link(temporary, target)
+        await io.link(temporary, target)
         await guard.check()
         await assertSameEntry(temporary, temporaryStat, makeError)
-        await fs.unlink(temporary)
+        await io.unlink(temporary)
       }
     } catch (error) {
-      try {
-        await guard.check()
-        await assertSameEntry(temporary, temporaryStat, makeError)
-        await fs.unlink(temporary)
-      } catch {}
+      if (temporaryStat) {
+        try {
+          await guard.check()
+          await assertSameEntry(temporary, temporaryStat, makeError)
+          await io.unlink(temporary)
+        } catch (cleanupError) {
+          // Preserve the write failure as the primary error while exposing
+          // why cleanup could not remove this operation's exact inode.
+          error.details = {
+            ...(error.details || {}),
+            temporaryCleanupError: {
+              code: cleanupError.code || 'TEMPORARY_CLEANUP_FAILED',
+              message: cleanupError.message || '临时文件清理失败',
+            },
+          }
+        }
+      } else if (temporaryCreated) {
+        error.details = {
+          ...(error.details || {}),
+          temporaryCleanupError: {
+            code: 'TEMPORARY_IDENTITY_UNAVAILABLE',
+            message: '无法确认临时文件身份，为避免删除其他文件，已保留该路径供诊断',
+          },
+        }
+      }
       if (error.code === 'EEXIST' && expectedRevision === null) {
         let current = null
         try {
@@ -1678,6 +1711,43 @@ export async function uploadFile(workspace, reqPath, file, options = {}) {
 // 列出所有文件（用于判断是否为空工作空间）
 export async function listAll(workspace) {
   return (await listTree(workspace)).filter(item => item.type === 'file')
+}
+
+// Startup only needs a yes/no answer for the welcome screen. Stop at the first
+// visible regular file instead of allocating and sorting the complete tree.
+export async function hasWorkspaceFiles(workspace) {
+  const { full } = await existingPath(workspace, '')
+
+  async function walk(directory, isRoot = false) {
+    let entries
+    try {
+      entries = await fs.readdir(directory, { withFileTypes: true })
+    } catch (error) {
+      if (!isRoot && ['EACCES', 'EPERM'].includes(error.code)) return false
+      throw error
+    }
+
+    for (const entry of entries) {
+      if (entry.name.startsWith('.') || entry.isSymbolicLink()) continue
+      const entryPath = path.join(directory, entry.name)
+      if (entry.isFile()) return true
+      if (entry.isDirectory()) {
+        const stat = await fs.lstat(entryPath)
+        if (stat.isSymbolicLink()) continue
+        if (stat.isDirectory() && await walk(entryPath)) return true
+        if (stat.isFile()) return true
+        continue
+      }
+
+      const stat = await fs.lstat(entryPath)
+      if (stat.isSymbolicLink()) continue
+      if (stat.isFile()) return true
+      if (stat.isDirectory() && await walk(entryPath)) return true
+    }
+    return false
+  }
+
+  return walk(full, true)
 }
 
 const SEARCH_READ_CONCURRENCY = 4

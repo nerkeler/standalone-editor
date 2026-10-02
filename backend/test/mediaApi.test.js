@@ -15,7 +15,7 @@ async function temporaryDirectory(t, prefix) {
 }
 
 async function startBackend(t, workspace, recovery) {
-  const source = `import { server } from './src/index.js'; server.once('listening', () => process.send({ port: server.address().port }));`
+  const source = `import { createBackend } from './src/index.js'; import { createHttpServer } from './src/httpServer.js'; const backend = createBackend(); await backend.initialize(); const server = createHttpServer(backend.app); server.once('listening', () => process.send({ port: server.address().port })); server.listen(0, '127.0.0.1');`
   const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
     cwd: backendRoot,
     env: {

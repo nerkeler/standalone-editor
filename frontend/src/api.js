@@ -1,15 +1,18 @@
 import axios from 'axios'
+import { readJsonStorage, readStorage, removeStorage, writeStorage } from './safeStorage.js'
 
 const CONTEXT_KEY = 'editor_workspace_info'
 const PATH_KEY = 'editor_workspace'
 
 function readContext() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(CONTEXT_KEY) || 'null')
-    if (parsed?.workspace) return parsed
-  } catch {}
-  const workspace = localStorage.getItem(PATH_KEY)
-  return workspace ? { workspace } : null
+  const cached = readJsonStorage(CONTEXT_KEY)
+  if (cached.ok && typeof cached.value?.workspace === 'string' && cached.value.workspace) {
+    return cached.value
+  }
+  const legacy = readStorage(PATH_KEY)
+  return legacy.ok && typeof legacy.value === 'string' && legacy.value
+    ? { workspace: legacy.value }
+    : null
 }
 
 let context = readContext()
@@ -23,8 +26,8 @@ export function getWorkspaceContext() {
 export function setWorkspaceContext(value) {
   if (!value) {
     context = null
-    localStorage.removeItem(CONTEXT_KEY)
-    localStorage.removeItem(PATH_KEY)
+    removeStorage(CONTEXT_KEY)
+    removeStorage(PATH_KEY)
     return null
   }
   const next = typeof value === 'string' ? { workspace: value } : {
@@ -34,8 +37,8 @@ export function setWorkspaceContext(value) {
   }
   if (!next.workspace) return null
   context = next
-  localStorage.setItem(PATH_KEY, next.workspace)
-  localStorage.setItem(CONTEXT_KEY, JSON.stringify(next))
+  writeStorage(PATH_KEY, next.workspace)
+  writeStorage(CONTEXT_KEY, JSON.stringify(next))
   return next
 }
 
@@ -44,11 +47,24 @@ function isContextFreeRequest(config) {
   return url.includes('/api/dirs') || url.includes('/api/workspace/check') || url.includes('/api/workspace/set')
 }
 
+function hasHeader(headers, name) {
+  if (typeof headers?.has === 'function') return headers.has(name)
+  const normalizedName = name.toLowerCase()
+  return Object.keys(headers || {}).some(key => key.toLowerCase() === normalizedName)
+}
+
 api.interceptors.request.use(config => {
   if (!isContextFreeRequest(config) && context?.workspaceId) {
     config.headers = config.headers || {}
-    config.headers['X-Workspace-Id'] = context.workspaceId
-    if (context.workspaceVersion != null) config.headers['X-Workspace-Version'] = String(context.workspaceVersion)
+    // Preserve identity explicitly bound to an operation, such as a delayed
+    // confirmation. The backend can then reject it with 409 after a workspace
+    // switch instead of redirecting that operation to the newly selected path.
+    if (!hasHeader(config.headers, 'X-Workspace-Id')) {
+      config.headers['X-Workspace-Id'] = context.workspaceId
+    }
+    if (context.workspaceVersion != null && !hasHeader(config.headers, 'X-Workspace-Version')) {
+      config.headers['X-Workspace-Version'] = String(context.workspaceVersion)
+    }
   }
   return config
 })

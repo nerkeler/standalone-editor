@@ -7,6 +7,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import {
   listAll,
+  hasWorkspaceFiles,
   listDir,
   listTree,
   listFileHistory,
@@ -84,6 +85,109 @@ test('new atomic writes default to owner-only permissions', async t => {
   if (process.platform !== 'win32') {
     assert.equal((await fs.stat(path.join(workspace, 'new.md'))).mode & 0o777, 0o600)
   }
+})
+
+test('write, sync, rename, and link failures preserve the old file and remove only owned temporaries', async t => {
+  const cases = [
+    { name: 'stat', operation: 'stat', existing: true },
+    { name: 'write', operation: 'write', existing: true },
+    { name: 'sync', operation: 'sync', existing: true },
+    { name: 'rename', operation: 'rename', existing: true },
+    { name: 'link', operation: 'link', existing: false },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async t => {
+      const workspace = await temporaryWorkspace(t)
+      const recovery = await temporaryRecovery(t)
+      const target = path.join(workspace, 'note.md')
+      if (scenario.existing) await fs.writeFile(target, 'original', { mode: 0o640 })
+      const expectedRevision = scenario.existing ? revision('original') : null
+      const injected = Object.assign(new Error(`injected ${scenario.name} failure`), { code: 'EIO' })
+      let temporaryHandleClosed = false
+      const fileSystem = {
+        open: async (...args) => {
+          const handle = await fs.open(...args)
+          return {
+            stat: (...statArgs) => scenario.operation === 'stat'
+              ? Promise.reject(injected)
+              : handle.stat(...statArgs),
+            writeFile: (...writeArgs) => scenario.operation === 'write'
+              ? Promise.reject(injected)
+              : handle.writeFile(...writeArgs),
+            chmod: (...chmodArgs) => handle.chmod(...chmodArgs),
+            sync: () => scenario.operation === 'sync' ? Promise.reject(injected) : handle.sync(),
+            close: async () => {
+              await handle.close()
+              temporaryHandleClosed = true
+            },
+          }
+        },
+        rename: (...args) => scenario.operation === 'rename' ? Promise.reject(injected) : fs.rename(...args),
+        link: (...args) => scenario.operation === 'link' ? Promise.reject(injected) : fs.link(...args),
+        unlink: (...args) => fs.unlink(...args),
+      }
+
+      let failure
+      await assert.rejects(
+        writeFile(workspace, 'note.md', 'replacement', expectedRevision, { root: recovery, fileSystem }),
+        error => {
+          failure = error
+          return error === injected
+        },
+      )
+      if (scenario.operation === 'stat') {
+        assert.equal(temporaryHandleClosed, true, 'the opened temporary file descriptor must close when fstat fails')
+        assert.equal(failure.details.temporaryCleanupError.code, 'TEMPORARY_IDENTITY_UNAVAILABLE')
+      }
+      if (scenario.existing) {
+        assert.equal(await fs.readFile(target, 'utf8'), 'original')
+        const history = await listFileHistory(workspace, 'note.md', { root: recovery })
+        assert.equal(history.history.length, 1)
+        assert.equal(history.history[0].revision, revision('original'))
+        if (process.platform !== 'win32') assert.equal((await fs.stat(target)).mode & 0o777, 0o640)
+      } else {
+        await assert.rejects(fs.lstat(target), error => error.code === 'ENOENT')
+      }
+      const temporaryNames = (await fs.readdir(workspace)).filter(name => name.endsWith('.tmp'))
+      if (scenario.operation === 'stat') {
+        // Without a verified inode identity cleanup cannot safely distinguish
+        // our temp pathname from a concurrent replacement, so retain it.
+        assert.equal(temporaryNames.length, 1)
+        assert.equal((await fs.stat(path.join(workspace, temporaryNames[0]))).size, 0)
+      } else {
+        assert.deepEqual(temporaryNames, [])
+      }
+    })
+  }
+})
+
+test('failed cleanup reports the error and leaves a replacement inode untouched', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'original')
+  const injected = Object.assign(new Error('injected rename failure'), { code: 'EIO' })
+  let foreignTempPath
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    rename: async temporary => {
+      foreignTempPath = `${temporary}.owned-moved-aside`
+      await fs.rename(temporary, foreignTempPath)
+      await fs.writeFile(temporary, 'foreign inode')
+      throw injected
+    },
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'replacement', revision('original'), { root: recovery, fileSystem }),
+    error => error === injected && Boolean(error.details?.temporaryCleanupError?.message),
+  )
+  assert.equal(await fs.readFile(target, 'utf8'), 'original')
+  assert.equal(await fs.readFile(path.join(workspace, path.basename(foreignTempPath).replace('.owned-moved-aside', '')), 'utf8'), 'foreign inode')
+  assert.equal(await fs.readFile(foreignTempPath, 'utf8'), 'replacement')
 })
 
 test('uploads keep binary bytes and refuse replacement', async t => {
@@ -182,6 +286,18 @@ test('recursive tree uses the workspace-relative shape and omits hidden and syml
     { name: 'notes', type: 'dir', path: 'notes' },
     { name: 'one.md', type: 'file', path: 'notes/one.md' },
   ])
+})
+
+test('workspace file presence checks ignore hidden, symlink, and empty directory entries', async t => {
+  const workspace = await temporaryWorkspace(t)
+  await fs.mkdir(path.join(workspace, 'empty-folder'))
+  await fs.mkdir(path.join(workspace, '.hidden'))
+  await fs.writeFile(path.join(workspace, '.hidden', 'secret.md'), 'hidden')
+  assert.equal(await hasWorkspaceFiles(workspace), false)
+
+  await fs.mkdir(path.join(workspace, 'visible-folder'))
+  await fs.writeFile(path.join(workspace, 'visible-folder', 'note.md'), 'visible')
+  assert.equal(await hasWorkspaceFiles(workspace), true)
 })
 
 test('recursive tree keeps readable siblings when one child directory is unreadable', async t => {

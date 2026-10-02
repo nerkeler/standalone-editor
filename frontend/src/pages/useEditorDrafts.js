@@ -2,6 +2,14 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { MAX_EDITABLE_MARKDOWN_BYTES, utf8ByteLength } from '../markdownSize'
 import { requestErrorMessage } from '../requestErrorMessage'
+import {
+  classifyStorageError,
+  listStorageKeys,
+  readJsonStorage,
+  readStorage,
+  removeStorage,
+  writeStorage,
+} from '../safeStorage.js'
 
 const API = '/api/workspace'
 const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif']
@@ -46,19 +54,35 @@ function isFileConflict(error) {
 
 function getTabSessionId() {
   const key = 'editor_draft_tab_session'
-  try {
-    const existing = sessionStorage.getItem(key)
-    if (existing) return existing
-    const created = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-    sessionStorage.setItem(key, created)
-    return created
-  } catch {
-    return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  }
+  const existing = readStorage(key, 'sessionStorage')
+  if (existing.ok && existing.value) return existing.value
+  const created = createTabSessionId()
+  writeStorage(key, created, 'sessionStorage')
+  return created
 }
 
 function createTabSessionId() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function draftStorageFailureMessage(code, operation) {
+  if (code === 'quota') return '浏览器本地恢复存储已满，部分未保存草稿可能无法在异常关闭后恢复；服务端自动保存仍会继续'
+  if (code === 'security' || code === 'unavailable') {
+    return '浏览器禁止访问本地恢复存储，异常关闭后的草稿恢复可能受影响；服务端自动保存仍会继续'
+  }
+  if (code === 'invalid-json') return '本地恢复草稿格式无效，已忽略损坏的恢复数据；服务端自动保存仍会继续'
+  if (operation === 'remove') return '无法清理过期的本地恢复草稿；服务端自动保存仍会继续'
+  return operation === 'read'
+    ? '无法读取浏览器本地恢复草稿，草稿恢复可能受影响；服务端自动保存仍会继续'
+    : '无法写入浏览器本地恢复草稿；服务端自动保存仍会继续'
+}
+
+function throwStorageFailure(result) {
+  if (result.ok) return
+  const error = new Error(result.error?.message || 'Browser storage operation failed')
+  error.name = result.error?.name || 'StorageError'
+  error.storageCode = result.code
+  throw error
 }
 
 /** Owns each open document's Markdown draft and its serialized save queue. */
@@ -112,41 +136,57 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
   const pendingDraftKey = `${workspaceStoragePrefix}${encodeURIComponent(tabSessionId)}`
   const legacyPendingDraftKey = `editor_pending_drafts:${encodeURIComponent(draftWorkspaceIdentity)}`
   const readDraftStore = useCallback(key => {
-    try {
-      const raw = localStorage.getItem(key) || ''
-      if (raw.length > MAX_PENDING_DRAFT_STORE_CODE_UNITS) {
-        setDraftStorageError('本地恢复草稿超过安全大小，未自动恢复；服务端自动保存仍会继续')
-        return {}
-      }
-      const parsed = JSON.parse(raw || 'null')
-      if (!parsed || typeof parsed.drafts !== 'object' || Array.isArray(parsed.drafts)) return {}
-      const savedAt = Number(parsed.savedAt) || 0
-      // A draft left by a crashed/closed tab should not shadow a file forever.
-      if (savedAt && Date.now() - savedAt > DRAFT_RETENTION_MS) {
-        // Expired entries are the one case where stale storage can be pruned
-        // without coordinating with another live window.
-        localStorage.removeItem(key)
-        return {}
-      }
-      let oversizedDraft = false
-      const drafts = Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
-        if (!isMarkdownFile(path)) return []
-        const snapshot = normalizeDraftSnapshot(value, savedAt)
-        if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
-        if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
-          oversizedDraft = true
-          return []
-        }
-        return [[path, snapshot]]
-      }))
-      if (oversizedDraft) setDraftStorageError('超出 5 MiB 上限的本地草稿未自动恢复')
-      return drafts
-    } catch (error) {
-      setDraftStorageError(error?.name === 'SecurityError'
-        ? '浏览器禁止访问本地恢复存储'
-        : '无法读取浏览器本地恢复草稿')
+    const stored = readStorage(key)
+    if (!stored.ok) {
+      setDraftStorageError(draftStorageFailureMessage(stored.code, 'read'))
       return {}
     }
+    const raw = stored.value || ''
+    if (!raw) return {}
+    if (raw.length > MAX_PENDING_DRAFT_STORE_CODE_UNITS) {
+      setDraftStorageError('本地恢复草稿超过安全大小，未自动恢复；服务端自动保存仍会继续')
+      return {}
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      setDraftStorageError(draftStorageFailureMessage('invalid-json', 'read'))
+      return {}
+    }
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.drafts !== 'object' || Array.isArray(parsed.drafts)) {
+      setDraftStorageError(draftStorageFailureMessage('invalid-json', 'read'))
+      return {}
+    }
+    const savedAt = Number(parsed.savedAt) || 0
+    // A draft left by a crashed/closed tab should not shadow a file forever.
+    if (savedAt && Date.now() - savedAt > DRAFT_RETENTION_MS) {
+      // A failed cleanup does not make expired content eligible for recovery.
+      const removed = removeStorage(key)
+      if (!removed.ok) setDraftStorageError(draftStorageFailureMessage(removed.code, 'remove'))
+      return {}
+    }
+    let oversizedDraft = false
+    let malformedDraft = false
+    const drafts = Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
+      if (!isMarkdownFile(path)) {
+        malformedDraft = true
+        return []
+      }
+      const snapshot = normalizeDraftSnapshot(value, savedAt)
+      if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) {
+        malformedDraft = true
+        return []
+      }
+      if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) {
+        oversizedDraft = true
+        return []
+      }
+      return [[path, snapshot]]
+    }))
+    if (oversizedDraft) setDraftStorageError('超出 5 MiB 上限的本地草稿未自动恢复')
+    else if (malformedDraft) setDraftStorageError(draftStorageFailureMessage('invalid-json', 'read'))
+    return drafts
   }, [])
 
   const readPendingDrafts = useCallback(() => readDraftStore(pendingDraftKey), [pendingDraftKey, readDraftStore])
@@ -174,8 +214,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
         })
       const persist = currentEntries => {
         if (!currentEntries.length) {
-          localStorage.removeItem(pendingDraftKey)
-          return
+          return removeStorage(pendingDraftKey)
         }
         const savedAt = Date.now()
         const normalized = Object.fromEntries(currentEntries.map(([path, snapshot]) => [
@@ -183,15 +222,17 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
           { ...snapshot, savedAt },
         ]))
         const serialized = JSON.stringify({ version: 2, savedAt, drafts: normalized })
-        localStorage.setItem(pendingDraftKey, serialized)
+        return writeStorage(pendingDraftKey, serialized)
       }
       if (!entries.length) {
-        localStorage.removeItem(pendingDraftKey)
+        throwStorageFailure(persist([]))
       } else {
-        try {
-          persist(entries)
-        } catch (error) {
-          if (error?.name !== 'QuotaExceededError') throw error
+        const firstWrite = persist(entries)
+        if (!firstWrite.ok) {
+          const error = new Error(firstWrite.error?.message || 'Browser storage write failed')
+          error.name = firstWrite.error?.name || 'StorageError'
+          error.storageCode = firstWrite.code
+          if (classifyStorageError(error) !== 'quota') throw error
           skippedLargeDraft = true
           const retained = [...entries]
           let saved = false
@@ -200,28 +241,26 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
             // Never call persist([]) as a quota fallback: it removes the old
             // store, even though setItem failures leave that data intact.
             if (!retained.length) break
-            try {
-              persist(retained)
+            const retry = persist(retained)
+            if (retry.ok) {
               saved = true
               break
-            } catch (retryError) {
-              if (retryError?.name !== 'QuotaExceededError') throw retryError
             }
+            const retryError = new Error(retry.error?.message || 'Browser storage write failed')
+            retryError.name = retry.error?.name || 'StorageError'
+            retryError.storageCode = retry.code
+            if (classifyStorageError(retryError) !== 'quota') throw retryError
           }
           if (!saved) persistenceFailed = true
         }
       }
       let requiredDraftsPersisted = true
       if (requiredPaths.length) {
-        try {
-          const stored = JSON.parse(localStorage.getItem(pendingDraftKey) || 'null')
-          requiredDraftsPersisted = requiredPaths.every(path => (
+        const stored = readJsonStorage(pendingDraftKey)
+        requiredDraftsPersisted = stored.ok && requiredPaths.every(path => (
             typeof drafts[path]?.content === 'string' &&
-            stored?.drafts?.[path]?.content === drafts[path].content
+            stored.value?.drafts?.[path]?.content === drafts[path].content
           ))
-        } catch {
-          requiredDraftsPersisted = false
-        }
       }
       setDraftStorageError(!requiredDraftsPersisted
         ? '此文件的本地恢复草稿未能写入；为保护内容，标签页仍保持打开'
@@ -233,9 +272,7 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
       if (!persistenceFailed) lastSnapshotWriteRef.current = Date.now()
       return requiredPaths.length ? requiredDraftsPersisted : !persistenceFailed
     } catch (error) {
-      setDraftStorageError(error?.name === 'QuotaExceededError'
-        ? '浏览器存储空间已满，最近的未保存内容可能无法恢复'
-        : '无法写入浏览器本地恢复草稿；服务自动保存仍会继续')
+      setDraftStorageError(draftStorageFailureMessage(classifyStorageError(error), 'write'))
       return false
     }
   }, [pendingDraftKey])
@@ -400,7 +437,10 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
       // cross-tab presence channel, use a fresh slot for this page instance
       // so two tabs can never write the same localStorage snapshot key.
       const replacement = createTabSessionId()
-      try { sessionStorage.setItem('editor_draft_tab_session', replacement) } catch {}
+      const identityWrite = writeStorage('editor_draft_tab_session', replacement, 'sessionStorage')
+      if (!identityWrite.ok && identityWrite.code !== 'security' && identityWrite.code !== 'unavailable') {
+        setDraftStorageError(draftStorageFailureMessage(identityWrite.code, 'write'))
+      }
       setTabSessionId(replacement)
       setSessionIdentityReady(true)
       return undefined
@@ -420,7 +460,10 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
       if (cancelled) return
       if (responses.has(tabSessionId)) {
         const replacement = createTabSessionId()
-        try { sessionStorage.setItem('editor_draft_tab_session', replacement) } catch {}
+        const identityWrite = writeStorage('editor_draft_tab_session', replacement, 'sessionStorage')
+        if (!identityWrite.ok && identityWrite.code !== 'security' && identityWrite.code !== 'unavailable') {
+          setDraftStorageError(draftStorageFailureMessage(identityWrite.code, 'write'))
+        }
         setTabSessionId(replacement)
       }
       setSessionIdentityReady(true)
@@ -475,15 +518,12 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
     }
 
     const recoverAbandonedSessions = async () => {
-      let candidates = []
-      try {
-        for (let index = 0; index < localStorage.length; index += 1) {
-          const key = localStorage.key(index)
-          if (key?.startsWith(workspaceStoragePrefix) && key !== pendingDraftKey) candidates.push(key)
-        }
-      } catch {
+      const storedKeys = listStorageKeys(workspaceStoragePrefix)
+      if (!storedKeys.ok) {
+        setDraftStorageError(draftStorageFailureMessage(storedKeys.code, 'read'))
         return
       }
+      let candidates = storedKeys.keys.filter(key => key !== pendingDraftKey)
       const candidateSessions = candidates.map(key => key.slice(workspaceStoragePrefix.length))
       const channel = presenceChannelRef.current
       if (channel && candidateSessions.length) {
@@ -502,36 +542,17 @@ export default function useEditorDrafts(workspace, activeFileRef, workspaceId) {
         candidates = candidates.filter((_, index) => !responses.has(candidateSessions[index]))
       }
 
-        for (const key of candidates) {
-          if (cancelled) return
-        try {
-          const raw = localStorage.getItem(key) || ''
-          if (raw.length > MAX_PENDING_DRAFT_STORE_CODE_UNITS) continue
-          const parsed = JSON.parse(raw || 'null')
-          if (!parsed || typeof parsed.drafts !== 'object') continue
-          const savedAt = Number(parsed.savedAt) || 0
-          if (savedAt && Date.now() - savedAt > DRAFT_RETENTION_MS) {
-            localStorage.removeItem(key)
-            continue
-          }
-          const abandoned = Object.fromEntries(Object.entries(parsed.drafts).flatMap(([path, value]) => {
-            if (!isMarkdownFile(path)) return []
-            const snapshot = normalizeDraftSnapshot(value, savedAt)
-            if (!snapshot || (snapshot.savedAt && Date.now() - snapshot.savedAt > DRAFT_RETENTION_MS)) return []
-            if (utf8ByteLength(snapshot.content) > MAX_EDITABLE_MARKDOWN_BYTES) return []
-            return [[path, snapshot]]
-          }))
-          if (!Object.keys(abandoned).length) continue
-          // Other session stores are read-only here. A slow or suspended
-          // window may miss the presence probe, so adopting and deleting its
-          // snapshot automatically could erase a live draft. Keep every
-          // alternative visible until the user chooses it.
-          const sourceSession = key.slice(workspaceStoragePrefix.length)
-          for (const [path, snapshot] of Object.entries(abandoned)) {
-            addRecoveryAlternative(path, snapshot, sourceSession)
-          }
-        } catch (error) {
-          setDraftStorageError('无法读取其他标签页遗留的本地恢复草稿')
+      for (const key of candidates) {
+        if (cancelled) return
+        const abandoned = readDraftStore(key)
+        if (!Object.keys(abandoned).length) continue
+        // Other session stores are read-only here. A slow or suspended
+        // window may miss the presence probe, so adopting and deleting its
+        // snapshot automatically could erase a live draft. Keep every
+        // alternative visible until the user chooses it.
+        const sourceSession = key.slice(workspaceStoragePrefix.length)
+        for (const [path, snapshot] of Object.entries(abandoned)) {
+          addRecoveryAlternative(path, snapshot, sourceSession)
         }
       }
     }

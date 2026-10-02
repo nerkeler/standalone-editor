@@ -1,10 +1,10 @@
+import { readStorage } from './safeStorage.js'
+
 export const THEME_KEY = 'editor_theme'
 
 export function getInitialTheme() {
-  try {
-    const saved = localStorage.getItem(THEME_KEY)
-    if (saved === 'light' || saved === 'dark') return saved
-  } catch {}
+  const saved = readStorage(THEME_KEY)
+  if (saved.ok && (saved.value === 'light' || saved.value === 'dark')) return saved.value
   return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches
     ? 'dark'
     : 'light'

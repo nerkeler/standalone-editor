@@ -216,9 +216,9 @@ async function pageIsReady(connection = cdp) {
 }
 
 async function openFile(fileName, expectedText, connection = cdp) {
-  await waitUntil(`${fileName} in file tree`, () => connection.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === ${JSON.stringify(fileName)})`))
+  await waitUntil(`${fileName} in file tree`, () => connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === ${JSON.stringify(fileName)})`))
   await connection.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.click();
     return Boolean(node);
   })()`)
@@ -242,7 +242,7 @@ async function insertAtDocumentEnd(text, connection = cdp) {
 }
 
 async function insertAtSourceEnd(text, connection = cdp) {
-  await connection.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('Markdown source textarea to open', () => connection.evaluate(
     `Boolean(document.querySelector('.source-editor .cm-content'))`,
   ))
@@ -340,22 +340,22 @@ async function clickMenuItem(text, connection = cdp) {
 
 async function moveFileToTrash(fileName, connection = cdp) {
   await waitUntil(`${fileName} in the file tree before trashing`, () => connection.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
   ))
   await connection.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }));
     return Boolean(node);
   })()`)
-  await waitUntil(`${fileName} context menu to open`, () => connection.evaluate(`document.body.innerText.includes('删除')`))
+  await waitUntil(`${fileName} context menu to open`, () => connection.evaluate(`Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).some(item => item.innerText.includes('移入回收站'))`))
   await connection.evaluate(`(() => {
-    const action = Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '删除' && item.getBoundingClientRect().width > 0);
+    const action = Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).find(item => item.innerText.trim() === '移入回收站' && item.getBoundingClientRect().width > 0);
     action?.click();
     return Boolean(action);
   })()`)
   await clickVisibleButton('移入回收站', connection)
   await waitUntil(`${fileName} to leave the workspace tree`, () => connection.evaluate(
-    `!Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+    `!Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
   ))
   await waitUntil(`${fileName} move confirmation to close`, async () => !await hasVisibleConfirmation(connection))
 }
@@ -414,8 +414,8 @@ async function switchWorkspace(targetDirectoryName) {
     const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('选择工作目录'));
     const body = modal?.querySelector('.ant-modal-body');
     const target = ${JSON.stringify(targetDirectoryName)};
-    const listed = Array.from(body?.querySelectorAll('div') || []).some(item => item.innerText.trim() === target);
-    const rootButton = Array.from(body?.querySelectorAll('button[title]') || []).find(button => button.innerText.trim() === target);
+    const listed = Array.from(body?.querySelectorAll('.welcome-directory-entry') || []).some(item => item.innerText.trim() === target);
+    const rootButton = Array.from(body?.querySelectorAll('button[title]') || []).find(button => !button.classList.contains('welcome-directory-entry') && button.innerText.trim() === target);
     const back = Array.from(body?.querySelectorAll('button') || []).find(button => button.innerText.trim() === '返回');
     const currentName = Array.from(body?.querySelectorAll('.ant-breadcrumb-link') || []).at(-1)?.innerText.trim() || '';
     return { listed, rootButton: Boolean(rootButton), currentName, canGoUp: Boolean(back && !back.disabled) };
@@ -438,10 +438,10 @@ async function switchWorkspace(targetDirectoryName) {
   }
   if (!selectedRoot) {
     await waitUntil(`${targetDirectoryName} directory in picker`, () => cdp.evaluate(
-      `Array.from(document.querySelectorAll('.ant-modal-body div')).some(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)})`,
+      `Array.from(document.querySelectorAll('.workspace-picker-modal .welcome-directory-entry')).some(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)})`,
     ))
     await cdp.evaluate(`(() => {
-      const row = Array.from(document.querySelectorAll('.ant-modal-body div')).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
+      const row = Array.from(document.querySelectorAll('.workspace-picker-modal .welcome-directory-entry')).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
       row?.click();
       return Boolean(row);
     })()`)
@@ -608,6 +608,43 @@ test('an edit is persisted by the three-second autosave', async () => {
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
 })
 
+test('denied browser storage leaves the workspace editable and the three-second server save working', async () => {
+  await cdp.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `(() => {
+      const denied = () => { throw new DOMException('storage denied by isolated test', 'SecurityError') };
+      for (const method of ['getItem', 'setItem', 'removeItem', 'key']) {
+        Storage.prototype[method] = function() { return denied(); };
+      }
+      Object.defineProperty(Storage.prototype, 'length', {
+        configurable: true,
+        get: denied,
+      });
+    })();`,
+  })
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('workspace editor to mount while browser storage is denied', () => pageIsReady())
+  await openFile(firstFile, firstSeed)
+  await waitUntil('the local recovery warning to explain the storage failure', () => cdp.evaluate(
+    `document.querySelector('.draft-storage-warning')?.innerText.includes('服务端自动保存仍会继续')`,
+  ))
+
+  const token = `STORAGE-DENIED-SERVER-SAVE-${Date.now()}`
+  const editedAt = Date.now()
+  await insertAtDocumentEnd(token)
+  await waitUntil('the edited text to remain visible while browser storage is denied', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`,
+  ))
+  const saved = await waitUntil('the backend to persist the edit despite browser storage failures', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content.includes(token) ? content : null
+  }, 9000)
+
+  assert.ok(Date.now() - editedAt >= 2700, 'server save should keep the three-second debounce')
+  assert.ok(saved.includes(token))
+  assert.equal(await pageIsReady(), true, 'storage failures must not be reported as an unavailable workspace')
+  assert.ok(await cdp.evaluate(`document.querySelector('.draft-storage-warning')?.innerText.includes('服务端自动保存仍会继续')`))
+})
+
 test('restoring history in source mode stays clean and does not schedule another save', async () => {
   const original = '---\ntitle: Original source version\n---\n\nOriginal body\n'
   const changed = `HISTORY-CURRENT-${Date.now()}`
@@ -689,12 +726,12 @@ test('Markdown larger than the preview cap opens read-only without a draft or au
   await cdp.send('Page.reload', { ignoreCache: true })
   await waitUntil('editor to reload before opening the large Markdown fixture', () => pageIsReady())
   await waitUntil('oversized Markdown fixture to appear in the file tree', () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
   ))
 
   const requestOffset = cdp.networkRequests.length
   await cdp.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.click();
     return Boolean(node);
   })()`)
@@ -733,12 +770,12 @@ test('a late large-document response cannot block the next tab from editing', as
   await cdp.send('Page.reload', { ignoreCache: true })
   await waitUntil('editor to reload before the rapid tab switch', () => pageIsReady())
   await waitUntil('both documents to appear before the rapid tab switch', () => cdp.evaluate(
-    `['${fileName}', '${firstFile}'].every(name => Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === name))`,
+    `['${fileName}', '${firstFile}'].every(name => Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === name))`,
   ))
 
   await cdp.evaluate(`(() => {
-    const large = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
-    const normal = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(firstFile)});
+    const large = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const normal = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(firstFile)});
     large?.click();
     normal?.click();
     return Boolean(large && normal);
@@ -777,7 +814,7 @@ test('a dirty draft survives a read-only transition and remains recoverable afte
   await writeFile(filePath, 'x'.repeat(5 * 1024 * 1024 + 1))
   await openFile(firstFile, firstSeed)
   await cdp.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.click();
     return Boolean(node);
   })()`)
@@ -846,16 +883,16 @@ test('a dirty draft survives a read-only transition and remains recoverable afte
   })`), true)
 
   await cdp.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(fileName)});
     node?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }));
     return Boolean(node);
   })()`)
   await waitUntil('the tree context menu for the retained draft file', () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('div')).some(menu => menu.style.position === 'fixed' && menu.innerText.includes('重命名') && menu.innerText.includes('删除'))`,
+    `Boolean(document.querySelector('.editor-context-menu') && document.querySelector('.editor-context-menu').innerText.includes('重命名') && document.querySelector('.editor-context-menu').innerText.includes('移入回收站'))`,
   ))
   await cdp.evaluate(`(() => {
-    const menu = Array.from(document.querySelectorAll('div')).find(item => item.style.position === 'fixed' && item.innerText.includes('重命名') && item.innerText.includes('删除'));
-    Array.from(menu?.children || []).find(item => item.innerText.trim() === '删除')?.click();
+    const menu = document.querySelector('.editor-context-menu');
+    Array.from(menu?.querySelectorAll('[role="menuitem"]') || []).find(item => item.innerText.trim() === '移入回收站')?.click();
     return Boolean(menu);
   })()`)
   await waitUntil('the delete confirmation for the retained draft file', () => cdp.evaluate(
@@ -899,7 +936,7 @@ test('canceling a move reference warning does not flush an open draft or move th
   })
   await movePage.send('Page.reload', { ignoreCache: true })
   await waitUntil('move fixture folders to appear in the tree', () => movePage.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(folderName)}) && Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(archiveName)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(folderName)}) && Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(archiveName)})`,
   ))
 
   await movePage.evaluate(`(() => {
@@ -916,13 +953,13 @@ test('canceling a move reference warning does not flush an open draft or move th
   await insertAtDocumentEnd(draftToken, movePage)
   const requestOffset = movePage.networkRequests.length
   await movePage.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(folderName)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(folderName)});
     node?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }));
     return Boolean(node);
   })()`)
-  await waitUntil('directory context menu to open', () => movePage.evaluate(`Array.from(document.querySelectorAll('#editor-root div')).some(item => item.innerText.trim() === '移动到...' && item.getBoundingClientRect().width > 0)`))
+  await waitUntil('directory context menu to open', () => movePage.evaluate(`Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).some(item => item.innerText.trim() === '移动到...' && item.getBoundingClientRect().width > 0)`))
   await movePage.evaluate(`(() => {
-    const action = Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '移动到...' && item.getBoundingClientRect().width > 0);
+    const action = Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).find(item => item.innerText.trim() === '移动到...' && item.getBoundingClientRect().width > 0);
     action?.click();
     return Boolean(action);
   })()`)
@@ -985,10 +1022,10 @@ test('.markdown stays editable while attachments use a read-only byte download v
 
   const requestOffset = cdp.networkRequests.length
   await waitUntil(`${attachmentPath} in the file tree`, () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(node => node.innerText.trim() === ${JSON.stringify(attachmentPath)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === ${JSON.stringify(attachmentPath)})`,
   ))
   await cdp.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(attachmentPath)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(attachmentPath)});
     node?.click();
     return Boolean(node);
   })()`)
@@ -1070,7 +1107,7 @@ test('two independent browser tabs cannot silently overwrite a newer save', asyn
 
 test('duplicating a tab with a cloned session id keeps each draft snapshot separate', async () => {
   await openFile(firstFile, firstSeed)
-  await cdp.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await cdp.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('first source editor to open', () => cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
   const storageWorkspace = await realpath(workspace)
   const originalSession = await cdp.evaluate(`sessionStorage.getItem('editor_draft_tab_session')`)
@@ -1214,22 +1251,22 @@ test('switching workspace A to B and back keeps A recovery candidate separate', 
 
 test('trash UI can restore a deleted file to its original path', async () => {
   await waitUntil('second file in the workspace tree', () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`,
   ))
   await cdp.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === ${JSON.stringify(secondFile)});
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === ${JSON.stringify(secondFile)});
     node?.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 40, clientY: 40 }));
     return Boolean(node);
   })()`)
-  await waitUntil('file context menu to open', () => cdp.evaluate(`document.body.innerText.includes('重命名') && document.body.innerText.includes('删除')`))
+  await waitUntil('file context menu to open', () => cdp.evaluate(`Boolean(document.querySelector('.editor-context-menu')?.innerText.includes('重命名') && document.querySelector('.editor-context-menu')?.innerText.includes('移入回收站'))`))
   await cdp.evaluate(`(() => {
-    const action = Array.from(document.querySelectorAll('#editor-root div')).find(item => item.innerText.trim() === '删除' && item.getBoundingClientRect().width > 0);
+    const action = Array.from(document.querySelectorAll('.editor-context-menu [role="menuitem"]')).find(item => item.innerText.trim() === '移入回收站' && item.getBoundingClientRect().width > 0);
     action?.click();
     return Boolean(action);
   })()`)
   await clickVisibleButton('移入回收站')
   await waitUntil('file to leave the workspace tree', () => cdp.evaluate(
-    `!Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`,
+    `!Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`,
   ))
   await waitUntil('delete confirmation to close', () => cdp.evaluate(
     `!document.querySelector('.ant-modal-confirm')`,
@@ -1258,7 +1295,7 @@ test('trash UI can restore a deleted file to its original path', async () => {
   assert.ok(restoreNotice.includes('已从回收站恢复'), restoreNotice)
   await waitUntil('restore to bring the file back to disk and tree', async () => {
     const disk = await readFile(path.join(workspace, secondFile), 'utf8').catch(() => '')
-    const inTree = await cdp.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`)
+    const inTree = await cdp.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(secondFile)})`)
     return disk === secondSeed && inTree
   })
   assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
@@ -1352,7 +1389,7 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
   await setupPage(cdp)
   await Promise.all([expiredName, retainedName, retainedAfterFailureName].map(name => waitUntil(
     `${name} to appear after reload`,
-    () => cdp.evaluate(`Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(name)})`),
+    () => cdp.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(name)})`),
   )))
   await moveFileToTrash(expiredName)
   await moveFileToTrash(retainedName)
@@ -1622,7 +1659,7 @@ test('a renderer crash restores the throttled draft without writing it blindly',
   })()`)
   await openFile(firstFile, firstSeed)
   await installSaveTimerProbe(cdp)
-  await cdp.evaluate(`document.querySelector('[aria-label="源码"]')?.click()`)
+  await cdp.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
   await waitUntil('source editor to open before the crash test', () => cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`))
   const token = `CRASH-RECOVERY-${Date.now()}`
   await insertAtSourceEnd(token)
@@ -1697,7 +1734,7 @@ test('orphan history can be previewed, restored without silent overwrite, and ex
   await cdp.send('Page.reload', { ignoreCache: true })
   await waitUntil('editor to reload after creating the orphan test file', () => pageIsReady())
   await waitUntil('orphan test file in the workspace tree', () => cdp.evaluate(
-    `Array.from(document.querySelectorAll('.ant-tree-title > div')).some(item => item.innerText.trim() === ${JSON.stringify(orphanFile)})`,
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(orphanFile)})`,
   ))
   await openFile(orphanFile, orphanSeed)
   await insertAtSourceEnd(`\n${editToken}`)

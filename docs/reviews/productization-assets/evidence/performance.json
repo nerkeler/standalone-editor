@@ -1,0 +1,76 @@
+{
+  "date": "2026-10-01T15:28:03.630Z",
+  "platform": "darwin",
+  "node": "v22.22.3",
+  "files": 3000,
+  "groups": 60,
+  "noteBytes": 2848,
+  "scope": "isolated synthetic notes, local filesystem; warm repeated requests, not NAS/mobile hardware",
+  "observations": [
+    {
+      "endpoint": "/api/workspace/check",
+      "samplesMs": [
+        8.66,
+        1.54,
+        1.14,
+        0.99,
+        1.22
+      ],
+      "medianMs": 1.22,
+      "responseBytes": 180,
+      "resultCount": null
+    },
+    {
+      "endpoint": "/api/workspace?recursive=1",
+      "samplesMs": [
+        13.96,
+        9.9,
+        8.02,
+        9.53,
+        8.15
+      ],
+      "medianMs": 9.53,
+      "responseBytes": 198061,
+      "resultCount": 3000
+    },
+    {
+      "endpoint": "/api/workspace/search?q=note",
+      "samplesMs": [
+        8.19,
+        7.8,
+        7.19,
+        7.15,
+        6.67
+      ],
+      "medianMs": 7.19,
+      "responseBytes": 6501,
+      "resultCount": 100
+    },
+    {
+      "endpoint": "/api/workspace/search?q=unique-content-needle",
+      "samplesMs": [
+        17.12,
+        16.54,
+        16.43,
+        16.41,
+        17.51
+      ],
+      "medianMs": 16.54,
+      "responseBytes": 38301,
+      "resultCount": 100
+    },
+    {
+      "endpoint": "/api/workspace/search?q=not-present-in-any-note",
+      "samplesMs": [
+        278.56,
+        270,
+        269.58,
+        266.64,
+        267.06
+      ],
+      "medianMs": 269.58,
+      "responseBytes": 2,
+      "resultCount": 0
+    }
+  ]
+}

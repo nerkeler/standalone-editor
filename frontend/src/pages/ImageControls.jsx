@@ -14,7 +14,7 @@ export default function ImageControls({ editor, visible }) {
       if (!scroll || !selected) { setHandle(null); return }
       const box = selected.getBoundingClientRect()
       const frame = scroll.getBoundingClientRect()
-      setHandle({ left: box.right - frame.left + scroll.scrollLeft - 7, top: box.bottom - frame.top + scroll.scrollTop - 7,
+      setHandle({ left: box.right - frame.left + scroll.scrollLeft - 44, top: box.bottom - frame.top + scroll.scrollTop - 44,
         containerWidth: selected.parentElement?.clientWidth || box.width })
     }
     measure()

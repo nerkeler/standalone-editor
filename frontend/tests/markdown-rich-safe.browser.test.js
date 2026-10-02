@@ -154,10 +154,10 @@ async function openFixture() {
     'Boolean(document.querySelector(".workspace-sidebar") && document.querySelector(".tree-scroll"))',
   ))
   await waitUntil('rich-safe fixture to appear in file tree', () => connection.evaluate(
-    'Array.from(document.querySelectorAll(".ant-tree-title > div")).some(node => node.innerText.trim() === "rich-safe.md")',
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.innerText.trim() === 'rich-safe.md')`,
   ))
   await connection.evaluate(`(() => {
-    const node = Array.from(document.querySelectorAll('.ant-tree-title > div')).find(item => item.innerText.trim() === 'rich-safe.md');
+    const node = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(item => item.innerText.trim() === 'rich-safe.md');
     node?.click();
     return Boolean(node);
   })()`)

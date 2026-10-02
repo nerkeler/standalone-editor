@@ -10,6 +10,7 @@
 |---|---|---|
 | GET | `/api/workspace` | 列出目录文件 |
 | GET | `/api/workspace/check` | 检查工作空间状态 |
+| POST | `/api/workspace/set` | 校验并切换工作空间，body 使用主机路径 `path` |
 | GET | `/api/health` | 检查后端进程是否可响应；工作空间离线时仍返回成功 |
 | GET | `/api/workspace/file?path=...` | 读取文件内容 |
 | GET | `/api/workspace/file/history?path=...` | 查看该文件的版本历史 |
@@ -28,8 +29,8 @@
 | POST | `/api/workspace/trash/purge-expired` | 手动永久清理已过期的回收站项目 |
 | GET | `/api/workspace/recovery/stats` | 查看当前工作区历史版本、回收站和合计的项目数及存储字节数 |
 | POST | `/api/workspace/move` | 移动/重命名 |
-| POST | `/api/workspace/upload` | 上传文件 |
-| POST | `/api/upload/assets` | 上传图片到 `assets/`（兼容别名） |
+| POST | `/api/workspace/upload` | 上传文件；提交 Markdown 的 `documentPath` 时图片进入该文档同级 `assets/` |
+| POST | `/api/upload/assets` | 兼容接口：上传图片到工作区根目录 `assets/` |
 | GET | `/api/workspace/assets/:filename` | 读取图片资源（使用 `workspaceId` / `workspaceVersion` query） |
 | GET | `/api/workspace/media/*` | 按工作区相对路径读取图片，供 Markdown 相对图片引用渲染 |
 | GET | `/api/workspace/search?q=...` | 搜索文件名和 Markdown 内容 |
@@ -40,7 +41,7 @@
 
 除 `/api/workspace/check`、`/api/workspace/set` 和目录浏览外，工作空间 API 需要 `X-Workspace-Id`，并建议同时发送 `X-Workspace-Version`。前端自动附带这些标识；图片 `<img>` URL 使用同名 query 参数，因为浏览器资源请求不能附加自定义请求头。
 
-Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析；上传的图片保存在工作区根目录 `assets/`，插入时写入相对当前文档的路径。旧版 `/api/workspace/assets/...` 图片引用仍可读取，并会在富文本编辑保存后转换为相对路径。外部图片 URL 保持原样；媒体接口只读取工作区内支持的图片类型，并拒绝符号链接路径。
+Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析。编辑器通过 `/api/workspace/upload` 上传图片时会提交 `documentPath`，图片保存在当前文档同级的 `assets/`，Markdown 保存相对路径。旧客户端可继续使用 `/api/upload/assets` 将图片上传到工作区根目录 `assets/`；旧版 `/api/workspace/assets/...` 图片引用仍可读取，并会在富文本编辑保存后转换为相对路径。外部图片 URL 保持原样；媒体接口只读取工作区内支持的图片类型，并拒绝符号链接路径。
 
 `GET /api/workspace/download?path=...` 受工作空间身份和路径校验保护，以附件形式流式返回普通文件的原始字节；它不会像 Markdown `/export` 那样将内容解码为文本。即使某个 `.md` 文件因非法 UTF-8 无法编辑，也可以用此接口无损下载。
 
@@ -52,7 +53,7 @@ Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析；�
 
 `GET /api/workspace/recovery/stats` 返回当前工作区的 `history`、`trash` 和 `total`，每项包含 `items`、`bytes`，并带有 `generatedAt`。字节数按该工作区恢复存储中当前文件的实际字节长度统计，包含历史记录、回收站内容及其元数据；它表示恢复数据当前落盘占用，不是工作区原文件的总大小。
 
-未保存的编辑会定期保存在当前浏览器配置的本地存储中，重新打开工作空间时可以恢复。其他标签页遗留的草稿会作为独立恢复选项显示，不会自动覆盖当前草稿。浏览器草稿保留 7 天；浏览器清理站点数据、禁用本地存储或存储空间不足时，草稿恢复可能不可用。
+未保存的编辑会定期保存在当前浏览器配置的本地存储中，重新打开工作空间时可以恢复。其他标签页遗留的草稿会作为独立恢复选项显示，不会自动覆盖当前草稿。浏览器草稿保留 7 天；浏览器清理站点数据、禁用本地存储或存储空间不足时，草稿恢复可能不可用，界面会显示本地恢复受影响的提示。工作区缓存只用于启动上下文；后端校验失败仍按真实服务端错误显示，本地缓存读写失败不会阻止服务端自动保存。
 
 ### ZIP 导入范围
 
@@ -60,7 +61,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ### 本地运行边界
 
-后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。不要把监听地址改为局域网或公网可访问的地址，也不要把它当作多用户服务部署。
+后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。当前适用于本机使用；如需在可信局域网临时使用，必须由使用者控制网络边界和服务生命周期。不要向非可信网络或公网开放，也不要把它当作多用户服务部署。
 
 前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。Vite 默认接受 IP 和 localhost；使用自定义域名运行 Vite 时，以 `FRONTEND_ALLOWED_HOSTS=editor.example.com` 配置允许的主机名（多个名称用逗号分隔）。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未经认证时，仅应在可信网络内开放服务。
 
@@ -76,7 +77,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ## 测试
 
-CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。浏览器任务使用 Node.js 22 和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
+CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。浏览器任务使用 Node.js 22.12.0 或更高版本和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
 
 ```bash
 cd backend
@@ -87,6 +88,7 @@ npm ci
 npm run test:unit
 npm run build
 npm run test:browser
+npm run test:production-smoke
 ```
 
-浏览器回归测试覆盖编辑器保存、历史恢复、工作区校验、Markdown 富文本支持边界和图片相对路径。浏览器测试需要 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；本地默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试文件在 CI 中串行运行，每次运行都会用独立临时目录创建笔记工作区和 Chrome 配置，并为前后端及 Chrome DevTools 选择临时回环端口。
+Vite 浏览器回归测试覆盖编辑器保存、历史恢复、工作区校验、Markdown 富文本支持边界和图片相对路径。`test:production-smoke` 则只启动后端，从 `frontend/dist` 打开构建产物并验证三秒保存、相对图片读取和附件原字节下载，不依赖 Vite。浏览器测试需要 Chrome 或 Chromium，且 Node.js 需支持内置 WebSocket；本地默认路径未检测到浏览器时，可设置 `CHROME_PATH` 指向浏览器可执行文件。测试文件在 CI 中串行运行，每次运行都会用独立临时目录创建笔记工作区和 Chrome 配置，并为前后端及 Chrome DevTools 选择临时回环端口。依赖维护和支持版本见[前端依赖维护记录](dependency-maintenance.md)；构建产物和服务生命周期见[运行、更新与回退说明](release-runtime.md)。
