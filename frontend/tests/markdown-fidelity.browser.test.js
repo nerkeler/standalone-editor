@@ -7,6 +7,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, before } from 'node:test'
 import { marked } from 'marked'
+import { cleanupBrowserTest } from './helpers/browser-cleanup.js'
 import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -339,16 +340,12 @@ before(async () => {
 })
 
 after(async () => {
-  connection?.close()
-  for (const child of [chromeProcess, frontendProcess, backendProcess]) {
-    if (!child || child.exitCode !== null) continue
-    child.kill('SIGTERM')
-    await Promise.race([
-      new Promise(resolve => child.once('exit', resolve)),
-      new Promise(resolve => setTimeout(() => { child.kill('SIGKILL'); resolve() }, 1500)),
-    ])
-  }
-  if (tempRoot) await rm(tempRoot, { recursive: true, force: true })
+  await cleanupBrowserTest({
+    browser: { child: chromeProcess, port: chromePort },
+    connections: [connection],
+    children: [frontendProcess, backendProcess],
+    tempRoot,
+  })
 })
 
 test('complex Markdown opens in source mode and rich conversion requires explicit warning confirmation', async () => {

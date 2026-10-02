@@ -2,11 +2,12 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createServer } from 'node:net'
 import { createHash } from 'node:crypto'
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
+import { cleanupBrowserTest } from './helpers/browser-cleanup.js'
 import { startChrome } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -128,18 +129,6 @@ async function findChrome() {
   throw new Error('Chrome or Chromium is required. Set CHROME_PATH to its executable.')
 }
 
-async function stopChild(child) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return
-  child.kill('SIGTERM')
-  const stopped = await Promise.race([
-    new Promise(resolve => child.once('exit', () => resolve(true))),
-    new Promise(resolve => setTimeout(() => resolve(false), 2_000)),
-  ])
-  if (stopped) return
-  child.kill('SIGKILL')
-  await new Promise(resolve => child.once('exit', resolve))
-}
-
 test('production build opens, autosaves, serves relative images, and downloads original attachment bytes', { timeout: 90_000 }, async t => {
   await access(distIndex).catch(() => {
     throw new Error('Production smoke requires frontend/dist/index.html; run `npm run build` in frontend first.')
@@ -153,14 +142,17 @@ test('production build opens, autosaves, serves relative images, and downloads o
   const noteName = 'production-smoke.md'
   let backendProcess
   let chromeProcess
+  let chromePort
   let connection
   let logs = ''
 
   t.after(async () => {
-    connection?.close()
-    await stopChild(chromeProcess)
-    await stopChild(backendProcess)
-    await rm(tempRoot, { recursive: true, force: true })
+    await cleanupBrowserTest({
+      browser: { child: chromeProcess, port: chromePort },
+      connections: [connection],
+      children: [backendProcess],
+      tempRoot,
+    })
   })
 
   await mkdir(path.join(workspace, 'assets'), { recursive: true })
@@ -202,6 +194,7 @@ test('production build opens, autosaves, serves relative images, and downloads o
   const chromePath = await findChrome()
   const chrome = await startChrome({ chromePath, profileDir: path.join(tempRoot, 'chrome-profile') })
   chromeProcess = chrome.child
+  chromePort = chrome.port
   const targetResponse = await fetch(`http://127.0.0.1:${chrome.port}/json/new?about:blank`, { method: 'PUT' })
   assert.equal(targetResponse.ok, true, 'Chrome should create the isolated smoke page')
   const target = await targetResponse.json()

@@ -1,29 +1,41 @@
 import assert from 'node:assert/strict'
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
-import { once } from 'node:events'
+import { EventEmitter } from 'node:events'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import { stopChildProcess } from './helpers/browser-cleanup.js'
 import { startChrome } from './helpers/chrome-startup.js'
 
-async function stopChild(child) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return
-
-  const waitForClose = async timeoutMs => {
-    let timeoutId
-    const closed = await Promise.race([
-      once(child, 'close').then(() => true),
-      new Promise(resolve => { timeoutId = setTimeout(() => resolve(false), timeoutMs) }),
-    ])
-    clearTimeout(timeoutId)
-    return closed
+test('child shutdown observes an exit emitted synchronously by SIGTERM', async () => {
+  const child = new EventEmitter()
+  child.exitCode = null
+  child.signalCode = null
+  const signals = []
+  child.kill = signal => {
+    signals.push(signal)
+    child.signalCode = signal
+    child.emit('exit', null, signal)
+    return true
   }
 
-  child.kill('SIGTERM')
-  if (await waitForClose(1_000)) return
-  child.kill('SIGKILL')
-  await waitForClose(1_000)
-}
+  await stopChildProcess(child, { terminateWaitMs: 50, killWaitMs: 50 })
+  assert.deepEqual(signals, ['SIGTERM'])
+})
+
+test('child shutdown reports a process that survives bounded SIGTERM and SIGKILL waits', async () => {
+  const child = new EventEmitter()
+  child.exitCode = null
+  child.signalCode = null
+  const signals = []
+  child.kill = signal => {
+    signals.push(signal)
+    return true
+  }
+
+  await assert.rejects(stopChildProcess(child, { terminateWaitMs: 10, killWaitMs: 10 }), /did not exit after SIGKILL/)
+  assert.deepEqual(signals, ['SIGTERM', 'SIGKILL'])
+})
 
 test('Chrome startup fails promptly with bounded stderr when CHROME_PATH exits early', { skip: process.platform === 'win32' }, async t => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'standalone-editor-chrome-startup-'))
@@ -80,7 +92,7 @@ test('Chrome startup retries once with a fresh profile after a transient CHROME_
   let started
   t.after(async () => {
     try {
-      await stopChild(started?.child)
+      await stopChildProcess(started?.child)
     } finally {
       if (previousChromePath === undefined) delete process.env.CHROME_PATH
       else process.env.CHROME_PATH = previousChromePath

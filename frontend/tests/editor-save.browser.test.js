@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test, { after, afterEach, before, beforeEach } from 'node:test'
+import { cleanupBrowserTest } from './helpers/browser-cleanup.js'
 import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -581,16 +582,12 @@ afterEach(async () => {
 })
 
 after(async () => {
-  for (const connection of cdpConnections) connection.close()
-  for (const child of [chromeProcess, frontendProcess, backendProcess]) {
-    if (!child || child.exitCode !== null) continue
-    child.kill('SIGTERM')
-    await Promise.race([
-      new Promise(resolve => child.once('exit', resolve)),
-      new Promise(resolve => setTimeout(() => { child.kill('SIGKILL'); resolve() }, 1500)),
-    ])
-  }
-  if (tempRoot) await rm(tempRoot, { recursive: true, force: true })
+  await cleanupBrowserTest({
+    browser: { child: chromeProcess, port: chromeDebugPort },
+    connections: [...cdpConnections],
+    children: [frontendProcess, backendProcess],
+    tempRoot,
+  })
 })
 
 test('an edit is persisted by the three-second autosave', async () => {
