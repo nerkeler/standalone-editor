@@ -20,7 +20,7 @@ Standalone Editor 是一款在浏览器中运行的本地文档工作台。它�
 
 ## 快速开始
 
-建议使用 Node.js 22.12.0 或更高版本和 npm。前端的 Vite 7 要求该 Node.js 版本；macOS / Linux 可在终端运行：
+建议使用 Node.js 22.x 的 22.17.0 或更新版本和 npm。Windows 文件身份检查需要 Node.js 22.17.0 所带的 libuv 修复；启动脚本和后端入口会拒绝较旧版本及其他主版本。macOS / Linux 可在终端运行：
 
 ~~~bash
 git clone https://github.com/nerkeler/standalone-editor.git

@@ -34,6 +34,7 @@ import {
 import { createTrashService } from './trashService.js'
 import { getRecoveryStats } from './recoveryStatsService.js'
 import { importZip } from './zipImportService.js'
+import { isSupportedNodeVersion } from './runtimeVersion.js'
 import {
   configuredRootValues,
   defaultRootCandidates,
@@ -1090,5 +1091,10 @@ export function createBackend(options = {}) {
 // Preserve `node src/index.js` as a supported development and production
 // entrypoint while imports used by tests only construct an app on demand.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await startBackendServer(createBackend())
+  if (!isSupportedNodeVersion(process.versions.node)) {
+    console.error(`❌ 需要 Node.js 22.17.0 或更新的 22.x 版本（当前：v${process.versions.node}）`)
+    process.exitCode = 1
+  } else {
+    await startBackendServer(createBackend())
+  }
 }

@@ -37,6 +37,7 @@ test('development start script stops the other child when either service exits',
   await writeFile(script, await readFile(sourceScript))
   await chmod(script, 0o755)
   const serviceShim = label => `#!/bin/bash
+if [[ "\${1:-}" == "--version" ]]; then echo "\${START_TEST_NODE_VERSION:-v22.22.3}"; exit 0; fi
 echo "$$" > "$START_TEST_STATE/${label}.pid"
 trap 'echo stopped > "$START_TEST_STATE/${label}.stopped"; exit 0' TERM INT
 while :; do sleep 1; done
@@ -53,6 +54,7 @@ while :; do sleep 1; done
       ...process.env,
       PATH: `${fakeBin}:/usr/bin:/bin`,
       START_TEST_STATE: state,
+      START_TEST_NODE_VERSION: 'v22.17.0',
       EDITOR_PORT: '45557',
       FRONTEND_PORT: '45558',
       EDITOR_HOST: '127.0.0.1',
@@ -118,4 +120,39 @@ test('production start mode rejects a missing frontend build clearly', {
   })
   assert.equal(result.code, 1)
   assert.match(result.output, /未找到 frontend\/dist\/index\.html/)
+})
+
+test('start script rejects unsupported Node versions before launching services', {
+  skip: process.platform === 'win32' ? 'start.sh is the macOS/Linux launcher' : false,
+}, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'standalone-editor-start-node-version-'))
+  const project = path.join(root, 'project')
+  const fakeBin = path.join(root, 'bin')
+  const script = path.join(project, 'start.sh')
+  const nodeCommand = path.join(fakeBin, 'node')
+  await mkdir(project, { recursive: true })
+  await mkdir(fakeBin, { recursive: true })
+  await writeFile(script, await readFile(sourceScript))
+  await chmod(script, 0o755)
+  await writeFile(nodeCommand, '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "%s\\n" "$START_TEST_NODE_VERSION"; exit 0; fi\necho "services must not start" >&2\nexit 99\n')
+  await chmod(nodeCommand, 0o755)
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  for (const version of ['v22.12.0', 'v23.0.0']) {
+    const result = await new Promise((resolve, reject) => {
+      const child = spawn('/bin/bash', [script], {
+        cwd: project,
+        env: { ...process.env, PATH: `${fakeBin}:/usr/bin:/bin`, START_TEST_NODE_VERSION: version },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+      let output = ''
+      child.stdout.setEncoding('utf8').on('data', chunk => { output += chunk })
+      child.stderr.setEncoding('utf8').on('data', chunk => { output += chunk })
+      child.once('error', reject)
+      child.once('exit', code => resolve({ code, output }))
+    })
+    assert.equal(result.code, 1)
+    assert.match(result.output, /Node\.js 22\.17\.0 或更新的 22\.x 版本/)
+    assert.match(result.output, new RegExp(version.replaceAll('.', '\\.')))
+  }
 })

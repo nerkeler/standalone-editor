@@ -4,7 +4,7 @@ Standalone Editor can run in development mode with Vite, or serve the built fron
 
 ## Build and smoke-check a release
 
-Use Node.js 22.12.0 or newer in the 22.x line and install from the checked-in lockfiles:
+Use Node.js 22.17.0 or newer in the 22.x line and install from the checked-in lockfiles. The supported range is `>=22.17.0 <23.0.0`; the launch script and direct backend entrypoint both enforce it. Node.js 22.17.0 includes libuv 1.51.0, which fixes Windows file-system volume-serial consistency used by path and file-handle identity checks.
 
 ```bash
 (cd frontend && npm ci && npm run build)

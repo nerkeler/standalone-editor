@@ -53,8 +53,8 @@ test('backend instances keep workspace and recovery configuration isolated', asy
   assert.equal(infoA.workspace, realWorkspaceA)
   assert.equal(infoB.workspace, realWorkspaceB)
   assert.notEqual(infoA.workspaceId, infoB.workspaceId)
-  assert.equal((await fs.readFile(configA, 'utf8')).includes(realWorkspaceA), true)
-  assert.equal((await fs.readFile(configB, 'utf8')).includes(realWorkspaceB), true)
+  assert.equal(JSON.parse(await fs.readFile(configA, 'utf8')).workspace, realWorkspaceA)
+  assert.equal(JSON.parse(await fs.readFile(configB, 'utf8')).workspace, realWorkspaceB)
 
   const serverA = createHttpServer(backendA.app)
   const serverB = createHttpServer(backendB.app)
@@ -130,4 +130,20 @@ test('backend instances keep workspace and recovery configuration isolated', asy
   assert.equal(staleIdentityWrite.status, 409)
   assert.equal((await staleIdentityWrite.json()).code, 'WORKSPACE_MISMATCH')
   await assert.rejects(fs.stat(path.join(workspaceA2, 'note.md')), error => error.code === 'ENOENT')
+})
+
+test('path and file-handle stats agree for a real workspace file', async t => {
+  const workspace = await temporaryDirectory(t, 'path-handle-stat')
+  const filePath = path.join(workspace, 'identity.md')
+  await fs.writeFile(filePath, 'same file')
+  const handle = await fs.open(filePath, 'r')
+
+  try {
+    const [pathStat, handleStat] = await Promise.all([fs.lstat(filePath), handle.stat()])
+    assert.equal(pathStat.dev, handleStat.dev, `path st_dev=${pathStat.dev}; handle st_dev=${handleStat.dev}`)
+    assert.equal(pathStat.ino, handleStat.ino, `path st_ino=${pathStat.ino}; handle st_ino=${handleStat.ino}`)
+    assert.equal(pathStat.size, handleStat.size, `path size=${pathStat.size}; handle size=${handleStat.size}`)
+  } finally {
+    await handle.close()
+  }
 })

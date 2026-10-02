@@ -1,9 +1,19 @@
 import fs from 'node:fs/promises'
+import { constants } from 'node:fs'
 import path from 'node:path'
-import { assertSameEntry, openWorkspaceParent } from './workspacePathGuard.js'
-import { randomUUID } from 'node:crypto'
+import { openWorkspaceParent } from './workspacePathGuard.js'
+import { createHash, randomUUID } from 'node:crypto'
 import { inflateRaw } from 'node:zlib'
 import { promisify } from 'node:util'
+import {
+  directoryFingerprint,
+  directoryIdentity,
+  fileFingerprint,
+  matchesDirectoryFingerprint,
+  matchesDirectoryIdentity,
+  matchesFileFingerprint,
+  sameFileSnapshot,
+} from './zipImportIdentity.js'
 
 const inflateRawAsync = promisify(inflateRaw)
 const EOCD_SIGNATURE = 0x06054b50
@@ -306,62 +316,386 @@ async function validateExistingParents(base, targetDirectory) {
   }
 }
 
-async function makeDirectories(base, targetDirectory, createdDirectories) {
+const READ_FILE_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0)
+
+function sha256(buffer) {
+  return createHash('sha256').update(buffer).digest('hex')
+}
+
+function rememberDirectory(directoryPath, stat, directoryMap, directoryList) {
+  const record = {
+    path: directoryPath,
+    identity: directoryIdentity(stat),
+    fingerprint: directoryFingerprint(stat),
+    children: new Set(),
+  }
+  directoryMap.set(directoryPath, record)
+  directoryList.push(record)
+  return record
+}
+
+async function assertTrackedDirectory(directoryPath, directoryMap) {
+  const record = directoryMap.get(directoryPath)
+  if (!record) return
+  const stat = await fs.lstat(directoryPath, { bigint: true })
+  if (!matchesDirectoryFingerprint(stat, record.fingerprint)) throw zipError('导入目录在操作期间发生变化')
+  const children = await fs.readdir(directoryPath)
+  if (children.length !== record.children.size || children.some(child => !record.children.has(child))) {
+    throw zipError('导入目录包含并发创建的内容')
+  }
+}
+
+async function refreshTrackedDirectory(directoryPath, directoryMap) {
+  const record = directoryMap.get(directoryPath)
+  if (!record) return
+  const stat = await fs.lstat(directoryPath, { bigint: true })
+  if (!matchesDirectoryIdentity(stat, record.identity)) throw zipError('导入目录在操作期间发生变化')
+  record.fingerprint = directoryFingerprint(stat)
+  const children = await fs.readdir(directoryPath)
+  if (children.length !== record.children.size || children.some(child => !record.children.has(child))) {
+    throw zipError('导入目录包含并发创建的内容')
+  }
+}
+
+async function noteTrackedChild(parentPath, childName, directoryMap) {
+  const record = directoryMap.get(parentPath)
+  if (!record) return
+  if (record.children.has(childName)) throw zipError('导入目录目标已存在', 'CONFLICT')
+  record.children.add(childName)
+  await refreshTrackedDirectory(parentPath, directoryMap)
+}
+
+async function forgetTrackedChild(parentPath, childName, directoryMap) {
+  const record = directoryMap.get(parentPath)
+  if (!record) return
+  record.children.delete(childName)
+  await refreshTrackedDirectory(parentPath, directoryMap)
+}
+
+async function makeDirectories(base, targetDirectory, createdDirectories, directoryMap) {
   if (!within(base, targetDirectory)) throw zipError('压缩包路径超出工作空间')
   const relative = path.relative(base, targetDirectory)
   let current = base
   for (const part of relative ? relative.split(path.sep) : []) {
     current = path.join(current, part)
+    const parent = path.dirname(current)
+    await assertTrackedDirectory(parent, directoryMap)
+    let stat
     try {
-      const stat = await fs.lstat(current)
-      if (stat.isSymbolicLink() || !stat.isDirectory()) throw zipError('导入目录包含非法符号链接或文件')
+      stat = await fs.lstat(current, { bigint: true })
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
       const guard = await openWorkspaceParent(base, current, zipError)
       try {
         await guard.check()
-        await fs.mkdir(current, { mode: 0o700 })
-        createdDirectories.push({ path: current, stat: await fs.lstat(current) })
-      } catch (mkdirError) {
-        if (mkdirError.code !== 'EEXIST') throw mkdirError
-        const stat = await fs.lstat(current)
-        if (stat.isSymbolicLink() || !stat.isDirectory()) throw zipError('导入目录包含非法符号链接或文件')
+        await assertTrackedDirectory(parent, directoryMap)
+        try {
+          await fs.mkdir(current, { mode: 0o700 })
+          stat = await fs.lstat(current, { bigint: true })
+          if (!stat.isDirectory() || stat.isSymbolicLink()) throw zipError('导入目录包含非法符号链接或文件')
+          await noteTrackedChild(parent, path.basename(current), directoryMap)
+          rememberDirectory(current, stat, directoryMap, createdDirectories)
+        } catch (mkdirError) {
+          if (mkdirError.code !== 'EEXIST') throw mkdirError
+          stat = await fs.lstat(current, { bigint: true })
+        }
       } finally {
         await guard.close()
       }
     }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw zipError('导入目录包含非法符号链接或文件')
+    await assertTrackedDirectory(current, directoryMap)
   }
 }
 
-async function writeExclusive(base, destination, content, createdFiles) {
+async function inspectOpenFile(filePath, handle, maxBytes, includeData = false) {
+  const before = await handle.stat({ bigint: true })
+  const beforePath = await fs.lstat(filePath, { bigint: true })
+  if (!sameFileSnapshot(before, beforePath)) throw zipError('导入文件在读取前已变化')
+  if (before.size > BigInt(maxBytes) || before.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw zipError('ZIP 回滚文件超过可验证大小上限')
+  }
+
+  const size = Number(before.size)
+  const data = includeData ? Buffer.alloc(size) : undefined
+  const chunk = includeData ? data : Buffer.allocUnsafe(64 * 1024)
+  const digest = createHash('sha256')
+  let position = 0
+  while (position < size) {
+    const length = Math.min(chunk.length, size - position)
+    const { bytesRead } = await handle.read(chunk, includeData ? position : 0, length, position)
+    if (!bytesRead) throw zipError('导入文件在读取期间发生变化')
+    digest.update(chunk.subarray(includeData ? position : 0, (includeData ? position : 0) + bytesRead))
+    position += bytesRead
+  }
+
+  const after = await handle.stat({ bigint: true })
+  const afterPath = await fs.lstat(filePath, { bigint: true })
+  if (!sameFileSnapshot(before, after) || !sameFileSnapshot(before, afterPath)) {
+    throw zipError('导入文件在读取期间发生变化')
+  }
+  return { stat: after, sha256: digest.digest('hex'), data }
+}
+
+async function writeTrackedStagingFile(base, destination, content, stagingFiles, directoryMap) {
   const guard = await openWorkspaceParent(base, destination, zipError)
+  let handle
   try {
     await guard.check()
-    const handle = await fs.open(destination, 'wx', 0o600)
-    createdFiles.push({ path: destination, stat: await handle.stat() })
+    await assertTrackedDirectory(path.dirname(destination), directoryMap)
+    handle = await fs.open(destination, 'wx+', 0o600)
+    let writeError
     try {
       await handle.writeFile(content)
-    } finally {
-      await handle.close()
+    } catch (error) {
+      writeError = error
     }
+    const observed = await inspectOpenFile(destination, handle, content.length)
+    const record = { kind: 'file', path: destination, fingerprint: fileFingerprint(observed.stat, observed.sha256) }
+    stagingFiles.push(record)
+    await noteTrackedChild(path.dirname(destination), path.basename(destination), directoryMap)
+    if (writeError) throw writeError
+    if (observed.sha256 !== sha256(content)) throw zipError('ZIP 暂存文件写入内容不一致')
+    return record
   } finally {
+    await handle?.close().catch(() => {})
     await guard.close()
   }
 }
 
-async function removeCreated(base, entry, remove) {
+const UNAVAILABLE_HARDLINK_ERRORS = new Set(['EXDEV', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EPERM', 'EACCES', 'EMLINK'])
+
+async function writeExclusive(base, destination, content, createdFiles, stagingDirectory, stagingFiles,
+  workspaceDirectories, stagingDirectories, options) {
+  const guard = await openWorkspaceParent(base, destination, zipError)
+  let handle
+  const record = { path: destination, fingerprint: null, anchorPath: null, anchorIdentity: null }
+  createdFiles.push(record)
   try {
-    const guard = await openWorkspaceParent(base, entry.path, zipError)
+    await guard.check()
+    await assertTrackedDirectory(path.dirname(destination), workspaceDirectories)
+    handle = await fs.open(destination, 'wx+', 0o600)
+    const empty = await inspectOpenFile(destination, handle, content.length)
+    if (empty.stat.size !== 0n) throw zipError('新建导入文件并非空文件')
+
+    let writeError
     try {
-      await guard.check()
-      await assertSameEntry(entry.path, entry.stat, zipError)
-      await remove(entry.path)
-    } finally {
-      await guard.close()
+      if (typeof options.writeFileForTest === 'function') {
+        await options.writeFileForTest(handle, content, path.basename(destination))
+      } else {
+        await handle.writeFile(content)
+      }
+    } catch (error) {
+      writeError = error
     }
-  } catch {
-    // A changed path belongs to another actor. Never remove it by name.
+
+    const beforeLink = await inspectOpenFile(destination, handle, content.length)
+    const anchorPath = path.join(stagingDirectory, `.rollback-${randomUUID()}.link`)
+    const anchorGuard = await openWorkspaceParent(base, anchorPath, zipError)
+    try {
+      await anchorGuard.check()
+      await assertTrackedDirectory(stagingDirectory, stagingDirectories)
+      let linkError
+      try {
+        if (typeof options.linkForRollbackForTest === 'function') {
+          await options.linkForRollbackForTest(destination, anchorPath)
+        } else {
+          await fs.link(destination, anchorPath)
+        }
+      } catch (error) {
+        linkError = error
+      }
+
+      if (linkError && !UNAVAILABLE_HARDLINK_ERRORS.has(linkError.code)) throw linkError
+      if (!linkError) {
+        const anchorStat = await fs.lstat(anchorPath, { bigint: true })
+        if (!anchorStat.isFile() || anchorStat.isSymbolicLink() || anchorStat.dev !== beforeLink.stat.dev ||
+          anchorStat.ino !== beforeLink.stat.ino) {
+          throw zipError('ZIP 回滚锚点身份不匹配')
+        }
+        record.anchorPath = anchorPath
+        record.anchorIdentity = { dev: anchorStat.dev, ino: anchorStat.ino, modeType: anchorStat.mode & 0o170000n }
+        stagingFiles.push({ kind: 'anchor', path: anchorPath, identity: record.anchorIdentity })
+        await noteTrackedChild(stagingDirectory, path.basename(anchorPath), stagingDirectories)
+
+        const anchorHandle = await fs.open(anchorPath, READ_FILE_FLAGS)
+        try {
+          const afterLink = await inspectOpenFile(destination, handle, content.length)
+          const anchorObserved = await inspectOpenFile(anchorPath, anchorHandle, content.length)
+          const sourceStayedStable = afterLink.stat.dev === beforeLink.stat.dev &&
+            afterLink.stat.ino === beforeLink.stat.ino && afterLink.stat.size === beforeLink.stat.size &&
+            afterLink.stat.mtimeNs === beforeLink.stat.mtimeNs && afterLink.sha256 === beforeLink.sha256
+          if (!sourceStayedStable || !sameFileSnapshot(afterLink.stat, anchorObserved.stat) ||
+            afterLink.sha256 !== anchorObserved.sha256) {
+            throw zipError('ZIP 回滚锚点创建期间文件发生变化')
+          }
+          record.fingerprint = fileFingerprint(afterLink.stat, afterLink.sha256)
+        } finally {
+          await anchorHandle.close().catch(() => {})
+        }
+        await refreshTrackedDirectory(stagingDirectory, stagingDirectories)
+      } else {
+        // Hard links are unavailable on some filesystems. Imports still succeed;
+        // rollback will preserve this path because a hash is not a durable file identity.
+        const afterWrite = await inspectOpenFile(destination, handle, content.length)
+        record.fingerprint = fileFingerprint(afterWrite.stat, afterWrite.sha256)
+      }
+    } finally {
+      await anchorGuard.close()
+    }
+
+    if (!record.fingerprint) throw zipError('无法记录 ZIP 导入文件身份')
+    await noteTrackedChild(path.dirname(destination), path.basename(destination), workspaceDirectories)
+    if (writeError) throw writeError
+    if (record.fingerprint.sha256 !== sha256(content)) throw zipError('ZIP 导入文件写入内容不一致')
+  } finally {
+    await handle?.close().catch(() => {})
+    await guard.close()
   }
+}
+
+function sameFileIdentity(stat, expected) {
+  return stat.isFile() && !stat.isSymbolicLink() && stat.dev === expected.dev && stat.ino === expected.ino &&
+    (stat.mode & 0o170000n) === expected.modeType
+}
+
+async function removeCreatedFile(base, entry, workspaceDirectories, stagingDirectories) {
+  if (!entry.fingerprint || !entry.anchorPath || !entry.anchorIdentity) return false
+  let guard
+  let handle
+  let anchorGuard
+  let anchorHandle
+  try {
+    guard = await openWorkspaceParent(base, entry.path, zipError)
+    await guard.check()
+    await assertTrackedDirectory(path.dirname(entry.path), workspaceDirectories)
+    handle = await fs.open(entry.path, READ_FILE_FLAGS)
+    const current = await inspectOpenFile(entry.path, handle, Number(entry.fingerprint.size))
+    if (!matchesFileFingerprint(current.stat, entry.fingerprint, current.sha256)) return false
+
+    anchorGuard = await openWorkspaceParent(base, entry.anchorPath, zipError)
+    await anchorGuard.check()
+    await assertTrackedDirectory(path.dirname(entry.anchorPath), stagingDirectories)
+    anchorHandle = await fs.open(entry.anchorPath, READ_FILE_FLAGS)
+    const anchor = await inspectOpenFile(entry.anchorPath, anchorHandle, Number(entry.fingerprint.size))
+    if (!matchesFileFingerprint(anchor.stat, entry.fingerprint, anchor.sha256) ||
+      !sameFileSnapshot(current.stat, anchor.stat) || current.sha256 !== anchor.sha256) return false
+
+    await guard.check()
+    await assertTrackedDirectory(path.dirname(entry.path), workspaceDirectories)
+    const finalPathStat = await fs.lstat(entry.path, { bigint: true })
+    if (!matchesFileFingerprint(finalPathStat, entry.fingerprint, current.sha256)) return false
+    await fs.unlink(entry.path)
+    await forgetTrackedChild(path.dirname(entry.path), path.basename(entry.path), workspaceDirectories)
+    return true
+  } catch {
+    return false
+  } finally {
+    await anchorHandle?.close().catch(() => {})
+    await anchorGuard?.close()
+    await handle?.close().catch(() => {})
+    await guard?.close()
+  }
+}
+
+async function removeCreatedDirectory(base, record, directoryMap) {
+  let guard
+  try {
+    guard = await openWorkspaceParent(base, record.path, zipError)
+    await guard.check()
+    await assertTrackedDirectory(record.path, directoryMap)
+    if (record.children.size !== 0) return false
+    const parent = path.dirname(record.path)
+    await assertTrackedDirectory(parent, directoryMap)
+    await fs.rmdir(record.path)
+    directoryMap.delete(record.path)
+    await forgetTrackedChild(parent, path.basename(record.path), directoryMap)
+    return true
+  } catch {
+    return false
+  } finally {
+    await guard?.close()
+  }
+}
+
+async function removeStagingFile(base, record, directoryMap) {
+  let guard
+  let handle
+  try {
+    guard = await openWorkspaceParent(base, record.path, zipError)
+    await guard.check()
+    const parentPath = path.dirname(record.path)
+    await assertTrackedDirectory(parentPath, directoryMap)
+    const stat = await fs.lstat(record.path, { bigint: true })
+    if (record.kind === 'anchor') {
+      if (!sameFileIdentity(stat, record.identity)) return false
+    } else {
+      handle = await fs.open(record.path, READ_FILE_FLAGS)
+      const current = await inspectOpenFile(record.path, handle, Number(record.fingerprint.size))
+      if (!matchesFileFingerprint(current.stat, record.fingerprint, current.sha256)) return false
+    }
+    await guard.check()
+    await assertTrackedDirectory(parentPath, directoryMap)
+    await fs.unlink(record.path)
+    await forgetTrackedChild(parentPath, path.basename(record.path), directoryMap)
+    return true
+  } catch {
+    return false
+  } finally {
+    await handle?.close().catch(() => {})
+    await guard?.close()
+  }
+}
+
+async function cleanupStaging(base, stagingFiles, stagingDirectories, stagingDirectoryMap) {
+  const warnings = []
+  for (const record of [...stagingFiles].reverse()) {
+    if (!await removeStagingFile(base, record, stagingDirectoryMap) && await pathExists(record.path)) {
+      warnings.push(record.path)
+    }
+  }
+  for (const record of [...stagingDirectories].reverse()) {
+    if (!await removeCreatedDirectory(base, record, stagingDirectoryMap) && await pathExists(record.path)) {
+      warnings.push(record.path)
+    }
+  }
+  return warnings
+}
+
+async function readTrackedStagingFile(base, record, directoryMap, maxBytes) {
+  const guard = await openWorkspaceParent(base, record.path, zipError)
+  let handle
+  try {
+    await guard.check()
+    await assertTrackedDirectory(path.dirname(record.path), directoryMap)
+    handle = await fs.open(record.path, READ_FILE_FLAGS)
+    const observed = await inspectOpenFile(record.path, handle, maxBytes, true)
+    if (!matchesFileFingerprint(observed.stat, record.fingerprint, observed.sha256)) {
+      throw zipError('ZIP 暂存文件在提交前发生变化')
+    }
+    return observed.data
+  } finally {
+    await handle?.close().catch(() => {})
+    await guard.close()
+  }
+}
+
+async function pathExists(target) {
+  try {
+    await fs.lstat(target)
+    return true
+  } catch (error) {
+    return error.code !== 'ENOENT'
+  }
+}
+
+function addRollbackDiagnostics(error, paths, base) {
+  const unique = [...new Set(paths)].map(target => path.relative(base, target) || '.')
+  if (!unique.length) return error
+  const diagnostic = error instanceof Error ? error : new Error(String(error))
+  diagnostic.rollbackWarnings = unique
+  diagnostic.message = `${diagnostic.message}；为避免误删，回滚保留了无法确认身份的路径：${unique.join('、')}`
+  return diagnostic
 }
 
 function mergeLimits(options) {
@@ -420,38 +754,63 @@ export async function importZip(workspace, archive, options = {}) {
   try {
     await stagingGuard.check()
     await fs.mkdir(stagingDirectory, { mode: 0o700 })
-    stagingStat = await fs.lstat(stagingDirectory)
+    stagingStat = await fs.lstat(stagingDirectory, { bigint: true })
   } finally {
     await stagingGuard.close()
   }
   const createdFiles = []
   const createdDirectories = []
+  const workspaceDirectoryMap = new Map()
+  const stagingFiles = []
+  const stagingDirectories = []
+  const stagingDirectoryMap = new Map()
+  rememberDirectory(stagingDirectory, stagingStat, stagingDirectoryMap, stagingDirectories)
+  let result
+  let failure
+  const rollbackWarnings = []
   try {
     const staged = []
     for (const { entry, destination } of destinations) {
       const data = await extractEntry(buffer, entry, limits)
       const stagedPath = path.resolve(stagingDirectory, ...entry.name.split('/'))
       if (!within(stagingDirectory, stagedPath)) throw zipError('暂存路径无效')
-      await fs.mkdir(path.dirname(stagedPath), { recursive: true, mode: 0o700 })
-      await fs.writeFile(stagedPath, data, { flag: 'wx', mode: 0o600 })
-      staged.push({ entry, destination, stagedPath })
+      await makeDirectories(stagingDirectory, path.dirname(stagedPath), stagingDirectories, stagingDirectoryMap)
+      const stagingRecord = await writeTrackedStagingFile(
+        stagingDirectory, stagedPath, data, stagingFiles, stagingDirectoryMap)
+      staged.push({ entry, destination, stagingRecord })
     }
 
-    for (const { entry, destination, stagedPath } of staged) {
-      await makeDirectories(realWorkspace, path.dirname(destination), createdDirectories)
+    for (const { entry, destination, stagingRecord } of staged) {
+      await makeDirectories(realWorkspace, path.dirname(destination), createdDirectories, workspaceDirectoryMap)
       if (typeof options.beforeCommitFile === 'function') await options.beforeCommitFile(entry.name)
-      const data = await fs.readFile(stagedPath)
-      await writeExclusive(realWorkspace, destination, data, createdFiles)
+      const data = await readTrackedStagingFile(
+        stagingDirectory, stagingRecord, stagingDirectoryMap, limits.maxFileBytes)
+      await writeExclusive(realWorkspace, destination, data, createdFiles, stagingDirectory, stagingFiles,
+        workspaceDirectoryMap, stagingDirectoryMap, options)
     }
-    return { imported: staged.length, files: staged.map(item => item.entry.name) }
+    result = { imported: staged.length, files: staged.map(item => item.entry.name) }
   } catch (error) {
-    for (const file of createdFiles.reverse()) await removeCreated(realWorkspace, file, filePath => fs.unlink(filePath))
-    for (const directory of createdDirectories.reverse()) await removeCreated(realWorkspace, directory, directoryPath => fs.rmdir(directoryPath))
-    throw error
-  } finally {
-    await removeCreated(realWorkspace, { path: stagingDirectory, stat: stagingStat },
-      directoryPath => fs.rm(directoryPath, { recursive: true, force: true }))
+    failure = error
+    for (const file of [...createdFiles].reverse()) {
+      const removed = await removeCreatedFile(realWorkspace, file, workspaceDirectoryMap, stagingDirectoryMap)
+      if (!removed && await pathExists(file.path)) rollbackWarnings.push(file.path)
+    }
+    for (const directory of [...createdDirectories].reverse()) {
+      const removed = await removeCreatedDirectory(realWorkspace, directory, workspaceDirectoryMap)
+      if (!removed && await pathExists(directory.path)) rollbackWarnings.push(directory.path)
+    }
   }
+
+  const stagingWarnings = await cleanupStaging(
+    realWorkspace, stagingFiles, stagingDirectories, stagingDirectoryMap)
+  if (failure) {
+    failure = addRollbackDiagnostics(failure, [...rollbackWarnings, ...stagingWarnings], realWorkspace)
+    throw failure
+  }
+  if (stagingWarnings.length) {
+    console.warn(`ZIP 导入暂存目录包含无法确认归属的内容，已保留：${stagingWarnings.map(file => path.relative(realWorkspace, file)).join('、')}`)
+  }
+  return result
 }
 
 export const zipImportLimits = DEFAULT_LIMITS

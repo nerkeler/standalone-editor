@@ -1,6 +1,6 @@
 # 前端依赖维护
 
-此记录对应 2026-10-01 的前端锁文件更新。当前前端要求 Node.js `22.12.0` 或更高版本；Vite 7 官方支持范围包含 Node.js 22.12 及更高的 22.x 版本。[Vite 7 发布说明](https://vite.dev/blog/announcing-vite7)
+此记录先对应 2026-10-01 的前端锁文件更新，后补充 2026-10-02 的跨平台 CI 稳定化。前后端当前支持 Node.js `22.17.0` 或更高版本，范围限定在 `22.x`（`>=22.17.0 <23.0.0`）。Vite 7 本身支持从 Node.js 22.12 开始的 22.x；项目要求提高到 22.17，是因为 [Node.js 22.17.0 LTS](https://nodejs.org/en/blog/release/v22.17.0) 更新至 libuv 1.51.0，而 [libuv 1.51.0 变更记录](https://github.com/libuv/libuv/blob/v1.51.0/ChangeLog)包含 Windows 文件系统卷序列号一致性修复。这个修复让同一文件的路径 `lstat` 与文件句柄 `fstat` 能提供一致的设备身份，避免合法保存被误判为文件变化。[Vite 7 发布说明](https://vite.dev/blog/announcing-vite7)
 
 ## 本次更新
 

@@ -151,6 +151,131 @@ test('rollback leaves a concurrent replacement at a committed path untouched', a
   assert.equal(await fs.readFile(path.join(workspace, 'nested', 'first.md'), 'utf8'), 'concurrent replacement')
 })
 
+test('rollback preserves a same-length in-place modification', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-same-size-')
+  const archive = createZip([
+    { name: 'first.md', data: 'original' },
+    { name: 'second.md', data: 'second' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'second.md') {
+        await fs.writeFile(path.join(workspace, 'first.md'), 'modified')
+        throw new Error('injected later failure')
+      }
+    },
+  }), /injected later failure/)
+
+  assert.equal(await fs.readFile(path.join(workspace, 'first.md'), 'utf8'), 'modified')
+})
+
+test('rollback leaves an identical-content replacement untouched while the anchor pins the original inode', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-identical-')
+  const original = 'same content'
+  const archive = createZip([
+    { name: 'first.md', data: original },
+    { name: 'second.md', data: 'second' },
+  ])
+  let identityPinned = false
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'second.md') {
+        const stagingName = (await fs.readdir(workspace)).find(item => item.endsWith('.staging'))
+        assert.ok(stagingName)
+        const stagingPath = path.join(workspace, stagingName)
+        const anchorName = (await fs.readdir(stagingPath)).find(item => item.startsWith('.rollback-'))
+        assert.ok(anchorName)
+        const anchorStat = await fs.lstat(path.join(stagingPath, anchorName), { bigint: true })
+        await fs.unlink(path.join(workspace, 'first.md'))
+        await fs.writeFile(path.join(workspace, 'first.md'), original)
+        const replacementStat = await fs.lstat(path.join(workspace, 'first.md'), { bigint: true })
+        identityPinned = anchorStat.dev === replacementStat.dev && anchorStat.ino !== replacementStat.ino
+        throw new Error('injected later failure')
+      }
+    },
+  }), /injected later failure/)
+
+  assert.equal(identityPinned, true)
+  assert.equal(await fs.readFile(path.join(workspace, 'first.md'), 'utf8'), original)
+})
+
+test('captures and rolls back the actual partial contents when a write fails', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-partial-')
+  const archive = createZip([{ name: 'partial.md', data: 'complete expected payload' }])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async writeFileForTest(handle, content) {
+      await handle.write(content.subarray(0, 7), 0, 7, 0)
+      throw new Error('injected partial write failure')
+    },
+  }), /injected partial write failure/)
+
+  assert.deepEqual(await fs.readdir(workspace), [])
+})
+
+test('hard-link unavailability does not block a successful import', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-no-link-success-')
+  const archive = createZip([{ name: 'one.md', data: 'one' }])
+
+  const result = await importZip(workspace, archive, {
+    async linkForRollbackForTest() {
+      const error = new Error('hard links unsupported')
+      error.code = 'ENOTSUP'
+      throw error
+    },
+  })
+
+  assert.deepEqual(result, { imported: 1, files: ['one.md'] })
+  assert.deepEqual(await fs.readdir(workspace), ['one.md'])
+})
+
+test('preserves and diagnoses unanchored files when a later commit fails', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-no-link-failure-')
+  const archive = createZip([
+    { name: 'first.md', data: 'first' },
+    { name: 'second.md', data: 'second' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async linkForRollbackForTest() {
+      const error = new Error('hard links unsupported')
+      error.code = 'EPERM'
+      throw error
+    },
+    async beforeCommitFile(name) {
+      if (name === 'second.md') throw new Error('injected later failure')
+    },
+  }), error => {
+    assert.match(error.message, /injected later failure/)
+    assert.deepEqual(error.rollbackWarnings, ['first.md'])
+    assert.match(error.message, /回滚保留了无法确认身份的路径/)
+    return true
+  })
+
+  assert.equal(await fs.readFile(path.join(workspace, 'first.md'), 'utf8'), 'first')
+  await assert.rejects(fs.lstat(path.join(workspace, 'second.md')), error => error.code === 'ENOENT')
+  assert.deepEqual((await fs.readdir(workspace)).sort(), ['first.md'])
+})
+
+test('staging cleanup preserves unknown concurrent content instead of recursing into it', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-staging-unknown-')
+  const archive = createZip([{ name: 'one.md', data: 'one' }])
+  let unexpectedPath
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile() {
+      const stagingName = (await fs.readdir(workspace)).find(item => item.endsWith('.staging'))
+      unexpectedPath = path.join(workspace, stagingName, 'concurrent.txt')
+      await fs.writeFile(unexpectedPath, 'keep concurrent staging content')
+    },
+  }), /导入目录在操作期间发生变化/)
+
+  assert.equal(await fs.readFile(unexpectedPath, 'utf8'), 'keep concurrent staging content')
+  await assert.rejects(fs.lstat(path.join(workspace, 'one.md')), error => error.code === 'ENOENT')
+})
+
 test('rollback leaves a replaced import directory untouched', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-zip-directory-replaced-')
   const archive = createZip([
@@ -194,4 +319,33 @@ test('import rejects a parent replaced by a symlink before the next commit and a
 
   assert.equal(await fs.readFile(path.join(outside, 'second.md'), 'utf8'), 'outside value')
   assert.equal(await fs.readFile(path.join(workspace, 'held', 'first.md'), 'utf8'), 'first')
+})
+
+test('a replaced parent does not stop rollback of independent files or hide the original failure', async t => {
+  if (process.platform === 'win32') return t.skip('symlink creation may require administrator privileges')
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-parent-isolation-')
+  const outside = await temporaryDirectory(t, 'standalone-editor-zip-rollback-parent-outside-')
+  const archive = createZip([
+    { name: 'folder/first.md', data: 'first' },
+    { name: 'safe.md', data: 'safe' },
+    { name: 'folder/third.md', data: 'third' },
+  ])
+
+  await assert.rejects(importZip(workspace, archive, {
+    async beforeCommitFile(name) {
+      if (name === 'folder/third.md') {
+        await fs.rename(path.join(workspace, 'folder'), path.join(workspace, 'held'))
+        await fs.symlink(outside, path.join(workspace, 'folder'))
+        throw new Error('original injected failure')
+      }
+    },
+  }), error => {
+    assert.match(error.message, /original injected failure/)
+    assert.deepEqual(error.rollbackWarnings, ['folder'])
+    return true
+  })
+
+  assert.equal(await fs.readFile(path.join(workspace, 'held', 'first.md'), 'utf8'), 'first')
+  await assert.rejects(fs.lstat(path.join(workspace, 'safe.md')), error => error.code === 'ENOENT')
+  assert.deepEqual((await fs.readdir(workspace)).sort(), ['folder', 'held'])
 })

@@ -7,6 +7,16 @@ FRONTEND_PORT_VALUE="${FRONTEND_PORT:-5558}"
 EDITOR_HOST_VALUE="${EDITOR_HOST:-127.0.0.1}"
 EDITOR_MODE_VALUE="${EDITOR_MODE:-development}"
 
+if ! NODE_VERSION="$(node --version 2>/dev/null)"; then
+  NODE_VERSION="未安装"
+  echo "❌ 需要 Node.js 22.17.0 或更新的 22.x 版本（当前：${NODE_VERSION}）" >&2
+  exit 1
+fi
+if [[ ! "$NODE_VERSION" =~ ^v?22\.([0-9]+)\.[0-9]+$ ]] || (( ${BASH_REMATCH[1]:-0} < 17 )); then
+  echo "❌ 需要 Node.js 22.17.0 或更新的 22.x 版本（当前：${NODE_VERSION}）" >&2
+  exit 1
+fi
+
 case "$EDITOR_MODE_VALUE" in
   development|production) ;;
   *) echo "EDITOR_MODE 必须是 development 或 production" >&2; exit 2 ;;

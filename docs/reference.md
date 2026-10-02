@@ -77,7 +77,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ## 测试
 
-CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。浏览器任务使用 Node.js 22.12.0 或更高版本和 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
+CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。CI 固定使用 Node.js 22.22.3；项目支持 Node.js 22.x 的 22.17.0 或更高版本。浏览器任务运行在 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
 
 ```bash
 cd backend
