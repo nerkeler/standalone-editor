@@ -79,7 +79,7 @@ async function resolveWorkspaceItem(realWorkspace, requestPath, { allowRoot = fa
   }
   const real = await fs.realpath(fullPath)
   if (!isWithin(realWorkspace, real) || real !== fullPath) throw serviceError('路径超出工作空间')
-  return { fullPath, relativePath: slashPath(relative), stat: await fs.lstat(fullPath) }
+  return { fullPath, relativePath: slashPath(relative), stat: await fs.lstat(fullPath, { bigint: true }) }
 }
 
 async function assertSafeRestorationParent(realWorkspace, relativePath) {
@@ -350,7 +350,7 @@ export function createTrashService(workspace, options = {}) {
         if (await existsNoFollow(payloadPath)) {
           try {
             const original = path.resolve(realWorkspace, item.relativePath.split('/').join(path.sep))
-            const payloadStat = await fs.lstat(payloadPath)
+            const payloadStat = await fs.lstat(payloadPath, { bigint: true })
             await moveEntryNoReplace(payloadPath, original, payloadStat, {
               check: () => sourceGuard.check(),
               errorFactory: serviceError,
@@ -377,7 +377,7 @@ export function createTrashService(workspace, options = {}) {
     if (entryStat.isSymbolicLink() || !entryStat.isDirectory()) throw serviceError('回收站项目不存在', 'ENOENT')
     const manifest = await readManifest(entryDirectory, id, workspaceId)
     const payloadPath = path.join(entryDirectory, PAYLOAD_NAME)
-    const payloadStat = await fs.lstat(payloadPath)
+    const payloadStat = await fs.lstat(payloadPath, { bigint: true })
     if (payloadStat.isSymbolicLink()) throw serviceError('回收站内容无效', 'INVALID_TRASH_ENTRY')
     const target = await assertSafeRestorationParent(realWorkspace, manifest.originalPath)
     const workspaceGuard = await openWorkspaceParent(realWorkspace, target, serviceError)
@@ -419,7 +419,7 @@ export function createTrashService(workspace, options = {}) {
       try {
         await checkParents()
         await copyAndVerify(payloadPath, temporaryTarget, copyFile)
-        temporaryStat = await fs.lstat(temporaryTarget)
+        temporaryStat = await fs.lstat(temporaryTarget, { bigint: true })
         await moveEntryNoReplace(temporaryTarget, target, temporaryStat, {
           check: checkParents,
           errorFactory: serviceError,

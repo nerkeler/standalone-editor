@@ -60,10 +60,11 @@ export async function openWorkspaceParent(base, target, errorFactory) {
   }
 }
 
-export async function assertSameEntry(target, expected, errorFactory) {
+export async function assertSameEntry(target, expected, errorFactory, { lstat = fs.lstat } = {}) {
   let current
   try {
-    current = await fs.lstat(target)
+    const exactIdentity = typeof expected.dev === 'bigint' && typeof expected.ino === 'bigint'
+    current = exactIdentity ? await lstat(target, { bigint: true }) : await lstat(target)
   } catch {
     throw errorFactory('文件在操作期间发生变化')
   }
@@ -160,20 +161,33 @@ async function copyFileNoReplace(source, destination, expected, { check, errorFa
   let destinationStat
   try {
     const before = await sourceHandle.stat({ bigint: true })
-    if (!before.isFile() || before.dev !== BigInt(expected.dev) || before.ino !== BigInt(expected.ino) ||
-      before.size !== BigInt(expected.size)) throw errorFactory('文件在复制前发生变化')
+    const beforePath = await fs.lstat(source, { bigint: true })
+    const exactExpectedIdentity = typeof expected.dev === 'bigint' && typeof expected.ino === 'bigint'
+    if (!exactExpectedIdentity && (!Number.isSafeInteger(expected.dev) || !Number.isSafeInteger(expected.ino))) {
+      throw errorFactory('文件在复制前发生变化')
+    }
+    const expectedDev = exactExpectedIdentity ? expected.dev : BigInt(expected.dev)
+    const expectedIno = exactExpectedIdentity ? expected.ino : BigInt(expected.ino)
+    const expectedSize = Number(expected.size)
+    if (!Number.isSafeInteger(expectedSize) || expectedSize < 0 || !sameFileSnapshot(before, beforePath) ||
+      before.dev !== expectedDev || before.ino !== expectedIno || before.size !== BigInt(expectedSize) ||
+      (exactExpectedIdentity && !sameFileSnapshot(before, expected))) {
+      throw errorFactory('文件在复制前发生变化')
+    }
     await check()
+    await assertSameEntry(source, expected, errorFactory)
     try {
-      destinationHandle = await fs.open(destination, 'wx', expected.mode & 0o777)
+      const mode = typeof expected.mode === 'bigint' ? Number(expected.mode & 0o777n) : expected.mode & 0o777
+      destinationHandle = await fs.open(destination, 'wx', mode)
     } catch (error) {
       if (error.code === 'EEXIST') throw conflictFactory()
       throw error
     }
-    destinationStat = await destinationHandle.stat()
+    destinationStat = await destinationHandle.stat({ bigint: true })
     const buffer = Buffer.allocUnsafe(256 * 1024)
     let position = 0
-    while (position < expected.size) {
-      const { bytesRead } = await sourceHandle.read(buffer, 0, Math.min(buffer.length, expected.size - position), position)
+    while (position < expectedSize) {
+      const { bytesRead } = await sourceHandle.read(buffer, 0, Math.min(buffer.length, expectedSize - position), position)
       if (!bytesRead) throw errorFactory('文件在复制期间发生变化')
       let written = 0
       while (written < bytesRead) {
@@ -183,11 +197,12 @@ async function copyFileNoReplace(source, destination, expected, { check, errorFa
       }
       position += bytesRead
     }
-    await destinationHandle.chmod(expected.mode & 0o777)
+    const mode = typeof expected.mode === 'bigint' ? Number(expected.mode & 0o777n) : expected.mode & 0o777
+    await destinationHandle.chmod(mode)
     await destinationHandle.utimes(expected.atime, expected.mtime)
     const after = await sourceHandle.stat({ bigint: true })
-    if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
-      after.mtimeNs !== before.mtimeNs || after.ctimeNs !== before.ctimeNs) {
+    const afterPath = await fs.lstat(source, { bigint: true })
+    if (!sameFileSnapshot(before, after) || !sameFileSnapshot(before, afterPath)) {
       throw errorFactory('文件在复制期间发生变化')
     }
     await check()
@@ -207,4 +222,10 @@ async function copyFileNoReplace(source, destination, expected, { check, errorFa
     await destinationHandle?.close().catch(() => {})
     await sourceHandle.close().catch(() => {})
   }
+}
+
+function sameFileSnapshot(left, right) {
+  return left.isFile() && !left.isSymbolicLink() && right.isFile() && !right.isSymbolicLink() &&
+    left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs
 }

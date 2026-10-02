@@ -148,11 +148,11 @@ async function workspaceBase(workspace) {
 // Resolve an existing path and reject symlinks in the requested path. This
 // keeps every file operation inside the canonical workspace, even when a
 // user-created symlink points outside it.
-async function existingPath(workspace, requestPath, { allowRoot = true } = {}) {
+async function existingPath(workspace, requestPath, { allowRoot = true, bigintStat = false } = {}) {
   const base = await workspaceBase(workspace)
   const full = lexicalPath(base, requestPath)
   if (!allowRoot && full === base) throw makeError('不能操作工作空间根目录')
-  const stat = await fs.lstat(full)
+  const stat = bigintStat ? await fs.lstat(full, { bigint: true }) : await fs.lstat(full)
   if (stat.isSymbolicLink()) throw makeError('不支持通过符号链接访问文件')
   const real = await fs.realpath(full)
   assertInside(base, real)
@@ -475,7 +475,7 @@ export async function deleteItem(workspace, reqPath) {
 
 // 移动/重命名，目标存在时返回冲突，不覆盖目标。
 export async function moveItem(workspace, oldPath, newPath, options = {}) {
-  const source = await existingPath(workspace, oldPath, { allowRoot: false })
+  const source = await existingPath(workspace, oldPath, { allowRoot: false, bigintStat: true })
   const destination = await parentPath(workspace, newPath)
   const newName = assertName(path.basename(destination.full))
   const dest = path.join(destination.parent, newName)
@@ -514,7 +514,7 @@ export async function moveItem(workspace, oldPath, newPath, options = {}) {
     } catch (error) {
       if (itemMoved) {
         try {
-          const movedStat = await fs.lstat(dest)
+          const movedStat = await fs.lstat(dest, { bigint: true })
           await moveEntryNoReplace(dest, source.full, movedStat, {
             check: checkParents, errorFactory: makeError, conflictFactory: conflict, link: options.linkFile,
           })

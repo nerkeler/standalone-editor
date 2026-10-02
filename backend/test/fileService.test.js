@@ -776,6 +776,48 @@ test('file move uses an exclusive verified copy when hard links are unavailable'
   if (process.platform !== 'win32') assert.equal((await fs.stat(path.join(workspace, 'target.md'))).mode & 0o777, 0o640)
 })
 
+test('file move copy fallback preserves a same-inode same-size source modification', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const sourcePath = path.join(workspace, 'source.md')
+  const original = 'same-length-original'
+  const replacement = 'same-length-changed!'
+  assert.equal(Buffer.byteLength(original), Buffer.byteLength(replacement))
+  await fs.writeFile(sourcePath, original)
+  const originalStat = await fs.stat(sourcePath, { bigint: true })
+  const unavailableLink = async () => {
+    await fs.writeFile(sourcePath, replacement)
+    await fs.utimes(sourcePath, originalStat.atime, new Date('2000-01-01T00:00:00Z'))
+    const error = new Error('hard links unavailable')
+    error.code = 'ENOTSUP'
+    throw error
+  }
+
+  await assert.rejects(moveItem(workspace, 'source.md', 'target.md', { linkFile: unavailableLink }), error =>
+    error.code === 'INVALID_PATH' && error.message === '文件在复制前发生变化')
+
+  assert.equal(await fs.readFile(sourcePath, 'utf8'), replacement)
+  await assert.rejects(fs.lstat(path.join(workspace, 'target.md')), error => error.code === 'ENOENT')
+})
+
+test('file move copy fallback does not replace a concurrent destination or remove its source', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const sourcePath = path.join(workspace, 'source.md')
+  const targetPath = path.join(workspace, 'target.md')
+  await fs.writeFile(sourcePath, 'source remains')
+  const unavailableLink = async (_source, destination) => {
+    await fs.writeFile(destination, 'concurrent target')
+    const error = new Error('hard links unavailable')
+    error.code = 'ENOTSUP'
+    throw error
+  }
+
+  await assert.rejects(moveItem(workspace, 'source.md', 'target.md', { linkFile: unavailableLink }), error =>
+    error.code === 'CONFLICT')
+
+  assert.equal(await fs.readFile(sourcePath, 'utf8'), 'source remains')
+  assert.equal(await fs.readFile(targetPath, 'utf8'), 'concurrent target')
+})
+
 test('directory move refuses a populated destination created after its initial check', async t => {
   const workspace = await temporaryWorkspace(t)
   const recovery = await temporaryRecovery(t)
