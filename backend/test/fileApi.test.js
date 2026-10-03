@@ -6,7 +6,7 @@ import path from 'node:path'
 import http from 'node:http'
 import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createZip } from './zipFixture.js'
 import { MAX_EDITABLE_MARKDOWN_BYTES, MAX_MARKDOWN_PREVIEW_BYTES } from '../src/fileService.js'
 
@@ -192,6 +192,60 @@ test('file API requires revisions, returns structured conflicts, and restores gu
   const duplicateCreate = await put({ path: 'new.md', content: 'replacement', expectedRevision: null })
   assert.equal(duplicateCreate.status, 409)
   assert.equal((await duplicateCreate.json()).code, 'FILE_CONFLICT')
+})
+
+test('ZIP import API returns cleanup warnings after a staging unlink failure', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-api-import-cleanup-workspace-')
+  const recovery = await temporaryDirectory(t, 'standalone-editor-api-import-cleanup-recovery-')
+  const shimPath = path.join(recovery, 'inject-staging-unlink-failure.mjs')
+  await fs.writeFile(shimPath, `
+import fs from 'node:fs/promises'
+import path from 'node:path'
+const workspace = await fs.realpath(process.env.EDITOR_DEFAULT_WORKSPACE)
+let injected = false
+const originalUnlink = fs.unlink.bind(fs)
+fs.unlink = async target => {
+  const candidate = path.resolve(String(target))
+  if (!injected && candidate.startsWith(workspace + path.sep) &&
+      candidate.includes('.standalone-editor-import-') && candidate.includes('api-cleanup-warning.md') &&
+      !candidate.includes('.rollback-')) {
+    injected = true
+    const error = new Error('simulated staging cleanup permission error')
+    error.code = 'EACCES'
+    throw error
+  }
+  return originalUnlink(target)
+}
+`)
+  const inheritedNodeOptions = process.env.NODE_OPTIONS || ''
+  const baseUrl = await startBackend(t, workspace, recovery, {
+    NODE_OPTIONS: [inheritedNodeOptions, `--import=${pathToFileURL(shimPath).href}`].filter(Boolean).join(' '),
+  })
+  const workspaceInfo = await (await fetch(`${baseUrl}/api/workspace/check`)).json()
+  const form = new FormData()
+  form.append('file', new Blob([createZip([{ name: 'api-cleanup-warning.md', data: '# API import' }])]), 'notes.zip')
+  const response = await fetch(`${baseUrl}/api/workspace/import`, {
+    method: 'POST',
+    headers: {
+      'X-Workspace-Id': workspaceInfo.workspaceId,
+      'X-Workspace-Version': String(workspaceInfo.workspaceVersion),
+    },
+    body: form,
+  })
+
+  assert.equal(response.status, 200)
+  const body = await response.json()
+  assert.equal(body.success, true)
+  assert.equal(body.imported, 1)
+  assert.deepEqual(body.files, ['api-cleanup-warning.md'])
+  assert.ok(body.cleanupWarnings.length > 0)
+  assert.equal(new Set(body.cleanupWarnings).size, body.cleanupWarnings.length)
+  assert.ok(body.cleanupWarnings.every(item => !path.isAbsolute(item) && !item.includes('\\')))
+  assert.ok(body.cleanupWarnings.every(item => item.startsWith('.standalone-editor-import-')))
+  for (const warningPath of body.cleanupWarnings) {
+    await fs.lstat(path.join(workspace, ...warningPath.split('/')))
+  }
+  assert.equal(await fs.readFile(path.join(workspace, 'api-cleanup-warning.md'), 'utf8'), '# API import')
 })
 
 test('read-only directories remain selectable while unreadable listing and denied writes return permission errors', async t => {
@@ -561,6 +615,7 @@ test('trash and ZIP routes honor workspace identity, preserve hidden files, and 
   const importBody = await importResponse.json()
   assert.equal(importBody.imported, 2)
   assert.deepEqual(importBody.files, ['资料/复习.md', '图片/像素.png'])
+  assert.deepEqual(importBody.cleanupWarnings, [])
   assert.equal(await fs.readFile(path.join(workspace, '资料', '复习.md'), 'utf8'), '# UTF-8 stored')
   assert.deepEqual(await fs.readFile(path.join(workspace, '图片', '像素.png')), image)
 

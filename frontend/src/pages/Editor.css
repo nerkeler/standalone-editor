@@ -14,6 +14,145 @@
   background: var(--color-bg-sidebar) !important;
 }
 
+.import-modal-content {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  max-width: 100%;
+  padding-block: 8px;
+}
+
+.import-file-picker {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  min-height: 48px;
+  padding: 11px 14px;
+  border: 1px dashed var(--color-border);
+  border-radius: 8px;
+  font-family: inherit;
+  text-align: start;
+  color: var(--color-text-secondary);
+  font-size: 16px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.import-file-picker:hover,
+.import-file-picker:focus-visible,
+.import-file-picker:focus {
+  border-color: var(--color-primary);
+  color: var(--color-text);
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.import-file-picker.is-loading {
+  cursor: progress;
+  opacity: .72;
+}
+
+.import-file-picker:disabled {
+  cursor: progress;
+}
+
+.import-file-guidance {
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.import-completion,
+.import-cleanup-warning {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.import-completion {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.import-completion-count {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 16px;
+  line-height: 1.6;
+}
+
+.import-cleanup-warning {
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-text);
+  background: var(--color-bg-muted);
+}
+
+.import-cleanup-warning-heading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--color-text);
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.import-cleanup-warning-heading > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.import-cleanup-warning-heading .ant-btn {
+  flex: 0 0 40px;
+  width: 40px;
+  min-width: 40px;
+  height: 40px;
+  margin-inline-start: auto;
+  color: var(--color-text-secondary);
+}
+
+.import-cleanup-warning-heading .ant-btn:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.import-cleanup-warning > p {
+  margin: 8px 0 10px;
+  color: var(--color-text-secondary);
+  font-size: 16px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.import-cleanup-warning-paths {
+  box-sizing: border-box;
+  max-height: 176px;
+  min-width: 0;
+  margin: 0;
+  padding-inline-start: 20px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.import-cleanup-warning-paths li {
+  min-width: 0;
+  padding-block: 3px;
+  color: var(--color-text);
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .sidebar-header {
   min-height: 56px;
   padding: 12px 14px 10px !important;

@@ -338,6 +338,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
   const [createName, setCreateName] = useState('')
   const [uploading, setUploading] = useState(false)
   const imageInputRef = useRef(null)
+  const importInputRef = useRef(null)
   const [contextMenu, setContextMenu] = useState({ visible: false, node: null, x: 0, y: 0, restoreFocusTo: null })
   const [moveModal, setMoveModal] = useState({ open: false, node: null })
   const [moveTarget, setMoveTarget] = useState('')
@@ -386,6 +387,10 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
   const [searchLoading, setSearchLoading] = useState(false)
   const searchCoordinatorRef = useRef(null)
   const [importModal, setImportModal] = useState(false)
+  const [importLoading, setImportLoading] = useState(false)
+  const [importResult, setImportResult] = useState(null)
+  const [importWarningDismissed, setImportWarningDismissed] = useState(false)
+  const importComponentMountedRef = useRef(true)
   const [fileLoading, setFileLoading] = useState(false)
   const [conflictReview, setConflictReview] = useState(null)
   const [historyModal, setHistoryModal] = useState({ open: false, path: '', entries: [], loading: false })
@@ -408,6 +413,18 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
   useEffect(() => {
     setTrashModalOpen(false)
   }, [recoveryWorkspaceKey])
+
+  useEffect(() => {
+    setImportModal(false)
+    setImportResult(null)
+    setImportWarningDismissed(false)
+    setImportLoading(false)
+  }, [recoveryWorkspaceKey])
+
+  useEffect(() => {
+    importComponentMountedRef.current = true
+    return () => { importComponentMountedRef.current = false }
+  }, [])
 
   const reportRecoveryRefresh = useCallback((result, requestedWorkspaceKey) => {
     if (requestedWorkspaceKey !== recoveryWorkspaceKeyRef.current || result?.currentWorkspace !== true) return
@@ -1618,15 +1635,42 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
 
   // 导入弹窗处理
   const handleImport = async (file) => {
-    if (!file) return
+    if (!file || importLoading) return
+    const requestedWorkspaceKey = recoveryWorkspaceKeyRef.current
     const formData = new FormData()
     formData.append('file', file)
+    setImportLoading(true)
     try {
       const res = await axios.post(`${API}/import`, formData, { headers: { 'Content-Type': 'multipart/form-data' } })
-      message.success(res.data.message || '导入成功')
-      setImportModal(false)
-      await loadTree()
-    } catch (e) { message.error('导入失败：' + (e.response?.data?.error || e.message)) }
+      if (!importComponentMountedRef.current || requestedWorkspaceKey !== recoveryWorkspaceKeyRef.current) return
+      const cleanupWarnings = [...new Set((Array.isArray(res.data?.cleanupWarnings) ? res.data.cleanupWarnings : [])
+        .filter(value => typeof value === 'string' && value.length > 0))]
+      const result = {
+        workspaceKey: requestedWorkspaceKey,
+        imported: Number.isFinite(res.data?.imported) ? res.data.imported : 0,
+        message: res.data?.message || `已导入 ${res.data?.imported || 0} 个文件`,
+        cleanupWarnings,
+      }
+      if (cleanupWarnings.length) {
+        setImportResult(result)
+        setImportWarningDismissed(false)
+        setImportModal(true)
+      } else {
+        message.success(result.message)
+        setImportResult(null)
+        setImportModal(false)
+      }
+      const treeLoaded = await loadTree()
+      if (!treeLoaded && importComponentMountedRef.current && requestedWorkspaceKey === recoveryWorkspaceKeyRef.current) {
+        message.warning('导入成功，但目录刷新失败，请刷新目录。')
+      }
+    } catch (e) {
+      if (importComponentMountedRef.current && requestedWorkspaceKey === recoveryWorkspaceKeyRef.current) {
+        message.error('导入失败：' + (e.response?.data?.error || e.message))
+      }
+    } finally {
+      if (importComponentMountedRef.current && requestedWorkspaceKey === recoveryWorkspaceKeyRef.current) setImportLoading(false)
+    }
   }
 
   const handleCreate = async () => {
@@ -2184,6 +2228,7 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
   const activeSaveStatus = activeLargeMarkdown ? (activeLargeMarkdown.hasUnsavedDraft ? 'error' : 'saved') : activeFile
     ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
     : 'idle'
+  const currentImportResult = importResult?.workspaceKey === recoveryWorkspaceKey ? importResult : null
   return (
     <div
       id="editor-root"
@@ -2237,7 +2282,11 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
                         if (key === 'expand') handleToggleExpandAll()
                         if (key === 'locate') handleLocateCurrentFile()
                         if (key === 'folder') setCreateModal({ open: true, parent: '', type: 'dir' })
-                        if (key === 'import') setImportModal(true)
+                        if (key === 'import') {
+                          setImportResult(null)
+                          setImportWarningDismissed(false)
+                          setImportModal(true)
+                        }
                         if (key === 'export') handleExport()
                         if (key === 'trash') handleOpenTrash()
                         if (key === 'recovery-drafts') setRecoveryModalOpen(true)
@@ -2748,22 +2797,63 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
       </Modal>
 
       {/* 导入 */}
-      <Modal title="导入文件（支持 .zip）" open={importModal}
-        onCancel={() => setImportModal(false)} footer={null} okText="导入" cancelText="取消">
-        <div style={{ padding: '16px 0', display: 'flex', flexDirection: 'column', gap: 12 }}>
-          <input
-            type="file"
-            accept=".zip"
-            id="import-zip-input"
-            style={{ display: 'none' }}
-            onChange={e => { const f = e.target.files?.[0]; if (f) handleImport(f); e.target.value = '' }}
-          />
-          <label htmlFor="import-zip-input" style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, padding: '12px 16px', border: '1px dashed var(--color-border)', borderRadius: 8, color: 'var(--color-text-secondary)', fontSize: 13 }}>
-            <UploadOutlined />点击选择 .zip 文件
-          </label>
-          <div style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>
-            仅允许导入 <b>.md</b> 和 <b>图片</b>（.jpg/.png/.gif/.webp/.bmp/.svg）文件。
-          </div>
+      <Modal title={currentImportResult ? '导入完成' : '导入文件（支持 .zip）'} open={importModal}
+        onCancel={() => {
+          setImportModal(false)
+          setImportResult(null)
+          setImportWarningDismissed(false)
+        }}
+        footer={null} okText="导入" cancelText="取消">
+        <div className="import-modal-content">
+          {currentImportResult && (
+            <div className="import-completion">
+              <p className="import-completion-count" role="status" aria-live="polite">已导入 {currentImportResult.imported} 个文件</p>
+              {currentImportResult.cleanupWarnings.length > 0 && !importWarningDismissed && (
+                <section className="import-cleanup-warning" role="region" aria-live="polite" aria-labelledby="import-cleanup-warning-title">
+                  <div className="import-cleanup-warning-heading">
+                    <WarningOutlined aria-hidden="true" />
+                    <strong id="import-cleanup-warning-title">部分暂存内容已保留</strong>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<CloseOutlined />}
+                      aria-label="关闭清理提醒"
+                      onClick={() => setImportWarningDismissed(true)}
+                    />
+                  </div>
+                  <p>以下暂存内容无法安全清理，已为避免误删而保留：</p>
+                  <ul className="import-cleanup-warning-paths">
+                    {currentImportResult.cleanupWarnings.map((warningPath, index) => (
+                      <li key={`${warningPath}-${index}`}><span>{warningPath}</span></li>
+                    ))}
+                  </ul>
+                </section>
+              )}
+            </div>
+          )}
+          {!currentImportResult && (
+            <>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept=".zip"
+                id="import-zip-input"
+                disabled={importLoading}
+                style={{ display: 'none' }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) handleImport(f); e.target.value = '' }}
+              />
+              <button type="button" disabled={importLoading}
+                aria-describedby="import-file-guidance"
+                className={`import-file-picker${importLoading ? ' is-loading' : ''}`}
+                onClick={() => importInputRef.current?.click()}>
+                <UploadOutlined aria-hidden="true" />
+                {importLoading ? '正在导入…' : '点击选择 .zip 文件'}
+              </button>
+              <div className="import-file-guidance" id="import-file-guidance">
+                仅允许导入 <b>.md</b> 和 <b>图片</b>（.jpg/.png/.gif/.webp/.bmp/.svg）文件。
+              </div>
+            </>
+          )}
         </div>
       </Modal>
 

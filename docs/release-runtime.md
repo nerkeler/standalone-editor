@@ -6,6 +6,8 @@ Standalone Editor can run in development mode with Vite, or serve the built fron
 
 Use Node.js 22.17.0 or newer in the 22.x line and install from the checked-in lockfiles. The supported range is `>=22.17.0 <23.0.0`; the launch script and direct backend entrypoint both enforce it. Node.js 22.17.0 includes libuv 1.51.0, which fixes Windows file-system volume-serial consistency used by path and file-handle identity checks.
 
+This range describes the application runtime. GitHub Actions runs its own action runtime: CI uses `actions/checkout@v6`, `actions/setup-node@v6`, and `actions/upload-artifact@v6`, whose official action metadata declares Node.js 24. That does not change the Node.js version used by the app or its tests; `setup-node` still installs Node.js `22.22.3`. This distinction matters because [GitHub removed the Node.js 20 runtime from Actions on 2026-09-23](https://github.blog/changelog/2026-09-23-node-20-is-no-longer-available-in-github-actions/).
+
 ```bash
 (cd frontend && npm ci && npm run build)
 (cd backend && npm ci --omit=dev)

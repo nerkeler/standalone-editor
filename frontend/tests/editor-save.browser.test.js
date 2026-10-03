@@ -2,13 +2,14 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises'
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import test, { after, afterEach, before, beforeEach } from 'node:test'
 import { cleanupBrowserTest } from './helpers/browser-cleanup.js'
 import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
+import { createZip } from '../../backend/test/zipFixture.js'
 
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = path.resolve(frontendRoot, '..')
@@ -339,6 +340,39 @@ async function clickMenuItem(text, connection = cdp) {
   })()`)
 }
 
+async function openImportDialog(connection = cdp) {
+  await clickAriaButton('更多目录操作', connection)
+  await clickMenuItem('导入文件', connection)
+  await waitForImportDialogSettled(connection)
+}
+
+async function waitForImportDialogSettled(connection = cdp) {
+  await waitUntil('ZIP import dialog to become visible and settled', () => connection.evaluate(`(() => {
+    const content = document.querySelector('.import-modal-content');
+    const wrap = content?.closest('.ant-modal-wrap');
+    const modal = content?.closest('.ant-modal');
+    if (!content || !wrap || !modal) return false;
+    const wrapStyle = getComputedStyle(wrap);
+    const modalStyle = getComputedStyle(modal);
+    const runningAnimations = wrap.getAnimations({ subtree: true }).some(animation => animation.playState === 'running' || animation.pending);
+    const modalRect = modal.getBoundingClientRect();
+    return modalRect.width > 0 && modalRect.height > 0 && wrapStyle.display !== 'none' && wrapStyle.visibility !== 'hidden' &&
+      Number(wrapStyle.opacity || 1) >= 0.99 && Number(modalStyle.opacity || 1) >= 0.99 && !runningAnimations;
+  })()`))
+}
+
+async function chooseImportArchive(fileName, archive, connection = cdp) {
+  await connection.evaluate(`(() => {
+    const input = document.querySelector('.import-modal-content #import-zip-input');
+    if (!input) return false;
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(${JSON.stringify([...archive])})], ${JSON.stringify(fileName)}, { type: 'application/zip' }));
+    Object.defineProperty(input, 'files', { configurable: true, value: transfer.files });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`)
+}
+
 async function moveFileToTrash(fileName, connection = cdp) {
   await waitUntil(`${fileName} in the file tree before trashing`, () => connection.evaluate(
     `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
@@ -520,6 +554,64 @@ before(async () => {
   await writeFile(path.join(workspace, firstFile), firstSeed)
   await writeFile(path.join(workspace, secondFile), secondSeed)
   await writeFile(path.join(workspaceB, firstFile), 'Workspace B seed')
+  const cleanupFailureShim = path.join(tempRoot, 'zip-import-cleanup-shim.mjs')
+  const staleImportMarker = path.join(tempRoot, 'stale-import-cleanup')
+  await writeFile(cleanupFailureShim, `
+import fs from 'node:fs/promises'
+import path from 'node:path'
+const workspace = await fs.realpath(process.env.EDITOR_DEFAULT_WORKSPACE)
+const originalUnlink = fs.unlink.bind(fs)
+const originalReaddir = fs.readdir.bind(fs)
+const originalStat = fs.stat.bind(fs)
+let delayedStaleImport = false
+let failedTreeRefresh = false
+fs.unlink = async target => {
+  const candidate = path.resolve(String(target))
+  if (!candidate.startsWith(workspace + path.sep) || !candidate.includes('.standalone-editor-import-')) {
+    return originalUnlink(target)
+  }
+  if (candidate.includes('界面告警') && !candidate.includes('.rollback-')) {
+    const error = new Error('simulated ZIP staging cleanup permission error')
+    error.code = 'EACCES'
+    throw error
+  }
+  if (!delayedStaleImport && candidate.includes('stale-switch.md') && !candidate.includes('.rollback-')) {
+    delayedStaleImport = true
+    const marker = process.env.EDITOR_TEST_STALE_IMPORT_MARKER
+    await fs.writeFile(marker + '.started', 'started')
+    const deadline = Date.now() + 30_000
+    let released = false
+    while (Date.now() < deadline) {
+      try {
+        await fs.access(marker + '.release')
+        released = true
+        break
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error
+      }
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    if (!released) throw new Error('test did not release the delayed ZIP cleanup')
+    await fs.writeFile(marker + '.done', 'done')
+  }
+  return originalUnlink(target)
+}
+fs.readdir = async (target, options) => {
+  const candidate = path.resolve(String(target))
+  if (!failedTreeRefresh && candidate === workspace) {
+    try {
+      await originalStat(path.join(workspace, 'tree-refresh-error.md'))
+      failedTreeRefresh = true
+      const error = new Error('simulated directory refresh permission error')
+      error.code = 'EACCES'
+      throw error
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+    }
+  }
+  return originalReaddir(target, options)
+}
+`)
   backendPort = await freePort()
   frontendPort = await freePort()
 
@@ -532,8 +624,11 @@ before(async () => {
     WORKSPACE_CONFIG_FILE: path.join(tempRoot, 'workspace-config.json'),
     EDITOR_RECOVERY_DIR: path.join(tempRoot, 'recovery'),
     EDITOR_DIRECTORY_ROOTS: tempRoot,
+    EDITOR_DEFAULT_WORKSPACE: workspace,
+    EDITOR_TEST_STALE_IMPORT_MARKER: staleImportMarker,
     ALLOW_ANY_WORKSPACE: '1',
     HOST: '127.0.0.1',
+    NODE_OPTIONS: [process.env.NODE_OPTIONS || '', `--import=${pathToFileURL(cleanupFailureShim).href}`].filter(Boolean).join(' '),
   })
   frontendProcess = startProcess('vite', process.execPath, [viteEntry, '--host', '127.0.0.1', '--port', String(frontendPort), '--strictPort'], {
     ...sharedEnv,
@@ -603,6 +698,285 @@ test('an edit is persisted by the three-second autosave', async () => {
   }, 9000)
   assert.ok(Date.now() - editedAt >= 2700, 'the write should follow the three-second debounce')
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
+})
+
+test('ZIP import cleanup warnings remain visible, readable on a narrow screen, and dismissible', { timeout: 75_000 }, async t => {
+  const importEntries = Array.from({ length: 8 }, (_, index) => ({
+    name: `界面告警/深层中文资料目录/这是一条用于窄屏自动换行和滚动验收的长中文Markdown文件名-${String(index + 1).padStart(2, '0')}.md`,
+    data: `# Import warning fixture ${index + 1}`,
+  }))
+  const archive = createZip(importEntries)
+  const screenshotDirectory = process.env.EDITOR_REVIEW_INTERACTION_DIR || os.tmpdir()
+
+  await cdp.evaluate(`document.querySelector('button[aria-label="切换到深色模式"]')?.click()`)
+  await waitUntil('dark theme to be applied', () => cdp.evaluate(`document.documentElement.dataset.theme === 'dark'`))
+  await openImportDialog()
+  await cdp.send('Page.bringToFront')
+  await waitUntil('browser page to receive keyboard focus', () => cdp.evaluate(`document.hasFocus()`))
+  let pickerFocused = false
+  const pickerFocusTrace = []
+  for (let attempt = 0; attempt < 8 && !pickerFocused; attempt += 1) {
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 })
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 })
+    pickerFocusTrace.push(await cdp.evaluate(`(() => {
+      const active = document.activeElement;
+      return { tagName: active?.tagName, className: active?.className, ariaLabel: active?.getAttribute('aria-label'), text: active?.textContent?.trim().slice(0, 50), inDialog: Boolean(active?.closest('.ant-modal')) };
+    })()`))
+    pickerFocused = await cdp.evaluate(`document.activeElement === document.querySelector('.import-file-picker')`)
+  }
+  const pickerState = await cdp.evaluate(`(() => {
+    const picker = document.querySelector('.import-file-picker');
+    return {
+      tagName: picker?.tagName,
+      tabIndex: picker?.tabIndex,
+      documentFocused: document.hasFocus(),
+      focused: document.activeElement === picker,
+      focusVisible: picker?.matches(':focus-visible'),
+      outline: getComputedStyle(picker).outlineStyle,
+      background: getComputedStyle(picker).backgroundColor,
+    };
+  })()`)
+  assert.equal(pickerState.tagName, 'BUTTON')
+  assert.equal(pickerState.tabIndex, 0)
+  assert.equal(pickerState.documentFocused, true)
+  assert.equal(pickerFocused && pickerState.focused, true, JSON.stringify({ pickerState, pickerFocusTrace }))
+  assert.equal(pickerState.focusVisible, true)
+  assert.notEqual(pickerState.outline, 'none', JSON.stringify(pickerState))
+  const pickerScreenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  await mkdir(screenshotDirectory, { recursive: true })
+  const pickerScreenshotPath = path.join(screenshotDirectory, 'standalone-editor-import-picker-dark.png')
+  await writeFile(pickerScreenshotPath, Buffer.from(pickerScreenshot.data, 'base64'))
+
+  await chooseImportArchive('cleanup-warning.zip', archive)
+  await waitUntil('successful import and retained staging warning', () => cdp.evaluate(`(() => {
+    const warning = document.querySelector('.import-cleanup-warning');
+    return Boolean(warning && warning.innerText.includes('无法安全清理') &&
+      warning.querySelectorAll('.import-cleanup-warning-paths li').length >= 8);
+  })()`), 20_000)
+  await waitForImportDialogSettled()
+  await waitUntil('successful import count in the result', () => cdp.evaluate(
+    `document.querySelector('.import-completion-count')?.innerText === '已导入 8 个文件'`,
+  ))
+  const warningPaths = await cdp.evaluate(`Array.from(document.querySelectorAll('.import-cleanup-warning-paths li')).map(item => item.innerText.trim())`)
+  assert.ok(warningPaths.length >= 8)
+  assert.ok(warningPaths.every(item => item.startsWith('.standalone-editor-import-') && !item.startsWith('/')))
+  for (const warningPath of warningPaths) {
+    await lstat(path.join(workspace, ...warningPath.split('/')))
+  }
+  for (const entry of importEntries) {
+    assert.equal(await readFile(path.join(workspace, ...entry.name.split('/')), 'utf8'), entry.data)
+  }
+
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+  })
+  await waitForImportDialogSettled()
+  await waitUntil('warning to adapt to a narrow viewport', () => cdp.evaluate(`(() => {
+    const warning = document.querySelector('.import-cleanup-warning');
+    const list = warning?.querySelector('.import-cleanup-warning-paths');
+    const firstPath = list?.querySelector('li span');
+    const warningRect = warning?.getBoundingClientRect();
+    return warning && list && firstPath && warningRect.width <= window.innerWidth &&
+      warningRect.left >= 0 && warningRect.right <= window.innerWidth && list.scrollWidth <= list.clientWidth + 1 &&
+      list.scrollHeight > list.clientHeight && parseFloat(getComputedStyle(firstPath).fontSize) >= 14 &&
+      getComputedStyle(firstPath).overflowWrap === 'anywhere';
+  })()`))
+  const warningScreenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  const warningScreenshotPath = path.join(screenshotDirectory, 'standalone-editor-import-warning-dark-mobile.png')
+  await writeFile(warningScreenshotPath, Buffer.from(warningScreenshot.data, 'base64'))
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 1195, height: 751, deviceScaleFactor: 1, mobile: false,
+  })
+  await cdp.evaluate(`document.querySelector('button[aria-label="切换到浅色模式"]')?.click()`)
+  await waitUntil('light theme to be applied', () => cdp.evaluate(`document.documentElement.dataset.theme === 'light'`))
+  await waitForImportDialogSettled()
+  const lightWarningScreenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  const lightWarningScreenshotPath = path.join(screenshotDirectory, 'standalone-editor-import-warning-light-desktop.png')
+  await writeFile(lightWarningScreenshotPath, Buffer.from(lightWarningScreenshot.data, 'base64'))
+  console.log(`[IMPORT_REVIEW_SCREENSHOTS] ${pickerScreenshotPath} ${warningScreenshotPath} ${lightWarningScreenshotPath}`)
+
+  await cdp.send('Page.bringToFront')
+  await waitUntil('browser page to keep keyboard focus before dismissing warning', () => cdp.evaluate(`document.hasFocus()`))
+  await waitForImportDialogSettled()
+  const warningCloseState = await cdp.evaluate(`(() => {
+    const button = document.querySelector('button[aria-label="关闭清理提醒"]');
+    window.__importWarningKeyEvents = [];
+    for (const name of ['keydown', 'keypress', 'keyup', 'click']) {
+      button?.addEventListener(name, event => window.__importWarningKeyEvents.push({ name, key: event.key, trusted: event.isTrusted }), { once: name === 'click' });
+    }
+    button?.focus({ preventScroll: true });
+    return {
+      focused: document.activeElement === button,
+      focusVisible: button?.matches(':focus-visible'),
+      pageFocused: document.hasFocus(),
+      visible: Boolean(button?.getClientRects().length && getComputedStyle(button).visibility !== 'hidden'),
+      modalOpacity: getComputedStyle(button?.closest('.ant-modal')).opacity,
+    };
+  })()`)
+  assert.equal(warningCloseState.focused, true, JSON.stringify(warningCloseState))
+  assert.equal(warningCloseState.pageFocused, true, JSON.stringify(warningCloseState))
+  assert.equal(warningCloseState.focusVisible, true, JSON.stringify(warningCloseState))
+  assert.equal(warningCloseState.visible, true, JSON.stringify(warningCloseState))
+  assert.ok(Number(warningCloseState.modalOpacity) >= 0.99, JSON.stringify(warningCloseState))
+  await cdp.send('Input.dispatchKeyEvent', {
+    type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r', unmodifiedText: '\r',
+  })
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  const keyboardDismissState = await cdp.evaluate(`({
+    events: window.__importWarningKeyEvents || [],
+    warningVisible: Boolean(document.querySelector('.import-cleanup-warning')),
+    importedCount: document.querySelector('.import-completion-count')?.innerText,
+    pageFocused: document.hasFocus(),
+  })`)
+  assert.ok(keyboardDismissState.events.some(event => event.name === 'keydown' && event.key === 'Enter' && event.trusted), JSON.stringify(keyboardDismissState))
+  assert.ok(keyboardDismissState.events.some(event => event.name === 'keypress' && event.key === 'Enter' && event.trusted), JSON.stringify(keyboardDismissState))
+  assert.ok(keyboardDismissState.events.some(event => event.name === 'click' && event.trusted), JSON.stringify(keyboardDismissState))
+  await waitUntil('warning details to dismiss while import count remains', () => cdp.evaluate(`Boolean(
+    !document.querySelector('.import-cleanup-warning') &&
+    document.querySelector('.import-completion-count')?.innerText === '已导入 8 个文件'
+  )`))
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 1195, height: 751, deviceScaleFactor: 1, mobile: false,
+  })
+  await waitUntil('desktop workspace to return', () => pageIsReady())
+  await cdp.evaluate(`document.querySelector('.ant-modal-wrap .ant-modal-close')?.focus()`)
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })
+  await waitUntil('import result dialog to close and return to the directory', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
+    return (!modal || !modal.getClientRects().length || getComputedStyle(modal).display === 'none') &&
+      Boolean(document.querySelector('.workspace-sidebar'));
+  })()`))
+
+  await openImportDialog()
+  await chooseImportArchive('normal-success.zip', createZip([{ name: 'normal-success.md', data: '# Normal import' }]))
+  await waitUntil('normal success to close the import dialog with a success message', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
+    const notices = Array.from(document.querySelectorAll('.ant-message-notice-content')).map(item => item.innerText);
+    return (!modal || !modal.getClientRects().length || getComputedStyle(modal).display === 'none') &&
+      notices.some(item => item.includes('已导入 1 个文件'));
+  })()`))
+  assert.equal(await readFile(path.join(workspace, 'normal-success.md'), 'utf8'), '# Normal import')
+
+  await openImportDialog()
+  await chooseImportArchive('tree-refresh-error.zip', createZip([{ name: 'tree-refresh-error.md', data: '# Refresh warning import' }]))
+  await waitUntil('successful import to stay distinct from a failed directory refresh', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
+    const notices = Array.from(document.querySelectorAll('.ant-message-notice-content')).map(item => item.innerText);
+    return (!modal || !modal.getClientRects().length || getComputedStyle(modal).display === 'none') &&
+      notices.some(item => item.includes('已导入 1 个文件')) &&
+      notices.some(item => item.includes('导入成功，但目录刷新失败，请刷新目录。')) &&
+      !notices.some(item => item.startsWith('导入失败：'));
+  })()`))
+  assert.equal(await readFile(path.join(workspace, 'tree-refresh-error.md'), 'utf8'), '# Refresh warning import')
+
+  await openImportDialog()
+  await chooseImportArchive('invalid.zip', Buffer.from('not a ZIP archive'))
+  await waitUntil('invalid archive to remain an import error', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
+    const notices = Array.from(document.querySelectorAll('.ant-message-notice-content')).map(item => item.innerText);
+    return Boolean(modal?.getClientRects().length && notices.some(item => item.startsWith('导入失败：')) &&
+      !document.querySelector('.import-cleanup-warning'));
+  })()`))
+})
+
+test('a delayed ZIP result cannot surface after switching to another workspace', { timeout: 60_000 }, async t => {
+  const staleImportMarker = path.join(tempRoot, 'stale-import-cleanup')
+  t.after(async () => {
+    const teardownErrors = []
+    try {
+      await writeFile(staleImportMarker + '.release', 'release during test teardown')
+    } catch (error) {
+      teardownErrors.push(error)
+    }
+
+    let cleanupStarted = false
+    try {
+      await readFile(staleImportMarker + '.started', 'utf8')
+      cleanupStarted = true
+    } catch (error) {
+      if (error.code !== 'ENOENT') teardownErrors.push(error)
+    }
+    if (cleanupStarted) {
+      try {
+        await waitUntil('delayed ZIP cleanup to finish before workspace restoration', async () => {
+          return await readFile(staleImportMarker + '.done', 'utf8').catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+        }, 20_000)
+      } catch (error) {
+        teardownErrors.push(error)
+      }
+    }
+
+    try {
+      const originalWorkspace = await realpath(workspace)
+      const setResponse = await fetch(`http://127.0.0.1:${backendPort}/api/workspace/set`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: originalWorkspace }),
+      })
+      if (!setResponse.ok) throw new Error(`workspace teardown restore returned ${setResponse.status}: ${await setResponse.text()}`)
+      const selected = await setResponse.json()
+      assert.equal(await realpath(selected.workspace), originalWorkspace)
+      const checkResponse = await fetch(`http://127.0.0.1:${backendPort}/api/workspace/check`)
+      if (!checkResponse.ok) throw new Error(`workspace teardown check returned ${checkResponse.status}: ${await checkResponse.text()}`)
+      const checked = await checkResponse.json()
+      assert.equal(await realpath(checked.workspace), originalWorkspace)
+    } catch (error) {
+      teardownErrors.push(error)
+    }
+
+    try {
+      await Promise.all([
+        rm(path.join(workspace, 'stale-switch.md'), { force: true }),
+        rm(path.join(workspaceB, 'stale-switch.md'), { force: true }),
+      ])
+    } catch (error) {
+      teardownErrors.push(error)
+    }
+    if (cleanupStarted && teardownErrors.length === 0) {
+      await Promise.all([
+        rm(staleImportMarker + '.started', { force: true }),
+        rm(staleImportMarker + '.release', { force: true }),
+        rm(staleImportMarker + '.done', { force: true }),
+      ])
+    }
+    if (teardownErrors.length === 1) throw teardownErrors[0]
+    if (teardownErrors.length > 1) throw new AggregateError(teardownErrors, 'stale ZIP result test teardown failed')
+  })
+  await openImportDialog()
+  await chooseImportArchive('stale-switch.zip', createZip([{ name: 'stale-switch.md', data: '# Stale import' }]))
+  await waitUntil('stale import to publish in its original workspace', async () => {
+    return await readFile(path.join(workspace, 'stale-switch.md'), 'utf8').catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+  }, 20_000)
+  await waitUntil('stale import cleanup delay to begin', async () => {
+    return await readFile(path.join(tempRoot, 'stale-import-cleanup.started'), 'utf8').catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+  }, 10_000)
+
+  await cdp.evaluate(`document.querySelector('.ant-modal-wrap .ant-modal-close')?.click()`)
+  await waitUntil('pending import dialog to close', () => cdp.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
+    return !modal || !modal.getClientRects().length || getComputedStyle(modal).display === 'none';
+  })()`))
+  await switchWorkspace('workspace-b')
+  await writeFile(path.join(tempRoot, 'stale-import-cleanup.release'), 'release')
+  await waitUntil('delayed import API response to finish', async () => {
+    return await readFile(path.join(tempRoot, 'stale-import-cleanup.done'), 'utf8').catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+  }, 20_000)
+  await new Promise(resolve => setTimeout(resolve, 250))
+
+  const staleResultState = await cdp.evaluate(`(() => ({
+    workspace: JSON.parse(localStorage.getItem('editor_workspace_info') || 'null')?.workspace,
+    warningVisible: Boolean(document.querySelector('.import-cleanup-warning')),
+    importModalVisible: Array.from(document.querySelectorAll('.ant-modal-wrap')).some(item =>
+      item.querySelector('.import-modal-content') && item.getClientRects().length > 0 && getComputedStyle(item).display !== 'none'),
+    successNoticeVisible: Array.from(document.querySelectorAll('.ant-message-notice-content')).some(item => item.innerText.includes('已导入 1 个文件')),
+  }))()`)
+  assert.equal(path.basename(staleResultState.workspace), 'workspace-b')
+  assert.equal(staleResultState.warningVisible, false)
+  assert.equal(staleResultState.importModalVisible, false)
+  assert.equal(staleResultState.successNoticeVisible, false)
+  assert.equal(await readFile(path.join(workspace, 'stale-switch.md'), 'utf8'), '# Stale import')
+  await assert.rejects(readFile(path.join(workspaceB, 'stale-switch.md')), error => error.code === 'ENOENT')
 })
 
 test('denied browser storage leaves the workspace editable and the three-second server save working', async () => {

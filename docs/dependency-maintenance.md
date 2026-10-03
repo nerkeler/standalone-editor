@@ -1,6 +1,6 @@
 # 前端依赖维护
 
-此记录先对应 2026-10-01 的前端锁文件更新，后补充 2026-10-02 的跨平台 CI 稳定化。前后端当前支持 Node.js `22.17.0` 或更高版本，范围限定在 `22.x`（`>=22.17.0 <23.0.0`）。Vite 7 本身支持从 Node.js 22.12 开始的 22.x；项目要求提高到 22.17，是因为 [Node.js 22.17.0 LTS](https://nodejs.org/en/blog/release/v22.17.0) 更新至 libuv 1.51.0，而 [libuv 1.51.0 变更记录](https://github.com/libuv/libuv/blob/v1.51.0/ChangeLog)包含 Windows 文件系统卷序列号一致性修复。这个修复让同一文件的路径 `lstat` 与文件句柄 `fstat` 能提供一致的设备身份，避免合法保存被误判为文件变化。[Vite 7 发布说明](https://vite.dev/blog/announcing-vite7)
+此记录先对应 2026-10-01 的前端锁文件更新，后补充 2026-10-02 的跨平台 CI 稳定化和 2026-10-03 的 Actions runtime 维护。前后端当前支持 Node.js `22.17.0` 或更高版本，范围限定在 `22.x`（`>=22.17.0 <23.0.0`）。Vite 7 本身支持从 Node.js 22.12 开始的 22.x；项目要求提高到 22.17，是因为 [Node.js 22.17.0 LTS](https://nodejs.org/en/blog/release/v22.17.0) 更新至 libuv 1.51.0，而 [libuv 1.51.0 变更记录](https://github.com/libuv/libuv/blob/v1.51.0/ChangeLog)包含 Windows 文件系统卷序列号一致性修复。这个修复让同一文件的路径 `lstat` 与文件句柄 `fstat` 能提供一致的设备身份，避免合法保存被误判为文件变化。[Vite 7 发布说明](https://vite.dev/blog/announcing-vite7)
 
 ## 本次更新
 
@@ -35,3 +35,17 @@ npm run test:production-smoke
 ## 离线运行约束
 
 前端当前没有从远程地址加载 CSS。保持字体、样式表和图标由仓库内依赖或本地源码提供，避免新增远程 `@import`、外链样式表或 CDN 字体；应用在本机服务可用时应能断开外网使用。
+
+## GitHub Actions runtime 与 runner（2026-10-03）
+
+GitHub 于 2026-09-23 移除了 Actions 中的 Node.js 20 runtime，因此 CI 将旧 v4 action 升至已声明 Node.js 24 的稳定发布线。Node.js 24 在这里仅运行 Actions 本身；项目命令仍由 `setup-node` 安装的 Node.js `22.22.3` 执行，应用支持范围仍是 `>=22.17.0 <23.0.0`。
+
+| Action | CI 版本 | 官方依据 |
+|---|---|---|
+| `actions/checkout` | `v6` | [v6.0.0 action.yml](https://raw.githubusercontent.com/actions/checkout/v6.0.0/action.yml) 声明 `runs.using: node24`；[v6.0.0 release](https://github.com/actions/checkout/releases/tag/v6.0.0) 与[官方 README](https://github.com/actions/checkout/blob/v6/README.md)记录 Node.js 24 runtime 要求。 |
+| `actions/setup-node` | `v6` | [v6.0.0 action.yml](https://raw.githubusercontent.com/actions/setup-node/v6.0.0/action.yml) 声明 `runs.using: node24`；[v6.0.0 release](https://github.com/actions/setup-node/releases/tag/v6.0.0) 与[官方 README](https://github.com/actions/setup-node/blob/v6/README.md)记录 Node.js 24 runtime 要求。 |
+| `actions/upload-artifact` | `v6` | [v6.0.0 action.yml](https://raw.githubusercontent.com/actions/upload-artifact/v6.0.0/action.yml) 声明 `runs.using: node24`；[v6.0.0 release](https://github.com/actions/upload-artifact/releases/tag/v6.0.0) 记录 runner 最低版本，并修复 artifact 依赖中的 `punycode` 弃用告警。 |
+
+这些 Node.js 24 action 的官方说明给出的最低 Actions runner 版本为 `2.327.1`。`checkout@v6` 另要求从 Docker 容器 action 运行认证 Git 命令时使用 runner `2.329.0` 或更新版本；当前 workflow 不调用这种容器 action。[官方 README](https://github.com/actions/checkout/blob/v6/README.md)
+
+CI 使用 GitHub-hosted runners，后端矩阵增加固定的 `macos-15` 标签。GitHub 当前 [hosted-runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners) 列出 `macos-15`，且 [macos-15 runner image](https://github.com/actions/runner-images/blob/main/images/macos/macos-15-Readme.md)仍由官方维护。浏览器测试仍运行在 `ubuntu-24.04`，截图继续写入 `runner.temp` 并保留 14 天。

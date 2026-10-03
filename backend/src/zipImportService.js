@@ -810,7 +810,9 @@ export async function importZip(workspace, archive, options = {}) {
   if (stagingWarnings.length) {
     console.warn(`ZIP 导入暂存目录包含无法确认归属的内容，已保留：${stagingWarnings.map(file => path.relative(realWorkspace, file)).join('、')}`)
   }
-  return result
+  const cleanupWarnings = [...new Set(stagingWarnings.map(file =>
+    path.relative(realWorkspace, file).split(path.sep).join('/')))]
+  return { ...result, cleanupWarnings }
 }
 
 export const zipImportLimits = DEFAULT_LIMITS

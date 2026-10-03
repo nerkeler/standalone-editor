@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { importZip } from '../src/zipImportService.js'
 import { createZip } from './zipFixture.js'
 
@@ -24,7 +25,7 @@ test('imports UTF-8 stored and deflated Markdown and image entries byte for byte
 
   const result = await importZip(workspace, archive)
 
-  assert.deepEqual(result, { imported: 2, files: ['知识库/概览.md', '图像/照片.png'] })
+  assert.deepEqual(result, { imported: 2, files: ['知识库/概览.md', '图像/照片.png'], cleanupWarnings: [] })
   assert.equal(await fs.readFile(path.join(workspace, '知识库', '概览.md'), 'utf8'), '# 中文标题')
   assert.deepEqual(await fs.readFile(path.join(workspace, '图像', '照片.png')), image)
   await assert.rejects(fs.lstat(path.join(workspace, '.private')), error => error.code === 'ENOENT')
@@ -227,8 +228,53 @@ test('hard-link unavailability does not block a successful import', async t => {
     },
   })
 
-  assert.deepEqual(result, { imported: 1, files: ['one.md'] })
+  assert.deepEqual(result, { imported: 1, files: ['one.md'], cleanupWarnings: [] })
   assert.deepEqual(await fs.readdir(workspace), ['one.md'])
+})
+
+test('a successful import returns retained staging paths when cleanup cannot unlink them', async t => {
+  const workspace = await temporaryDirectory(t, 'standalone-editor-zip-cleanup-warning-')
+  const archive = createZip([{ name: '资料/cleanup.md', data: '# 已导入' }])
+  const serviceUrl = new URL('../src/zipImportService.js', import.meta.url).href
+  const childSource = `
+import fs from 'node:fs/promises'
+import path from 'node:path'
+const workspace = ${JSON.stringify(workspace)}
+const realWorkspace = await fs.realpath(workspace)
+let injected = false
+const originalUnlink = fs.unlink.bind(fs)
+fs.unlink = async target => {
+  const candidate = String(target)
+  if (!injected && candidate.startsWith(realWorkspace + path.sep) && candidate.includes('.staging')) {
+    injected = true
+    const error = new Error('simulated staging cleanup permission error')
+    error.code = 'EACCES'
+    throw error
+  }
+  return originalUnlink(target)
+}
+const { importZip } = await import(${JSON.stringify(serviceUrl)})
+const result = await importZip(workspace, Buffer.from(${JSON.stringify(archive.toString('base64'))}, 'base64'))
+console.log(JSON.stringify({ result, injected }))
+`
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', childSource], {
+    encoding: 'utf8',
+    timeout: 15_000,
+  })
+
+  assert.equal(child.status, 0, child.stderr || child.error?.message)
+  const output = JSON.parse(child.stdout.trim())
+  assert.equal(output.injected, true, 'the isolated cleanup failure should occur in the temporary workspace')
+  assert.equal(output.result.imported, 1)
+  assert.deepEqual(output.result.files, ['资料/cleanup.md'])
+  assert.ok(output.result.cleanupWarnings.length > 0)
+  assert.equal(new Set(output.result.cleanupWarnings).size, output.result.cleanupWarnings.length)
+  assert.ok(output.result.cleanupWarnings.every(item => !path.isAbsolute(item) && !item.includes('\\')))
+  assert.ok(output.result.cleanupWarnings.every(item => item.startsWith('.standalone-editor-import-')))
+  for (const warningPath of output.result.cleanupWarnings) {
+    await fs.lstat(path.join(workspace, ...warningPath.split('/')))
+  }
+  assert.equal(await fs.readFile(path.join(workspace, '资料', 'cleanup.md'), 'utf8'), '# 已导入')
 })
 
 test('preserves and diagnoses unanchored files when a later commit fails', async t => {

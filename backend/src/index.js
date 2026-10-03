@@ -1067,6 +1067,7 @@ export function createBackend(options = {}) {
         success: true,
         imported: result.imported,
         files: result.files,
+        cleanupWarnings: result.cleanupWarnings,
         message: `已导入 ${result.imported} 个文件`,
       }, req)
     } catch (error) { sendError(res, error, req) }
