@@ -607,6 +607,8 @@ async function getPickerState() {
     const input = modal.querySelector('input[aria-label="目录路径"]');
     const list = modal.querySelector('.workspace-picker-list');
     const confirm = modal.querySelector('button[aria-label="使用当前目录"]');
+    const cancel = modal.querySelector('button[aria-label="取消选择工作目录"]');
+    const statusText = modal.querySelector('.workspace-picker-status-text');
     return {
       path: modal.dataset.currentPath ?? null,
       inputValue: input?.value ?? null,
@@ -616,6 +618,8 @@ async function getPickerState() {
       rows: Array.from(modal.querySelectorAll('.welcome-directory-entry')).map(row => ({ path: row.dataset.path, text: row.innerText.trim() })),
       shortcuts: Array.from(modal.querySelectorAll('.workspace-picker-shortcut')).map(button => button.dataset.path),
       confirmDisabled: confirm?.disabled ?? true,
+      cancelDisabled: cancel?.disabled ?? true,
+      statusText: statusText?.innerText ?? '',
       listText: list?.innerText ?? '',
     }
   })()`)
@@ -769,6 +773,29 @@ async function clickAriaButton(label) {
     return true;
   })()`)
   assert.equal(clicked, true, `Expected an enabled button with aria-label ${label}`)
+}
+
+async function waitForRejectedWorkspaceSelection(targetPath, previousSetRequests, orderStart) {
+  await waitUntil(`rejected workspace selection for ${targetPath} to finish and unlock the picker`, async () => {
+    const picker = await getPickerState()
+    const response = state.setDetails.at(-1)
+    return state.setRequests === previousSetRequests + 1
+      && response?.payload.path === targetPath
+      && response?.responseStatus === 409
+      && state.requestOrder.slice(orderStart).join(',') === 'set'
+      && picker
+      && !picker.cancelDisabled
+      && Boolean(picker.statusText)
+  })
+  assert.deepEqual(state.requestOrder.slice(orderStart), ['set'], 'a known rejected SET must not issue a follow-up CHECK')
+}
+
+async function cancelPickerAndWaitForCleanup() {
+  await clickAriaButton('取消选择工作目录')
+  await waitUntil('picker cleanup and theme control restoration', () => connection.evaluate(`
+    !document.body.classList.contains('workspace-picker-open')
+      && getComputedStyle(document.querySelector('.theme-toggle')).visibility === 'visible'
+  `))
 }
 
 before(async () => {
@@ -1117,8 +1144,22 @@ test('an uncertain SET response keeps the Editor only when CHECK proves the old 
   await pressPickerPathEnter()
   await waitUntil('unapplied target to be verified', async () => (await getPickerState())?.path === '/srv/selection-that-was-not-applied')
   const unchangedOrderStart = state.requestOrder.length
+  const unchangedCheckCountBefore = state.checkCount
+  const unchangedCheckDetailsBefore = state.checkDetails.length
   await clickAriaButton('使用当前目录')
-  await waitUntil('ambiguous SET to be resolved by CHECK of the old identity', () => state.setRequests === 1 && state.checkCount >= 2)
+  await waitUntil('ambiguous SET to be resolved by CHECK of the old identity', async () => {
+    const picker = await getPickerState()
+    const followupOrder = state.requestOrder.slice(unchangedOrderStart)
+    return state.setRequests === 1
+      && state.checkCount > unchangedCheckCountBefore
+      && state.checkDetails.length > unchangedCheckDetailsBefore
+      && followupOrder.length === 2
+      && followupOrder[0] === 'set'
+      && followupOrder[1] === 'check'
+      && picker
+      && !picker.cancelDisabled
+      && picker.statusText.includes('切换结果未确认')
+  })
   assert.deepEqual(state.requestOrder.slice(unchangedOrderStart), ['set', 'check'])
   assert.deepEqual(state.checkDetails.at(-1), oldInfo, 'the follow-up check should prove the original path, id, and version remain active')
   assert.equal(currentPageEditorRequests().length, editorRequestsBeforeNoChange, 'an unchanged workspace identity should keep the old Editor mounted')
@@ -1133,8 +1174,10 @@ test('an uncertain SET response keeps the Editor only when CHECK proves the old 
   await pressPickerPathEnter()
   await waitUntil('changed uncertain target to be verified', async () => (await getPickerState())?.path === '/srv/selection-applied-before-response-loss')
   const changedOrderStart = state.requestOrder.length
+  const changedCheckCountBefore = state.checkCount
+  const changedCheckDetailsBefore = state.checkDetails.length
   await clickAriaButton('使用当前目录')
-  await waitUntil('changed uncertain SET to enter safe diagnostics', () => state.setRequests === 1 && state.checkCount >= 2 && connection.evaluate(
+  await waitUntil('changed uncertain SET to enter safe diagnostics', () => state.setRequests === 1 && state.checkCount > changedCheckCountBefore && state.checkDetails.length > changedCheckDetailsBefore && connection.evaluate(
     `Boolean(document.querySelector('.workspace-diagnostic[role="alert"]')) && !document.querySelector('.workspace-sidebar')`,
   ))
   assert.deepEqual(state.requestOrder.slice(changedOrderStart), ['set', 'check'])
@@ -1530,14 +1573,12 @@ test('directory picker keeps long paths readable on mobile and preserves Windows
   await waitUntil('path with repeated and trailing spaces to load unchanged', async () => state.dirPaths.at(-1) === directPathWithSpaces && (await getPickerState())?.path === directPathWithSpaces && !(await getPickerState())?.busy)
   assert.equal((await getPickerState()).inputValue, directPathWithSpaces)
   assert.equal(state.setRequests, 0, 'path verification should remain GET-only until explicit confirmation')
+  const directOrderStart = state.requestOrder.length
+  const directSetRequestsBefore = state.setRequests
   await clickButton('使用此目录')
-  await waitUntil('long path selection request to reach backend', () => state.setRequests === 1)
+  await waitForRejectedWorkspaceSelection(directPathWithSpaces, directSetRequestsBefore, directOrderStart)
   assert.equal(state.setPaths.at(-1), directPathWithSpaces, 'confirmation must preserve exact spaces in the server path')
-  await connection.evaluate(`document.querySelector('button[aria-label="取消选择工作目录"]')?.click()`)
-  await waitUntil('picker cleanup and theme control restoration', () => connection.evaluate(`
-    !document.body.classList.contains('workspace-picker-open')
-      && getComputedStyle(document.querySelector('.theme-toggle')).visibility === 'visible'
-  `))
+  await cancelPickerAndWaitForCleanup()
 
   for (const [scenario, targetPath] of [
     ['Windows drive', driveNotes],
@@ -1554,10 +1595,11 @@ test('directory picker keeps long paths readable on mobile and preserves Windows
     await waitUntil(`${scenario} path to load unchanged`, async () => state.dirPaths.at(-1) === targetPath && (await getPickerState())?.path === targetPath && !(await getPickerState())?.busy)
     assert.equal((await getPickerState()).inputValue, targetPath, `${scenario} address input should preserve its original separators`)
     const previousSetRequests = state.setRequests
+    const orderStart = state.requestOrder.length
     await clickButton('使用此目录')
-    await waitUntil(`${scenario} selection to reach the server`, () => state.setRequests === previousSetRequests + 1)
+    await waitForRejectedWorkspaceSelection(targetPath, previousSetRequests, orderStart)
     assert.equal(state.setPaths.at(-1), targetPath, `${scenario} confirmation should preserve the exact backend path`)
-    await connection.evaluate(`document.querySelector('button[aria-label="取消选择工作目录"]')?.click()`)
+    await cancelPickerAndWaitForCleanup()
   }
   state.directoryLocationMode = false
   state.directoryScenario = 'posix'
