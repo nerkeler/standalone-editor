@@ -103,7 +103,7 @@ class DevToolsConnection {
       if (!message.id) {
         if (message.method === 'Network.requestWillBeSent') {
           const request = message.params.request || {}
-          this.networkRequests.push({ method: request.method, url: request.url, postData: request.postData || '' })
+          this.networkRequests.push({ method: request.method, url: request.url, postData: request.postData || '', observedAt: Date.now() })
         }
         if (message.method === 'Runtime.exceptionThrown') {
           appendLog('browser exception', message.params.exceptionDetails.exception?.description || message.params.exceptionDetails.text)
@@ -215,6 +215,37 @@ async function startChrome() {
 
 async function pageIsReady(connection = cdp) {
   return connection.evaluate(`Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'))`)
+}
+
+async function workspacePickerIsClosed(connection = cdp) {
+  return connection.evaluate(`(() => {
+    const root = document.querySelector('.workspace-picker-modal');
+    const wrapper = root?.querySelector('.ant-modal-wrap');
+    const panel = root?.querySelector('.ant-modal-content');
+    const wrapperStyle = wrapper ? getComputedStyle(wrapper) : null;
+    const panelStyle = panel ? getComputedStyle(panel) : null;
+    const panelRect = panel?.getBoundingClientRect();
+    const panelHidden = !panel || !wrapper
+      || wrapperStyle.display === 'none' || wrapperStyle.visibility === 'hidden' || Number(wrapperStyle.opacity || 1) === 0
+      || panelStyle.display === 'none' || panelStyle.visibility === 'hidden' || Number(panelStyle.opacity || 1) === 0
+      || !panelRect?.width || !panelRect?.height;
+    return !document.body.classList.contains('workspace-picker-open') && panelHidden;
+  })()`)
+}
+
+async function workspacePickerIsOpen(connection = cdp) {
+  return connection.evaluate(`(() => {
+    const root = document.querySelector('.workspace-picker-modal');
+    const wrapper = root?.querySelector('.ant-modal-wrap');
+    const panel = root?.querySelector('.ant-modal-content');
+    const wrapperStyle = wrapper ? getComputedStyle(wrapper) : null;
+    const panelStyle = panel ? getComputedStyle(panel) : null;
+    const panelRect = panel?.getBoundingClientRect();
+    return document.body.classList.contains('workspace-picker-open')
+      && Boolean(wrapper && panel && panelRect?.width && panelRect?.height)
+      && wrapperStyle.display !== 'none' && wrapperStyle.visibility !== 'hidden'
+      && panelStyle.display !== 'none' && panelStyle.visibility !== 'hidden';
+  })()`)
 }
 
 async function openFile(fileName, expectedText, connection = cdp) {
@@ -419,10 +450,56 @@ async function readWorkspaceRecoveryStats(connection = cdp) {
   })()`)
 }
 
+async function readAntModalInventory(connection = cdp) {
+  return connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal')).map(modal => {
+    const wrapper = modal.closest('.ant-modal-wrap');
+    const modalStyle = getComputedStyle(modal);
+    const wrapperStyle = wrapper ? getComputedStyle(wrapper) : null;
+    const rect = modal.getBoundingClientRect();
+    const opacity = Number(modalStyle.opacity || 1) * Number(wrapperStyle?.opacity || 1);
+    const visible = Boolean(rect.width && rect.height && modal.getClientRects().length)
+      && modalStyle.display !== 'none' && modalStyle.visibility !== 'hidden'
+      && (!wrapper || (wrapperStyle.display !== 'none' && wrapperStyle.visibility !== 'hidden'))
+      && opacity > 0;
+    return {
+      visible,
+      className: String(modal.className),
+      title: modal.querySelector('.ant-modal-title')?.innerText?.trim() || '',
+      text: modal.innerText || '',
+      textareaValues: Array.from(modal.querySelectorAll('textarea')).map(input => input.value),
+      rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+      modalVisibility: modalStyle.visibility,
+      modalDisplay: modalStyle.display,
+      modalOpacity: modalStyle.opacity,
+      wrapperVisibility: wrapperStyle?.visibility ?? null,
+      wrapperDisplay: wrapperStyle?.display ?? null,
+      wrapperOpacity: wrapperStyle?.opacity ?? null,
+    };
+  })`)
+}
+
+async function readVisibleAntModals(connection = cdp) {
+  return (await readAntModalInventory(connection)).filter(modal => modal.visible)
+}
+
+let modalEvidenceSequence = 0
+async function captureAntModalEvidence(label, connection = cdp) {
+  const evidenceDirectory = process.env.WORKSPACE_PICKER_EVIDENCE_DIR
+  if (!evidenceDirectory) return
+  await mkdir(evidenceDirectory, { recursive: true })
+  const suffix = `${String(++modalEvidenceSequence).padStart(2, '0')}-${label}`
+  await writeFile(path.join(evidenceDirectory, `${suffix}.json`), JSON.stringify(await readAntModalInventory(connection), null, 2))
+  const screenshot = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  await writeFile(path.join(evidenceDirectory, `${suffix}.png`), Buffer.from(screenshot.data, 'base64'))
+}
+
 async function openTrash(connection = cdp) {
   await clickAriaButton('更多目录操作', connection)
   await clickMenuItem('回收站', connection)
-  await waitUntil('trash modal to open', () => connection.evaluate(`Boolean(document.querySelector('.ant-modal')?.innerText.includes('回收站'))`))
+  await waitUntil('visible trash modal with the expected title to open', async () =>
+    (await readVisibleAntModals(connection)).some(modal => modal.title.includes('回收站')))
+  await new Promise(resolve => setTimeout(resolve, 250))
+  await captureAntModalEvidence('trash-modal', connection)
 }
 
 function formatDisplayedBytes(value) {
@@ -438,58 +515,76 @@ function formatDisplayedBytes(value) {
   return `${amount.toLocaleString(undefined, { maximumFractionDigits: 1 })} ${units[unitIndex]}`
 }
 
-async function switchWorkspace(targetDirectoryName) {
+async function switchWorkspace(targetPath) {
+  assert.ok(path.isAbsolute(targetPath), `workspace switch target must be an absolute path: ${targetPath}`)
+  await waitUntil('workspace change button', () => cdp.evaluate(`Boolean(document.querySelector('button[aria-label="更改目录"]')?.getBoundingClientRect().width)`))
   await cdp.evaluate(`(() => {
-    const button = Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === '更改目录' && item.getBoundingClientRect().width > 0);
-    button?.click();
+    document.querySelector('button[aria-label="更改目录"]')?.click();
   })()`)
-  await clickVisibleButton('选择工作目录')
-  await waitUntil('directory picker to open', () => cdp.evaluate(`Boolean(document.querySelector('.ant-modal-body'))`))
-  const pickerState = await cdp.evaluate(`(() => {
-    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('选择工作目录'));
-    const body = modal?.querySelector('.ant-modal-body');
-    const target = ${JSON.stringify(targetDirectoryName)};
-    const listed = Array.from(body?.querySelectorAll('.welcome-directory-entry') || []).some(item => item.innerText.trim() === target);
-    const rootButton = Array.from(body?.querySelectorAll('button[title]') || []).find(button => !button.classList.contains('welcome-directory-entry') && button.innerText.trim() === target);
-    const back = Array.from(body?.querySelectorAll('button') || []).find(button => button.innerText.trim() === '返回');
-    const currentName = Array.from(body?.querySelectorAll('.ant-breadcrumb-link') || []).at(-1)?.innerText.trim() || '';
-    return { listed, rootButton: Boolean(rootButton), currentName, canGoUp: Boolean(back && !back.disabled) };
+  await waitUntil('directory picker overlay to open', () => workspacePickerIsOpen())
+
+  const pickerState = () => cdp.evaluate(`(() => {
+    const modal = document.querySelector('.workspace-picker-modal');
+    const wrapper = modal?.querySelector('.ant-modal-wrap');
+    const panel = modal?.querySelector('.ant-modal-content');
+    const wrapperStyle = wrapper ? getComputedStyle(wrapper) : null;
+    const panelStyle = panel ? getComputedStyle(panel) : null;
+    const panelRect = panel?.getBoundingClientRect();
+    const open = document.body.classList.contains('workspace-picker-open')
+      && Boolean(wrapper && panel && panelRect?.width && panelRect?.height)
+      && wrapperStyle.display !== 'none' && wrapperStyle.visibility !== 'hidden'
+      && panelStyle.display !== 'none' && panelStyle.visibility !== 'hidden';
+    const path = modal?.dataset.currentPath ?? null;
+    const input = modal?.querySelector('input[aria-label="目录路径"]');
+    const listing = modal?.querySelector('.workspace-picker-list');
+    const confirm = modal?.querySelector('button[aria-label="使用当前目录"]');
+    return {
+      open,
+      path,
+      inputValue: input?.value ?? null,
+      loaded: open && path !== null && listing?.getAttribute('aria-busy') !== 'true',
+      canConfirm: Boolean(path === ${JSON.stringify(targetPath)} && confirm && !confirm.disabled),
+    };
   })()`)
-  let selectedRoot = pickerState.currentName === targetDirectoryName
-  if (!pickerState.listed && pickerState.rootButton) {
+
+  await waitUntil('directory picker current path to load', async () => {
+    const state = await pickerState()
+    return state.loaded && state.path !== null && state.inputValue === state.path
+  })
+
+  const initialPickerState = await pickerState()
+  if (initialPickerState.path !== targetPath) {
+    const dirsBeforeTyping = cdp.networkRequests.filter(request => request.method === 'GET' && new URL(request.url).pathname === '/api/dirs').length
     await cdp.evaluate(`(() => {
-      const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('选择工作目录'));
-      const body = modal?.querySelector('.ant-modal-body');
-      const button = Array.from(body?.querySelectorAll('button[title]') || []).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
-      button?.click();
-      return Boolean(button);
+      const input = document.querySelector('.workspace-picker-modal input[aria-label="目录路径"]');
+      input?.focus();
+      input?.setSelectionRange(0, input.value.length);
     })()`)
-    selectedRoot = true
-    await waitUntil(`${targetDirectoryName} root to open in picker`, () => cdp.evaluate(
-      `document.querySelector('.ant-modal .ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)})`,
-    ))
-  } else if (!pickerState.listed && pickerState.canGoUp) {
-    await clickVisibleButton('返回')
+    await cdp.send('Input.insertText', { text: targetPath })
+    assert.equal((await pickerState()).inputValue, targetPath, 'the address field should preserve the exact backend path')
+    assert.equal(await cdp.evaluate(`document.querySelector('.workspace-picker-modal button[aria-label="使用当前目录"]')?.disabled`), true, 'editing a different path must disable confirmation until GET verifies it')
+    assert.equal(cdp.networkRequests.filter(request => request.method === 'GET' && new URL(request.url).pathname === '/api/dirs').length, dirsBeforeTyping, 'editing the input must not request directories before Enter')
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter' })
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter' })
+    await waitUntil(`GET /api/dirs to verify ${targetPath}`, async () => {
+      const state = await pickerState()
+      return state.loaded && state.path === targetPath && state.inputValue === targetPath
+    })
+    const lastDirsRequest = cdp.networkRequests.filter(request => request.method === 'GET' && new URL(request.url).pathname === '/api/dirs').at(-1)
+    assert.equal(new URL(lastDirsRequest.url).searchParams.get('path'), targetPath, 'the request query must preserve the canonical target exactly')
+  } else {
+    assert.equal(initialPickerState.inputValue, targetPath, 'the GET-confirmed current path should remain exact when it already matches the requested workspace')
   }
-  if (!selectedRoot) {
-    await waitUntil(`${targetDirectoryName} directory in picker`, () => cdp.evaluate(
-      `Array.from(document.querySelectorAll('.workspace-picker-modal .welcome-directory-entry')).some(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)})`,
-    ))
-    await cdp.evaluate(`(() => {
-      const row = Array.from(document.querySelectorAll('.workspace-picker-modal .welcome-directory-entry')).find(item => item.innerText.trim() === ${JSON.stringify(targetDirectoryName)});
-      row?.click();
-      return Boolean(row);
-    })()`)
-    await waitUntil(`${targetDirectoryName} selected in picker`, () => cdp.evaluate(
-      `document.querySelector('.ant-breadcrumb')?.innerText.includes(${JSON.stringify(targetDirectoryName)}) && !Array.from(document.querySelectorAll('button')).find(item => item.innerText.trim() === '确认选择')?.disabled`,
-    ))
-  }
-  await clickVisibleButton('确认选择')
-  await waitUntil(`${targetDirectoryName} workspace to load`, () => cdp.evaluate(`(() => {
+  await waitUntil(`${targetPath} current path and enabled confirmation`, async () => {
+    const state = await pickerState()
+    return state.loaded && state.path === targetPath && state.canConfirm
+  })
+  await clickVisibleButton('使用此目录')
+  await waitUntil(`${targetPath} workspace to load`, () => cdp.evaluate(`(() => {
     const info = JSON.parse(localStorage.getItem('editor_workspace_info') || 'null');
-    const currentName = String(info?.workspace || '').replace(/\\\\/g, '/').split('/').pop();
-    return currentName === ${JSON.stringify(targetDirectoryName)} && Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'));
+    return info?.workspace === ${JSON.stringify(targetPath)} && Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'));
   })()`), 12000)
+  await waitUntil('workspace picker close animation to finish after selection', () => workspacePickerIsClosed())
 }
 
 async function setupPage(connection = cdp) {
@@ -957,7 +1052,7 @@ test('a delayed ZIP result cannot surface after switching to another workspace',
     const modal = Array.from(document.querySelectorAll('.ant-modal-wrap')).find(item => item.querySelector('.import-modal-content'));
     return !modal || !modal.getClientRects().length || getComputedStyle(modal).display === 'none';
   })()`))
-  await switchWorkspace('workspace-b')
+  await switchWorkspace(await realpath(workspaceB))
   await writeFile(path.join(tempRoot, 'stale-import-cleanup.release'), 'release')
   await waitUntil('delayed import API response to finish', async () => {
     return await readFile(path.join(tempRoot, 'stale-import-cleanup.done'), 'utf8').catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
@@ -1602,22 +1697,182 @@ test('switching workspace A to B and back keeps A recovery candidate separate', 
     drafts: { [firstFile]: { content: recoveredContent, baseRevision: revision, savedAt } },
   }))})`)
 
-  await switchWorkspace('workspace-b')
+  await switchWorkspace(await realpath(workspaceB))
   await openFile(firstFile, 'Workspace B seed')
   assert.equal(await readFile(path.join(workspaceB, firstFile), 'utf8'), 'Workspace B seed')
 
-  await switchWorkspace('notes')
+  await switchWorkspace(await realpath(workspace))
   await openFile(firstFile, firstSeed)
   await clickAriaButton('更多目录操作')
   await waitUntil('A recovery alternative to appear after returning from B', () => cdp.evaluate(
     `Array.from(document.querySelectorAll('[role="menuitem"]')).some(item => item.innerText.includes('其他恢复草稿（1）'))`,
   ))
   await clickMenuItem('其他恢复草稿（1）')
-  await waitUntil('A recovery candidate to remain available after switching', () => cdp.evaluate(
-    `Array.from(document.querySelector('.ant-modal')?.querySelectorAll('textarea') || []).some(input => input.value.includes('RECOVERED-AFTER-SWITCH'))`,
-  ))
+  await waitUntil('visible A recovery modal to retain the exact candidate after switching', async () =>
+    (await readVisibleAntModals()).some(modal => modal.title.includes('其他本地恢复草稿')
+      && modal.textareaValues.some(value => value.includes('RECOVERED-AFTER-SWITCH'))))
+  await new Promise(resolve => setTimeout(resolve, 250))
+  await captureAntModalEvidence('workspace-switch-recovery-candidate')
   assert.equal(await readFile(path.join(workspace, firstFile), 'utf8'), firstSeed, 'switch-back recovery must stay local until deliberately saved')
   assert.equal(await readFile(path.join(workspaceB, firstFile), 'utf8'), 'Workspace B seed', 'workspace B must never receive workspace A draft bytes')
+})
+
+test('canceling the workspace picker keeps the same tabs, draft, tree scroll, and Editor context', async t => {
+  const generatedNames = Array.from({ length: 48 }, (_, index) => `picker-scroll-${String(index).padStart(2, '0')}.md`)
+  t.after(async () => {
+    await Promise.all(generatedNames.map(name => rm(path.join(workspace, name), { force: true })))
+  })
+  await switchWorkspace(await realpath(workspaceB))
+  await Promise.all(generatedNames.map(name => writeFile(path.join(workspace, name), `# ${name}`)))
+  await switchWorkspace(await realpath(workspace))
+  await waitUntil('generated entries to fill the workspace tree', () => cdp.evaluate(
+    `document.querySelectorAll('[data-testid="file-tree-item"]').length >= 50`,
+  ))
+  await openFile(firstFile, firstSeed)
+  await openFile(secondFile, secondSeed)
+
+  const scrollState = await cdp.evaluate(`(() => {
+    const tree = document.querySelector('.tree-scroll');
+    if (!tree) return null;
+    tree.scrollTop = Math.floor((tree.scrollHeight - tree.clientHeight) / 2);
+    return { top: tree.scrollTop, max: tree.scrollHeight - tree.clientHeight };
+  })()`)
+  assert.ok(scrollState.max > 0, `generated files should make the tree genuinely scrollable: ${JSON.stringify(scrollState)}`)
+  assert.ok(scrollState.top > 0, `the test should start from a scrolled tree position: ${JSON.stringify(scrollState)}`)
+  await cdp.evaluate(`(() => {
+    window.__pickerSidebarBefore = document.querySelector('.workspace-sidebar');
+    window.__pickerTreeBefore = document.querySelector('.tree-scroll');
+    window.__pickerTabsBefore = document.querySelector('.document-tabs');
+    window.__pickerActiveTabBefore = document.querySelector('.document-tab.is-active');
+    window.__pickerEditorBefore = document.querySelector('.ProseMirror');
+    window.__pickerWorkspaceInfoBefore = localStorage.getItem('editor_workspace_info');
+  })()`)
+
+  const token = `PICKER-CANCEL-DRAFT-${Date.now()}`
+  const requestOffset = cdp.networkRequests.length
+  const editStartedAt = Date.now()
+  await insertAtDocumentEnd(token)
+  await waitUntil('dirty draft to be visible in the active tab', () => cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)}) && document.querySelector('.document-tab.is-active [role="tab"]')?.getAttribute('aria-label')?.includes('修改待保存')`))
+  await waitUntil('draft snapshot to reach browser recovery storage', () => cdp.evaluate(`(() => {
+    const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+    return keys.some(key => key?.startsWith('editor_pending_drafts:') && localStorage.getItem(key)?.includes(${JSON.stringify(token)}));
+  })()`), 2000)
+  const currentWorkspace = await realpath(workspace)
+  await clickAriaButton('更改目录')
+  await waitUntil('picker overlay and canonical listing to load without leaving the editor', () => cdp.evaluate(`(() => {
+    const root = document.querySelector('.workspace-picker-modal');
+    const wrapper = root?.querySelector('.ant-modal-wrap');
+    const panel = root?.querySelector('.ant-modal-content');
+    const wrapperStyle = wrapper ? getComputedStyle(wrapper) : null;
+    const panelStyle = panel ? getComputedStyle(panel) : null;
+    const rect = panel?.getBoundingClientRect();
+    const input = root?.querySelector('input[aria-label="目录路径"]');
+    return document.body.classList.contains('workspace-picker-open')
+      && Boolean(wrapper && panel && rect?.width && rect?.height)
+      && wrapperStyle.display !== 'none' && wrapperStyle.visibility !== 'hidden'
+      && panelStyle.display !== 'none' && panelStyle.visibility !== 'hidden'
+      && root.dataset.currentPath === ${JSON.stringify(currentWorkspace)}
+      && input?.value === ${JSON.stringify(currentWorkspace)}
+      && root.querySelector('.workspace-picker-list')?.getAttribute('aria-busy') === 'false'
+      && document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)});
+  })()`))
+  const pickerPath = await cdp.evaluate(`document.querySelector('.workspace-picker-modal')?.dataset.currentPath ?? null`)
+  assert.equal(pickerPath, currentWorkspace, 'the overlay should start from the active canonical workspace')
+  await clickAriaButton('取消选择工作目录')
+  await waitUntil('picker overlay to hide after cancel', () => workspacePickerIsClosed())
+
+  const retainedContext = await cdp.evaluate(`(() => {
+    const tree = document.querySelector('.tree-scroll');
+    const activeTab = document.querySelector('.document-tab.is-active');
+    const source = document.querySelector('.ProseMirror');
+    const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+    return {
+      sameSidebar: window.__pickerSidebarBefore === document.querySelector('.workspace-sidebar'),
+      sameTreeNode: window.__pickerTreeBefore === tree,
+      sameTabsNode: window.__pickerTabsBefore === document.querySelector('.document-tabs'),
+      sameActiveTab: window.__pickerActiveTabBefore === activeTab,
+      sameEditorNode: window.__pickerEditorBefore === source,
+      activeLabel: activeTab?.querySelector('[role="tab"]')?.getAttribute('aria-label') || '',
+      draftVisible: source?.innerText.includes(${JSON.stringify(token)}) || false,
+      draftStored: keys.some(key => key?.startsWith('editor_pending_drafts:') && localStorage.getItem(key)?.includes(${JSON.stringify(token)})),
+      treeScrollTop: tree?.scrollTop ?? null,
+      workspaceInfo: localStorage.getItem('editor_workspace_info'),
+    };
+  })()`)
+  const expectedInfo = await cdp.evaluate(`window.__pickerWorkspaceInfoBefore`)
+  assert.deepEqual({
+    sameSidebar: retainedContext.sameSidebar,
+    sameTreeNode: retainedContext.sameTreeNode,
+    sameTabsNode: retainedContext.sameTabsNode,
+    sameActiveTab: retainedContext.sameActiveTab,
+    sameEditorNode: retainedContext.sameEditorNode,
+    draftVisible: retainedContext.draftVisible,
+    treeScrollTop: retainedContext.treeScrollTop,
+    workspaceInfo: retainedContext.workspaceInfo,
+  }, {
+    sameSidebar: true,
+    sameTreeNode: true,
+    sameTabsNode: true,
+    sameActiveTab: true,
+    sameEditorNode: true,
+    draftVisible: true,
+    treeScrollTop: scrollState.top,
+    workspaceInfo: expectedInfo,
+  }, 'cancel should preserve the active document, its tab and text, the scrolled tree, and the same workspace identity')
+  assert.ok(['second.md', 'second.md，修改待保存'].includes(retainedContext.activeLabel), `the active tab should remain open whether its scheduled save has completed or not: ${retainedContext.activeLabel}`)
+  await waitUntil('draft to remain in recovery storage or reach disk after cancel', async () => {
+    const stored = await cdp.evaluate(`(() => {
+      const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
+      return keys.some(key => key?.startsWith('editor_pending_drafts:') && localStorage.getItem(key)?.includes(${JSON.stringify(token)}));
+    })()`)
+    const disk = await readFile(path.join(workspace, secondFile), 'utf8').catch(error => error.code === 'ENOENT' ? '' : Promise.reject(error))
+    return stored || disk.includes(token)
+  }, 5000)
+
+  const writes = cdp.networkRequests.slice(requestOffset).filter(request => {
+    const pathname = new URL(request.url).pathname
+    return (request.method === 'PUT' && pathname === '/api/workspace') || (request.method === 'POST' && pathname === '/api/workspace/set')
+  })
+  const workspaceSetRequests = writes.filter(request => request.method === 'POST')
+  assert.deepEqual(workspaceSetRequests, [], 'cancel must not submit a workspace change')
+  const earlyFlushes = writes.filter(request => request.method === 'PUT' && request.observedAt - editStartedAt < 2900)
+  assert.deepEqual(earlyFlushes, [], 'cancel must not force an early flush before the normal three-second autosave')
+  await waitUntil('the normal autosave to persist the draft after cancel', async () => {
+    const content = await readFile(path.join(workspace, secondFile), 'utf8').catch(error => error.code === 'ENOENT' ? '' : Promise.reject(error))
+    return content.includes(token)
+  }, 8000)
+})
+
+test('a dirty draft flush failure prevents workspace selection', async () => {
+  await switchWorkspace(await realpath(workspace))
+  await openFile(firstFile, firstSeed)
+  const currentWorkspace = await realpath(workspace)
+  const token = `PICKER-FLUSH-CONFLICT-${Date.now()}`
+  await insertAtDocumentEnd(token)
+  await waitUntil('draft text to reach the active editor', () => cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`))
+  const externalContent = `${firstSeed}\nEXTERNAL-DISK-CHANGE-${Date.now()}`
+  await writeFile(path.join(workspace, firstFile), externalContent)
+  const requestOffset = cdp.networkRequests.length
+
+  await clickAriaButton('更改目录')
+  await waitUntil('picker overlay to open for a dirty draft', async () => await workspacePickerIsOpen()
+    && await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`))
+  await waitUntil('current workspace to be ready for confirmation', () => cdp.evaluate(`(() => {
+    const modal = document.querySelector('.workspace-picker-modal');
+    return modal?.dataset.currentPath === ${JSON.stringify(currentWorkspace)}
+      && modal.querySelector('.workspace-picker-list')?.getAttribute('aria-busy') !== 'true'
+      && modal.querySelector('button[aria-label="使用当前目录"]')?.disabled === false;
+  })()`))
+  await clickAriaButton('使用当前目录')
+  await waitUntil('flush conflict to report that changeover is blocked', () => cdp.evaluate(`document.body.innerText.includes('保存失败')`))
+  const afterFailure = cdp.networkRequests.slice(requestOffset)
+  const attemptedFlush = afterFailure.some(request => request.method === 'PUT' && new URL(request.url).pathname === '/api/workspace')
+  const attemptedSet = afterFailure.some(request => request.method === 'POST' && new URL(request.url).pathname === '/api/workspace/set')
+  assert.equal(attemptedFlush, true, 'confirmation should attempt to flush the dirty draft before changing context')
+  assert.equal(attemptedSet, false, 'a failed flush must stop before POST /api/workspace/set')
+  assert.equal(await readFile(path.join(workspace, firstFile), 'utf8'), externalContent, 'the conflict must not overwrite the external disk edit')
+  assert.equal(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(token)})`), true, 'the local draft should remain visible after the flush fails')
+  assert.equal(await cdp.evaluate(`Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.document-tab.is-active'))`), true, 'the current Editor and tab should remain available after a failed flush')
 })
 
 test('trash UI can restore a deleted file to its original path', async () => {
@@ -1830,10 +2085,10 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
   await clickConfirmButton('确认清理过期项目')
   await waitUntil('expiry cleanup to report success', () => cdp.evaluate(`document.body.innerText.includes('已永久清理 1 个过期项目')`))
   await waitUntil('expiry cleanup confirmation to close after success', async () => !await hasVisibleConfirmation())
-  await waitUntil('only unexpired trash entries to remain', () => cdp.evaluate(`(() => {
-    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
-    return modal?.innerText.includes(${JSON.stringify(retainedName)}) && modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && !modal?.innerText.includes(${JSON.stringify(expiredName)});
-  })()`))
+  await waitUntil('only unexpired trash entries to remain in the visible trash modal', async () => {
+    const modal = (await readVisibleAntModals()).find(item => item.title.includes('回收站'))
+    return modal?.text.includes(retainedName) && modal?.text.includes(retainedAfterFailureName) && !modal?.text.includes(expiredName)
+  })
   await waitUntil('trash storage count to refresh after expiry cleanup', () => cdp.evaluate(
     `Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText === '2 项'`,
   ))
@@ -1862,10 +2117,10 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
   await clickExactAriaButton(retainedDeleteLabel)
   await clickConfirmButton('永久删除')
   await waitUntil('single trash deletion confirmation to close after success', async () => !await hasVisibleConfirmation())
-  await waitUntil('selected unexpired trash item to be removed', () => cdp.evaluate(`(() => {
-    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
-    return !modal?.innerText.includes(${JSON.stringify(retainedName)}) && modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)});
-  })()`))
+  await waitUntil('selected unexpired trash item to be removed from the visible trash modal', async () => {
+    const modal = (await readVisibleAntModals()).find(item => item.title.includes('回收站'))
+    return modal && !modal.text.includes(retainedName) && modal.text.includes(retainedAfterFailureName)
+  })
   await waitUntil('trash statistics to refresh after the selected deletion', () => cdp.evaluate(
     `Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText === '1 项'`,
   ))
@@ -1890,30 +2145,26 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
     return deleted && listRefresh && statsRefresh
   })
   await waitUntil('failed deletion confirmation to close', async () => !await hasVisibleConfirmation())
-  await waitUntil('failed deletion to leave the item listed with refreshed count', () => cdp.evaluate(`(() => {
-    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
-    const count = Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText;
-    return modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && count === '1 项';
-  })()`))
+  await waitUntil('failed deletion to leave the item listed with refreshed count', async () => {
+    const modal = (await readVisibleAntModals()).find(item => item.title.includes('回收站'))
+    const count = await cdp.evaluate(`Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText`)
+    return modal?.text.includes(retainedAfterFailureName) && count === '1 项'
+  })
 
   await writeFile(retainedAfterFailureEntry.manifestPath, JSON.stringify(retainedAfterFailureEntry.manifest, null, 2))
   await clickExactAriaButton(`永久删除 ${retainedAfterFailureName}`)
   await clickConfirmButton('永久删除')
   await waitUntil('final trash deletion confirmation to close', async () => !await hasVisibleConfirmation())
-  await waitUntil('final test trash item to be removed', () => cdp.evaluate(`(() => {
-    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.innerText.includes('回收站'));
-    const count = Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText;
-    return !modal?.innerText.includes(${JSON.stringify(retainedAfterFailureName)}) && count === '0 项';
-  })()`))
+  await waitUntil('final test trash item to be removed', async () => {
+    const modal = (await readVisibleAntModals()).find(item => item.title.includes('回收站'))
+    const count = await cdp.evaluate(`Array.from(document.querySelectorAll('.recovery-stats-card')).find(card => card.querySelector('.recovery-stats-label')?.innerText === '回收站')?.querySelector('strong')?.innerText`)
+    return modal && !modal.text.includes(retainedAfterFailureName) && count === '0 项'
+  })
   assert.equal(await readFile(path.join(trashDirectory, retainedAfterFailureEntry.id, 'entry.json')).catch(error => error.code), 'ENOENT')
 
-  await switchWorkspace('workspace-b')
+  await switchWorkspace(await realpath(workspaceB))
   const workspaceBInitialView = await cdp.evaluate(`JSON.stringify({
     workspace: JSON.parse(localStorage.getItem('editor_workspace_info') || 'null')?.workspace || '',
-    visibleTrashModals: Array.from(document.querySelectorAll('.ant-modal')).filter(modal => {
-      const style = getComputedStyle(modal);
-      return modal.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
-    }).map(modal => modal.innerText),
     visibleTrashRows: Array.from(document.querySelectorAll('.trash-item-row')).filter(row => {
       const style = getComputedStyle(row);
       return row.getClientRects().length > 0 && style.visibility !== 'hidden' && style.display !== 'none' && Number(style.opacity || 1) > 0;
@@ -1924,6 +2175,7 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
     }).map(button => button.getAttribute('aria-label')),
   })`)
   const initialView = JSON.parse(workspaceBInitialView)
+  initialView.visibleTrashModals = (await readVisibleAntModals()).filter(modal => modal.title.includes('回收站')).map(modal => modal.text)
   assert.equal(path.basename(initialView.workspace), 'workspace-b')
   const visibleOldTrash = [
     ...initialView.visibleTrashModals,
@@ -1936,10 +2188,10 @@ test('trash dialog reports storage and limits permanent cleanup to confirmed exp
   const workspaceBStats = await readWorkspaceRecoveryStats()
   assert.equal(workspaceBStats.status, 200)
   assert.equal(workspaceBStats.data.total.items, 0, 'workspace B must not display workspace A recovery records')
-  assert.ok(!await cdp.evaluate(`document.querySelector('.ant-modal')?.innerText.includes(${JSON.stringify(firstFile)})`))
+  assert.equal((await readVisibleAntModals()).some(modal => modal.title.includes('回收站') && modal.text.includes(firstFile)), false, 'workspace B trash modal must not expose workspace A file recovery records')
   // Leave the isolated backend on the suite's default workspace for the next
   // test; its startup context is deliberately refreshed from this selection.
-  await switchWorkspace('notes')
+  await switchWorkspace(await realpath(workspace))
 })
 
 test('an external disk edit is detected before the browser can overwrite it', async () => {

@@ -64,6 +64,7 @@ jobs:
           EDITOR_REPAIR_SCREENSHOT_DIR: ${{ runner.temp }}/editor-repair-screenshots
           EDITOR_REVIEW_DIR: ${{ runner.temp }}/editor-review-screenshots
           EDITOR_REVIEW_INTERACTION_DIR: ${{ runner.temp }}/editor-review-interaction-screenshots
+          WORKSPACE_PICKER_EVIDENCE_DIR: ${{ runner.temp }}/workspace-picker-screenshots
       - name: Upload frontend browser screenshots
         if: always()
         uses: actions/upload-artifact@v6
@@ -73,5 +74,6 @@ jobs:
             ${{ runner.temp }}/editor-repair-screenshots
             ${{ runner.temp }}/editor-review-screenshots
             ${{ runner.temp }}/editor-review-interaction-screenshots
+            ${{ runner.temp }}/workspace-picker-screenshots
           if-no-files-found: ignore
           retention-days: 14

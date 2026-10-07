@@ -327,7 +327,7 @@ function menuAnchorPosition(event, fallbackElement) {
 
 // ========== 主组件 ==========
 
-export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, themeToggle }) {
+export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePicker, themeToggle }) {
   const [tree, setTree] = useState([])
   const [selectedKey, setSelectedKey] = useState('')
   const selectedTreeKeys = useMemo(() => [selectedKey], [selectedKey])
@@ -1539,19 +1539,20 @@ export default function Editor({ workspace, workspaceInfo, onWorkspaceChange, th
     enterRichMode()
   }, [captureCurrentDraft, saveBlockedRef, setEditorMarkdown])
 
-  const handleChangeWorkspace = useCallback(async () => {
-    try {
-      const retainedBlockedDrafts = Object.entries(dirtyRef.current)
-        .filter(([path, dirty]) => dirty && saveBlockedRef.current.has(path))
-        .map(([path]) => path)
-      await flushPaths([...new Set([...openFilesRef.current, ...retainedBlockedDrafts])])
-    } catch {
-      message.error('保存失败，暂不能更改目录')
-      return
-    }
-    openRequestRef.current += 1
-    onWorkspaceChange?.('')
-  }, [dirtyRef, flushPaths, onWorkspaceChange, saveBlockedRef])
+  const prepareWorkspaceSelection = useCallback(async () => {
+    const retainedBlockedDrafts = Object.entries(dirtyRef.current)
+      .filter(([path, dirty]) => dirty && saveBlockedRef.current.has(path))
+      .map(([path]) => path)
+    await flushPaths([...new Set([...openFilesRef.current, ...retainedBlockedDrafts])])
+    return true
+  }, [dirtyRef, flushPaths, saveBlockedRef])
+
+  const handleChangeWorkspace = useCallback(() => {
+    onRequestWorkspacePicker?.({
+      initialPath: workspaceInfo?.workspace || workspace,
+      beforeSelect: prepareWorkspaceSelection,
+    })
+  }, [onRequestWorkspacePicker, prepareWorkspaceSelection, workspace, workspaceInfo?.workspace])
 
   // Give the browser a last chance to transmit drafts when a tab/window is
   // closed. The confirmation keeps the page alive long enough for keepalive
