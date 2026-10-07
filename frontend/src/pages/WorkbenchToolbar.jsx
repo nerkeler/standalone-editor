@@ -73,7 +73,6 @@ export default function WorkbenchToolbar({
   onToggleSource,
   onInsertLink,
   onUploadImage,
-  onTableInsert,
   showOutline,
   onToggleOutline,
   editorFullscreen,
@@ -129,7 +128,7 @@ export default function WorkbenchToolbar({
           >
             <Button className="mobile-more-formats" aria-label="更多格式" aria-haspopup="menu" aria-expanded={formatMenuOpen} {...buttonProps(false, 'var(--color-text-secondary)', { pressed: false })} icon={<MoreOutlined />}>更多格式</Button>
           </Dropdown>
-          <TableInsertButton editor={editor} buttonProps={buttonProps(false, undefined, { pressed: false })} onInsert={onTableInsert} />
+          <TableInsertButton editor={editor} buttonProps={buttonProps(false, undefined, { pressed: false })} />
         </>}
         {showSource && <Tooltip title="上传图片"><Button aria-label="上传图片" {...buttonProps(false, undefined, { pressed: false })} icon={<UploadOutlined />} loading={uploading} onClick={onUploadImage} /></Tooltip>}
         <span className="toolbar-spacer" />
@@ -185,7 +184,7 @@ export default function WorkbenchToolbar({
           <Tooltip title="引用"><Button aria-label="引用" {...buttonProps(editor?.isActive('blockquote'))} onClick={() => editor?.chain().focus().toggleBlockquote().run()} icon={<CommentOutlined />} /></Tooltip>
           <Tooltip title="代码块"><Button aria-label="代码块" {...buttonProps(editor?.isActive('codeBlock'))} onClick={() => editor?.chain().focus().toggleCodeBlock().run()} icon={<CodeOutlined />} /></Tooltip>
           <Tooltip title="插入链接"><Button aria-label="插入链接" {...buttonProps(editor?.isActive('link'))} onClick={onInsertLink} icon={<LinkOutlined />} /></Tooltip>
-          <TableInsertButton editor={editor} buttonProps={buttonProps(false, undefined, { pressed: false })} onInsert={onTableInsert} />
+          <TableInsertButton editor={editor} buttonProps={buttonProps(false, undefined, { pressed: false })} />
         </div>
       </>}
       <div className="toolbar-group">

@@ -52,7 +52,7 @@ export function TableInsertButton({ editor, buttonProps = {}, onInsert }) {
       requestAnimationFrame(() => cellRefs.current[0]?.focus())
     }
   }
-  return <Popover open={open} onOpenChange={handleOpenChange} trigger="click" placement="bottomLeft" content={
+  return <Popover open={open} onOpenChange={handleOpenChange} trigger="click" placement="bottom" autoAdjustOverflow content={
     <div className="table-insert-panel" role="dialog" aria-label="插入表格" onKeyDown={handlePanelKeyDown}>
       <div className="table-insert-title" aria-live="polite">{rows} 行 × {cols} 列</div>
       <div className="table-size-grid" role="group" aria-label="选择表格行列数" onKeyDown={handleGridKeyDown}>
@@ -77,18 +77,4 @@ export function TableInsertButton({ editor, buttonProps = {}, onInsert }) {
   }>
     <Button ref={triggerRef} aria-label="插入表格" aria-haspopup="dialog" aria-expanded={open} icon={<TableOutlined />} {...buttonProps} />
   </Popover>
-}
-
-export function TableContextTools({ editor, visible }) {
-  if (!visible || !editor?.isActive('table')) return null
-  const actions = [
-    ['上方增行', 'addRowBefore'], ['下方增行', 'addRowAfter'],
-    ['左侧增列', 'addColumnBefore'], ['右侧增列', 'addColumnAfter'],
-    ['删除行', 'deleteRow'], ['删除列', 'deleteColumn'], ['删除表格', 'deleteTable'],
-  ]
-  return <div className="table-context-tools" role="toolbar" aria-label="表格行列操作">
-    {actions.map(([label, command]) => <Button key={command} size="small" aria-label={label}
-      disabled={!editor.can().chain().focus()[command]().run()}
-      onClick={() => editor.chain().focus()[command]().run()}>{label}</Button>)}
-  </div>
 }

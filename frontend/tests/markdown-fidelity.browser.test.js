@@ -198,6 +198,7 @@ async function setupPage() {
   await connection.send('Emulation.setDeviceMetricsOverride', {
     width: 1195, height: 751, deviceScaleFactor: 1, mobile: false,
   })
+  await connection.send('Emulation.setTouchEmulationEnabled', { enabled: false })
   connection.acceptBeforeUnload = true
   try {
     await connection.send('Page.navigate', { url: `http://127.0.0.1:${frontendPort}/` })
@@ -246,6 +247,400 @@ async function pressKey(key, windowsVirtualKeyCode, { code = key, modifiers = 0 
   await connection.send('Input.dispatchKeyEvent', {
     type: 'keyUp', key, code, windowsVirtualKeyCode, modifiers,
   })
+}
+
+async function setTestViewport(width, height, mobile = false) {
+  await connection.send('Emulation.setDeviceMetricsOverride', {
+    width, height, deviceScaleFactor: 1, mobile,
+  })
+  await connection.send('Emulation.setTouchEmulationEnabled', mobile
+    ? { enabled: true, maxTouchPoints: 1 }
+    : { enabled: false })
+}
+
+async function dispatchRealInput(targetExpression, { touch = false, scrollIntoView = true, button = 'left' } = {}) {
+  const point = await connection.evaluate(`(() => {
+    const target = (${targetExpression});
+    if (!target) return null;
+    if (${scrollIntoView}) target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+    const rect = target.getBoundingClientRect();
+    const cellIndex = cell => {
+      if (!cell) return null;
+      const row = cell.closest('tr');
+      const table = cell.closest('table');
+      return [Array.from(document.querySelectorAll('.ProseMirror table')).indexOf(table),
+        row ? Array.from(table.rows).indexOf(row) : -1, row ? Array.from(row.cells).indexOf(cell) : -1];
+    };
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    const targetCell = target.matches('td,th') ? target : target.closest('td,th');
+    const hitCell = hit?.matches('td,th') ? hit : hit?.closest('td,th');
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height,
+      targetLabel: target.getAttribute('aria-label'),
+      targetCell: cellIndex(targetCell),
+      hitCell: cellIndex(hitCell),
+      hitMatchesTarget: hit === target || target.contains(hit) || (target.matches('img') && hit?.closest?.('img') === target),
+      hitLabel: hit?.getAttribute?.('aria-label') || hit?.closest?.('[aria-label]')?.getAttribute('aria-label') || null,
+      viewport: { width: innerWidth, height: innerHeight },
+    };
+  })()`)
+  assert.ok(point?.width > 0 && point?.height > 0, `real input target must have visible geometry: ${targetExpression}`)
+  assert.ok(point.x >= 0 && point.x < point.viewport.width && point.y >= 0 && point.y < point.viewport.height,
+    `real input target must be inside the viewport: ${JSON.stringify(point)}`)
+  assert.equal(point.hitMatchesTarget, true, `the real input point must hit the requested element: ${JSON.stringify(point)}`)
+
+  if (touch) {
+    await connection.send('Input.dispatchTouchEvent', {
+      type: 'touchStart',
+      touchPoints: [{ id: 1, x: point.x, y: point.y, radiusX: 1, radiusY: 1, force: 1 }],
+    })
+    await new Promise(resolve => setTimeout(resolve, 45))
+    await connection.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  } else {
+    await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y })
+    await connection.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button, clickCount: 1 })
+    await connection.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button, clickCount: 1 })
+  }
+  if (point.targetCell) {
+    let matchingPolls = 0
+    await waitUntil(`DOM selection in clicked table cell ${JSON.stringify(point.targetCell)}`, async () => {
+      await connection.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`)
+      const selection = await readDOMCellSelection()
+      const matches = JSON.stringify(selection?.cell) === JSON.stringify(point.targetCell)
+        && (button === 'right' || selection.editorFocused)
+      matchingPolls = matches ? matchingPolls + 1 : 0
+      return matchingPolls >= 2
+    }, 2500)
+    assert.deepEqual(point.hitCell, point.targetCell,
+      `the real ${touch ? 'touch' : button === 'right' ? 'right-click' : 'mouse'} point must hit the requested table cell: ${JSON.stringify(point)}`)
+  }
+  return point
+}
+
+async function clickFileFromTree(fileName, expectedText) {
+  await dispatchRealInput(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).find(node => node.innerText.trim() === ${JSON.stringify(fileName)})`)
+  await waitUntil(`${fileName} content after a real tree click`, () => connection.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(expectedText)}) || document.querySelector('.ProseMirror')?.innerText.includes(${JSON.stringify(expectedText)})`,
+  ))
+}
+
+async function readDOMCellSelection() {
+  return connection.evaluate(`(() => {
+    const anchorNode = window.getSelection()?.anchorNode || null;
+    const anchorElement = anchorNode?.nodeType === Node.ELEMENT_NODE ? anchorNode : anchorNode?.parentElement;
+    const cell = anchorElement?.closest('td,th') || null;
+    const active = document.activeElement;
+    return {
+      cell: cell && [Array.from(document.querySelectorAll('.ProseMirror table')).indexOf(cell.closest('table')),
+        Array.from(cell.closest('table').rows).indexOf(cell.closest('tr')),
+        Array.from(cell.closest('tr').cells).indexOf(cell)],
+      editorFocused: Boolean(active?.classList?.contains('ProseMirror-focused')),
+    };
+  })()`)
+}
+
+async function readRichTableState() {
+  return connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror table')).map(table => ({
+    rows: Array.from(table.rows).map(row => Array.from(row.cells).map(cell => cell.innerText.replace(/\\s+/g, ' ').trim())),
+  }))`)
+}
+
+async function waitForStableContextMenu(label) {
+  let previousGeometry = ''
+  let stablePolls = 0
+  return waitUntil(`${label} context menu to be visible and stable`, async () => {
+    const geometry = await connection.evaluate(`(() => {
+      const menu = Array.from(document.querySelectorAll('[role="menu"]')).find(item => {
+        if (item.getAttribute('aria-label') !== ${JSON.stringify(label)}) return false;
+        const rect = item.getBoundingClientRect(), style = getComputedStyle(item);
+        return item.getClientRects().length && rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility === 'visible';
+      });
+      const rect = menu?.getBoundingClientRect(), item = menu?.querySelector('[role="menuitem"]');
+      const itemRect = item?.getBoundingClientRect();
+      const hit = itemRect && document.elementFromPoint(itemRect.left + itemRect.width / 2, itemRect.top + itemRect.height / 2);
+      return menu && rect && itemRect ? { rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        itemRect: { x: itemRect.x, y: itemRect.y, width: itemRect.width, height: itemRect.height },
+        viewport: { width: innerWidth, height: innerHeight },
+        visible: Boolean(menu.getClientRects().length && rect.width > 0 && rect.height > 0
+          && getComputedStyle(menu).display !== 'none' && getComputedStyle(menu).visibility === 'visible'
+          && item.getClientRects().length && itemRect.width > 0 && itemRect.height > 0),
+        hitLabel: hit?.getAttribute?.('aria-label') || hit?.closest?.('[aria-label]')?.getAttribute('aria-label') || null,
+        itemLabel: item.getAttribute('aria-label') || item.innerText.trim() } : null;
+    })()`)
+    const signature = geometry?.visible ? JSON.stringify([geometry.rect, geometry.itemRect, geometry.itemLabel]) : ''
+    stablePolls = signature && signature === previousGeometry ? stablePolls + 1 : 0
+    previousGeometry = signature
+    return stablePolls >= 2 ? geometry : null
+  }, 5000)
+}
+
+function assertContextMenuFitsViewport(geometry, label) {
+  const { rect, viewport } = geometry
+  assert.ok(rect && rect.x >= 0 && rect.y >= 0
+    && rect.x + rect.width <= viewport.width && rect.y + rect.height <= viewport.height,
+  `${label} menu must stay inside the viewport: ${JSON.stringify(geometry)}`)
+}
+
+async function readContextMenuScrollMetrics(label) {
+  return connection.evaluate(`(() => {
+    const menu = Array.from(document.querySelectorAll('[role="menu"]')).find(item => {
+      const rect = item.getBoundingClientRect(), style = getComputedStyle(item);
+      return item.getAttribute('aria-label') === ${JSON.stringify(label)} && item.getClientRects().length
+        && rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility === 'visible';
+    });
+    const elements = menu ? [menu, ...menu.querySelectorAll('*')] : [];
+    const constrained = elements.map(element => {
+      const style = getComputedStyle(element);
+      return { overflowY: style.overflowY, maxHeight: style.maxHeight,
+        scrollHeight: element.scrollHeight, clientHeight: element.clientHeight };
+    }).filter(item => ['auto', 'scroll', 'hidden'].includes(item.overflowY) || item.maxHeight !== 'none');
+    return { overflowing: constrained.some(item => item.scrollHeight > item.clientHeight + 1),
+      scrollable: constrained.some(item => item.scrollHeight > item.clientHeight + 1 && ['auto', 'scroll'].includes(item.overflowY)),
+      constrained };
+  })()`)
+}
+
+async function waitForStableObjectMenuButton(label, objectExpression) {
+  let previousGeometry = ''
+  let stablePolls = 0
+  let lastGeometry = null
+  try {
+    return await waitUntil(`${label} touch menu button to be visible and stable`, async () => {
+      const geometry = await connection.evaluate(`(() => {
+      const button = Array.from(document.querySelectorAll('button')).find(item => {
+        if (item.getAttribute('aria-label') !== ${JSON.stringify(label)}) return false;
+        const rect = item.getBoundingClientRect(), style = getComputedStyle(item);
+        return item.getClientRects().length && rect.width > 0 && rect.height > 0 && style.visibility === 'visible';
+      });
+      const object = (${objectExpression});
+      const buttonStyle = button && getComputedStyle(button);
+      const buttonRect = button?.getBoundingClientRect(), objectRect = object?.getBoundingClientRect();
+      const hit = buttonRect && document.elementFromPoint(buttonRect.left + buttonRect.width / 2, buttonRect.top + buttonRect.height / 2);
+      const hitButton = hit?.closest?.('button');
+      return button && buttonRect && objectRect ? { button: { x: buttonRect.x, y: buttonRect.y, width: buttonRect.width, height: buttonRect.height, zIndex: buttonStyle.zIndex },
+        object: { x: objectRect.x, y: objectRect.y, width: objectRect.width, height: objectRect.height },
+        visible: Boolean(button.getClientRects().length && getComputedStyle(button).visibility === 'visible'
+          && buttonRect.width >= 44 && buttonRect.height >= 44
+          && buttonRect.left >= 0 && buttonRect.top >= 0 && buttonRect.right <= innerWidth && buttonRect.bottom <= innerHeight),
+        hitLabel: hitButton?.getAttribute('aria-label') || null, hitIsButton: hitButton === button } : null;
+      })()`)
+      lastGeometry = geometry
+      const signature = geometry?.visible && geometry.hitIsButton && geometry.hitLabel === label
+        ? JSON.stringify([geometry.button, geometry.object]) : ''
+      stablePolls = signature && signature === previousGeometry ? stablePolls + 1 : 0
+      previousGeometry = signature
+      return stablePolls >= 2 ? geometry : null
+    }, 5000)
+  } catch (error) {
+    const state = await connection.evaluate(`(() => {
+      const button = Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === ${JSON.stringify(label)});
+      const object = (${objectExpression});
+      const scroll = document.querySelector('.editor-scroll'), frame = scroll?.getBoundingClientRect(), objectRect = object?.getBoundingClientRect();
+      const anchor = window.getSelection()?.anchorNode || null;
+      const anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+      const cell = anchorElement?.closest('td,th');
+      const active = document.activeElement;
+      const box = element => { const rect = element?.getBoundingClientRect(), style = element && getComputedStyle(element);
+        return element && { x: rect.x, y: rect.y, width: rect.width, height: rect.height, display: style.display, visibility: style.visibility }; };
+      return { viewport: { width: innerWidth, height: innerHeight }, mobileMedia: matchMedia('(max-width: 768px)').matches,
+        maxTouchPoints: navigator.maxTouchPoints, editorFocus: Boolean(document.querySelector('.ProseMirror-focused')),
+        active: active && { tag: active.tagName, role: active.getAttribute('role'), ariaLabel: active.getAttribute('aria-label'), className: String(active.className) },
+        editorFrame: frame && { x: frame.x, y: frame.y, width: frame.width, height: frame.height, scrollTop: scroll.scrollTop },
+        object: box(object), button: box(button), selectedImages: Array.from(document.querySelectorAll('.ProseMirror img.ProseMirror-selectednode')).length,
+        domCell: cell && [Array.from(document.querySelectorAll('.ProseMirror table')).indexOf(cell.closest('table')),
+          Array.from(cell.closest('table').rows).indexOf(cell.closest('tr')), Array.from(cell.closest('tr').cells).indexOf(cell)] };
+    })()`)
+    throw new Error(`${error.message}\nMore button evidence: ${JSON.stringify({ lastGeometry, state })}`)
+  }
+}
+
+async function openObjectContextMenu(targetExpression, { object = 'table', touch = false, keyboard = false } = {}) {
+  const triggerLabel = object === 'image' ? '更多图片操作' : '更多表格操作'
+  const menuLabel = object === 'image' ? '图片操作' : '表格操作'
+  let touchButtonEvidence = null
+  await dispatchRealInput(targetExpression, { touch, button: touch || keyboard ? 'left' : 'right' })
+  if (object === 'image') await waitForSelectedImage(targetExpression)
+  if (keyboard) await pressKey('F10', 121, { modifiers: 8 })
+  if (touch) {
+    const selectedObject = object === 'image' ? targetExpression : `(${targetExpression})?.closest('table')`
+    touchButtonEvidence = await waitForStableObjectMenuButton(triggerLabel, selectedObject)
+    await dispatchRealInput(`Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === ${JSON.stringify(triggerLabel)} && item.getClientRects().length && getComputedStyle(item).visibility === 'visible')`, {
+      touch: true, scrollIntoView: false,
+    })
+    assert.equal(touchButtonEvidence.hitLabel, triggerLabel, `${triggerLabel} must receive touch at its visible center`)
+    assert.equal(touchButtonEvidence.hitIsButton, true, `${triggerLabel} touch must land on the actual button receiver`)
+    try {
+      return { label: menuLabel, geometry: await waitForStableContextMenu(menuLabel) }
+    } catch (error) {
+      const state = await connection.evaluate(`(() => {
+        const button = Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === ${JSON.stringify(triggerLabel)});
+        const target = (${selectedObject});
+        const scroll = document.querySelector('.editor-scroll'), frame = scroll?.getBoundingClientRect(), buttonRect = button?.getBoundingClientRect();
+        const hit = buttonRect && document.elementFromPoint(buttonRect.left + buttonRect.width / 2, buttonRect.top + buttonRect.height / 2);
+        const anchor = window.getSelection()?.anchorNode || null, anchorElement = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+        const cell = anchorElement?.closest('td,th'), active = document.activeElement;
+        const visibleMenus = Array.from(document.querySelectorAll('[role="menu"]')).map(menu => {
+          const rect = menu.getBoundingClientRect(), style = getComputedStyle(menu);
+          return { label: menu.getAttribute('aria-label'), visible: Boolean(menu.getClientRects().length && rect.width && rect.height && style.visibility === 'visible' && style.display !== 'none'),
+            x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+        });
+        return { viewport: { width: innerWidth, height: innerHeight }, mobileMedia: matchMedia('(max-width: 768px)').matches,
+          maxTouchPoints: navigator.maxTouchPoints,
+          editorFrame: frame && { x: frame.x, y: frame.y, width: frame.width, height: frame.height, scrollTop: scroll.scrollTop },
+          button: button && { x: buttonRect.x, y: buttonRect.y, width: buttonRect.width, height: buttonRect.height,
+            display: getComputedStyle(button).display, visibility: getComputedStyle(button).visibility, zIndex: getComputedStyle(button).zIndex,
+            hitReceiver: hit?.closest?.('button') === button, hitLabel: hit?.closest?.('button')?.getAttribute('aria-label') },
+          target: target && { x: target.getBoundingClientRect().x, y: target.getBoundingClientRect().y,
+            width: target.getBoundingClientRect().width, height: target.getBoundingClientRect().height },
+          domCell: cell && [Array.from(document.querySelectorAll('.ProseMirror table')).indexOf(cell.closest('table')),
+            Array.from(cell.closest('table').rows).indexOf(cell.closest('tr')), Array.from(cell.closest('tr').cells).indexOf(cell)],
+          selectedImageCount: document.querySelectorAll('.ProseMirror img.ProseMirror-selectednode').length,
+          active: active && { tag: active.tagName, role: active.getAttribute('role'), label: active.getAttribute('aria-label'), className: String(active.className) },
+          visibleMenus };
+      })()`)
+      if (process.env.EDITOR_REPAIR_SCREENSHOT_DIR) await saveRepairScreenshot(`${object}-more-tap-no-menu.png`)
+      throw new Error(`${error.message}\nMore tap evidence: ${JSON.stringify({ touchButtonEvidence, state })}`)
+    }
+  }
+  return { label: menuLabel, geometry: await waitForStableContextMenu(menuLabel) }
+}
+
+async function clickContextMenuItem(menuLabel, itemLabel, { touch = false } = {}) {
+  const expression = `(() => {
+    const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter(menu => {
+      const rect = menu.getBoundingClientRect(), style = getComputedStyle(menu);
+      return menu.getAttribute('aria-label') === ${JSON.stringify(menuLabel)} && menu.getClientRects().length
+        && rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility === 'visible';
+    });
+    return menus.flatMap(menu => Array.from(menu.querySelectorAll('[role="menuitem"]')))
+      .find(item => item.getAttribute('aria-label') === ${JSON.stringify(itemLabel)} || item.innerText.trim() === ${JSON.stringify(itemLabel)});
+  })()`
+  const click = await dispatchRealInput(expression, { touch, scrollIntoView: false })
+  assert.equal(click.hitLabel, itemLabel, `real input must hit the ${itemLabel} menu item`)
+  return click
+}
+
+async function waitForContextMenuClosed(label) {
+  return waitUntil(`${label} context menu to close`, () => connection.evaluate(`(() => {
+    const menus = Array.from(document.querySelectorAll('[role="menu"]')).filter(item => item.getAttribute('aria-label') === ${JSON.stringify(label)});
+    return menus.every(menu => { const rect = menu.getBoundingClientRect(), style = getComputedStyle(menu);
+      return !menu.getClientRects().length || rect.width === 0 || rect.height === 0 || style.visibility === 'hidden' || style.display === 'none'; });
+  })()`))
+}
+
+async function waitForFocusedContextMenuItem(label, description = `${label} first menu command to receive focus`) {
+  try {
+    return await waitUntil(description, () => connection.evaluate(`(() => {
+      const menu = document.querySelector('[role="menu"][aria-label="${label}"]');
+      const active = document.activeElement;
+      return menu?.contains(active) && active?.getAttribute('role') === 'menuitem'
+        ? active.getAttribute('aria-label') : null;
+    })()`))
+  } catch (error) {
+    const evidence = await connection.evaluate(`(() => {
+      const menu = document.querySelector('[role="menu"][aria-label="${label}"]');
+      const active = document.activeElement;
+      return { active: active && { tag: active.tagName, role: active.getAttribute('role'), label: active.getAttribute('aria-label'), className: String(active.className) },
+        menu: menu && { visible: Boolean(menu.getClientRects().length), labels: Array.from(menu.querySelectorAll('[role="menuitem"]')).map(item => ({ label: item.getAttribute('aria-label'), tabIndex: item.tabIndex, focused: item === active })) },
+        editorFocused: Boolean(document.querySelector('.ProseMirror-focused')) };
+    })()`)
+    throw new Error(`${error.message}\nMenu focus evidence: ${JSON.stringify(evidence)}`)
+  }
+}
+
+async function waitForSelectedImage(imageExpression, description = 'clicked image to become the selected node') {
+  return waitUntil(description, () => connection.evaluate(`(() => {
+    const target = (${imageExpression});
+    return Boolean(target?.classList.contains('ProseMirror-selectednode'));
+  })()`))
+}
+
+async function assertNoPersistentObjectToolbars() {
+  assert.equal(await connection.evaluate(`!document.querySelector('.table-context-tools, .image-context-tools')`), true,
+    'table and image actions should be available through context menus, not persistent toolbars')
+}
+
+async function clickTableAction(label, cellExpression, { touch = false, shape } = {}) {
+  const context = await openObjectContextMenu(cellExpression, { touch })
+  assert.ok(context.geometry.visible, `table context menu must be visible: ${JSON.stringify(context.geometry)}`)
+  await clickContextMenuItem(context.label, label, { touch })
+  await waitForContextMenuClosed(context.label)
+  if (shape) await waitForTableShape(shape.table, shape.rows, shape.columns, shape.description)
+}
+
+async function waitForTableShape(index, rowCount, columnCount, description) {
+  return waitUntil(description, async () => {
+    const tables = await readRichTableState()
+    const table = tables[index]
+    return table && table.rows.length === rowCount && table.rows.every(row => row.length === columnCount) ? table : null
+  })
+}
+
+async function waitForStablePickerTarget(label) {
+  let previousGeometry = ''
+  let stablePolls = 0
+  return waitUntil(`${label} table picker target to be visible and stable`, async () => {
+    const geometry = await connection.evaluate(`(() => {
+      const target = Array.from(document.querySelectorAll('.table-size-grid button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(label)});
+      if (!target) return null;
+      const rect = target.getBoundingClientRect();
+      const panel = target.closest('.ant-popover');
+      const panelRect = panel?.getBoundingClientRect();
+      const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+      return {
+        target: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+        panel: panelRect && { x: panelRect.x, y: panelRect.y, width: panelRect.width, height: panelRect.height },
+        viewport: { width: innerWidth, height: innerHeight },
+        targetLabel: target.getAttribute('aria-label'),
+        hitLabel: hit?.getAttribute?.('aria-label') || hit?.closest?.('[aria-label]')?.getAttribute('aria-label') || null,
+        visible: Boolean(target.getClientRects().length && getComputedStyle(target).visibility === 'visible'
+          && panel?.getClientRects().length && getComputedStyle(panel).visibility === 'visible'),
+      };
+    })()`)
+    const hitReady = geometry?.visible && geometry.target.width > 20 && geometry.target.height > 20
+      && geometry.panel?.width > 20 && geometry.panel?.height > 20
+      && geometry.targetLabel === label && geometry.hitLabel === label
+    const signature = hitReady ? JSON.stringify([geometry.target, geometry.panel]) : ''
+    stablePolls = signature && signature === previousGeometry ? stablePolls + 1 : 0
+    previousGeometry = signature
+    return stablePolls >= 2 ? geometry : null
+  }, 8000)
+}
+
+function assertPickerFitsViewport(geometry, label) {
+  const { panel, viewport } = geometry
+  assert.ok(panel && panel.x >= 0 && panel.y >= 0
+    && panel.x + panel.width <= viewport.width && panel.y + panel.height <= viewport.height,
+  `${label} table picker panel must fit fully inside the viewport: ${JSON.stringify(geometry)}`)
+}
+
+function makeLongTableControlsSource() {
+  const context = Array.from({ length: 38 }, (_, index) => `Long context paragraph ${String(index + 1).padStart(2, '0')} remains outside the table edit.`)
+  return [
+    '# Long table controls fixture',
+    '',
+    ...context,
+    '',
+    'Adjacent text before the first table remains intact.',
+    '',
+    '| UPPER-KEY | UPPER-VALUE |',
+    '| --- | --- |',
+    '| UPPER-ROW-1 | UPPER-CELL-1 |',
+    '| UPPER-ROW-2 | UPPER-CELL-2 |',
+    '',
+    'Between-table text remains intact.',
+    '',
+    '| LOWER-KEY | LOWER-VALUE |',
+    '| --- | --- |',
+    '| LOWER-ROW-1 | LOWER-CELL-1 |',
+    '| LOWER-ROW-2 | LOWER-CELL-2 |',
+    '',
+    'Tail insertion point remains intact.',
+    '',
+  ].join('\n')
 }
 
 async function selectImageFile(name, bytes) {
@@ -1294,34 +1689,228 @@ test('image width and alignment round-trip as adjacent portable metadata', async
   const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
   await mkdir(path.join(workspace, 'assets'), { recursive: true })
   await writeFile(path.join(workspace, 'assets', 'presentation.png'), bytes)
-  await writeFile(path.join(workspace, fileName), '# Image presentation fixture\n\n![diagram](assets/presentation.png)<!-- se-image:width=50;align=center -->\n')
+  await writeFile(path.join(workspace, fileName), '# Image presentation fixture\n\nBefore the first image remains intact.\n\n![diagram](assets/presentation.png)<!-- se-image:width=50;align=center -->\n\nBetween images remains intact.\n\n![second](assets/presentation.png)<!-- se-image:width=100;align=left -->\n\nAfter the second image remains intact.\n')
   await setupPage()
   await openFile(fileName, 'Image presentation fixture')
-  await waitUntil('image presentation node', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
-  const initial = await connection.evaluate(`(() => { const img = document.querySelector('.ProseMirror img'); return img && { width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align'), style: img.getAttribute('style') } })()`)
-  assert.equal(initial.width, '50')
-  assert.equal(initial.align, 'center')
-  assert.match(initial.style, /width:\s*50%/)
-  assert.match(initial.style, /margin-left:\s*auto/)
-  await connection.evaluate(`document.querySelector('.ProseMirror img')?.click()`)
-  await waitUntil('image settings toolbar', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="图片宽度 75%"]'))`))
-  const handle = await waitUntil('image corner resize handle', () => connection.evaluate(`(() => { const box = document.querySelector('.image-resize-handle')?.getBoundingClientRect(); return box && { x: box.x + box.width / 2, y: box.y + box.height / 2 } })()`))
+  await waitUntil('both image presentation nodes', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img').length === 2`))
+  const firstImage = `document.querySelectorAll('.ProseMirror img')[0]`
+  const secondImage = `document.querySelectorAll('.ProseMirror img')[1]`
+  const readImages = () => connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror img')).map(img => ({
+    width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align'), style: img.getAttribute('style'),
+  }))`)
+  const initial = await readImages()
+  assert.deepEqual(initial.map(({ width, align }) => ({ width, align })), [
+    { width: '50', align: 'center' }, { width: '100', align: 'left' },
+  ])
+  assert.match(initial[0].style, /width:\s*50%/)
+  assert.match(initial[0].style, /margin-left:\s*auto/)
+
+  await dispatchRealInput(firstImage)
+  await waitForSelectedImage(firstImage, 'first image to become the old editor selection')
+  const rightClickMenu = await openObjectContextMenu(secondImage, { object: 'image' })
+  await waitForSelectedImage(secondImage, 'right-clicked second image to replace the old selection')
+  await saveRepairScreenshot('image-context-menu-desktop.png')
+  assert.equal(await waitForFocusedContextMenuItem('图片操作'), '左对齐', 'right-click should focus the first image command')
+  assert.equal(await connection.evaluate(`!Array.from(document.querySelectorAll('.ProseMirror img')).find(img => img.getAttribute('alt') === 'diagram')?.classList.contains('ProseMirror-selectednode')`), true)
+  await assertNoPersistentObjectToolbars()
+  assertContextMenuFitsViewport(rightClickMenu.geometry, 'desktop image context')
+  assert.ok(rightClickMenu.geometry.visible, 'right-clicking the second image should open its menu')
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('Escape to restore focus to the selected image', () => connection.evaluate(
+    `document.activeElement?.classList.contains('ProseMirror-focused') && document.querySelectorAll('.ProseMirror img')[1]?.classList.contains('ProseMirror-selectednode')`,
+  ))
+
+  const keyboardMenu = await openObjectContextMenu(secondImage, { object: 'image', keyboard: true })
+  assert.ok(keyboardMenu.geometry.visible, 'Shift+F10 should open the selected image menu')
+  assert.equal(await waitForFocusedContextMenuItem('图片操作'), '左对齐', 'Shift+F10 should focus the first image command')
+  const firstFocusedCommand = await connection.evaluate(`document.activeElement.getAttribute('aria-label')`)
+  await pressKey('ArrowDown', 40)
+  await waitUntil('ArrowDown to move through image context commands', () => connection.evaluate(
+    `document.querySelector('[role="menu"][aria-label="图片操作"]')?.contains(document.activeElement) && document.activeElement.getAttribute('aria-label') !== ${JSON.stringify(firstFocusedCommand)}`,
+  ))
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('Escape to return image selection to the editor', () => connection.evaluate(
+    `document.activeElement?.classList.contains('ProseMirror-focused') && document.querySelectorAll('.ProseMirror img')[1]?.classList.contains('ProseMirror-selectednode')`,
+  ))
+
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '宽度75%')
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('preset width to apply to the right-clicked image only', async () => {
+    const images = await readImages()
+    return images[1].width === '75' && images[0].width === '50' ? true : null
+  })
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '居中')
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('center alignment to apply to the right-clicked image only', async () => {
+    const images = await readImages()
+    return images[1].align === 'center' && images[0].align === 'center' && images[0].width === '50' ? true : null
+  })
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '左对齐')
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('left alignment to target the second image', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror img')[1]?.getAttribute('data-image-align') === 'left'`,
+  ))
+
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '自定义宽度…')
+  const sliderMenu = await waitForStableContextMenu('图片操作')
+  assertContextMenuFitsViewport(sliderMenu, 'custom image width')
+  const menuScroll = await readContextMenuScrollMetrics('图片操作')
+  assert.ok(!menuScroll.overflowing || menuScroll.scrollable,
+    `an expanded image menu must expose a scrollport if its body content overflows: ${JSON.stringify(menuScroll)}`)
+  const slider = `document.querySelector('[role="slider"][aria-label="图片宽度百分比"]')`
+  const sliderBounds = await waitUntil('custom image width slider', () => connection.evaluate(`(() => {
+    const slider = ${slider};
+    if (!slider || !slider.getClientRects().length) return null;
+    return { min: slider.getAttribute('min') || slider.getAttribute('aria-valuemin'),
+      max: slider.getAttribute('max') || slider.getAttribute('aria-valuemax'),
+      step: slider.getAttribute('step') || slider.getAttribute('aria-valuestep'),
+      value: slider.value || slider.getAttribute('aria-valuenow') };
+  })()`))
+  assert.deepEqual(sliderBounds, { min: '25', max: '100', step: '5', value: '75' })
+  await saveRepairScreenshot('image-context-menu-slider-open.png')
+  const sliderSnapshots = []
+  const recordSliderState = async step => {
+    const state = await connection.evaluate(`(() => {
+      const slider = document.querySelector('[role="slider"][aria-label="图片宽度百分比"]');
+      const menu = document.querySelector('[role="menu"][aria-label="图片操作"]');
+      const active = document.activeElement, rect = menu?.getBoundingClientRect();
+      return { value: slider?.value ?? null, ariaValue: slider?.getAttribute('aria-valuenow') ?? null,
+        output: slider?.closest('.editor-object-slider')?.querySelector('output')?.innerText ?? null,
+        active: active && { tag: active.tagName, type: active.type || null, role: active.getAttribute('role'),
+          label: active.getAttribute('aria-label'), className: String(active.className) },
+        imageAttrs: Array.from(document.querySelectorAll('.ProseMirror img')).map(img => ({ width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align') })),
+        menu: rect && { visible: Boolean(menu.getClientRects().length), x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+          scrollHeight: menu.scrollHeight, clientHeight: menu.clientHeight, scrollTop: menu.scrollTop } };
+    })()`)
+    sliderSnapshots.push({ step, ...state })
+  }
+  await dispatchRealInput(slider, { scrollIntoView: false })
+  await recordSliderState('mouse click')
+  await pressKey('Home', 36)
+  await recordSliderState('Home')
+  await pressKey('ArrowRight', 39)
+  await recordSliderState('ArrowRight 1')
+  await pressKey('ArrowRight', 39)
+  await recordSliderState('ArrowRight 2')
+  await pressKey('ArrowRight', 39)
+  await recordSliderState('ArrowRight 3')
+  try {
+    await waitUntil('real slider keyboard input to set custom width to 40 percent', () => connection.evaluate(
+      `document.querySelectorAll('.ProseMirror img')[1]?.getAttribute('data-image-width') === '40'`,
+    ))
+  } catch (error) {
+    throw new Error(`${error.message}\nImage slider evidence: ${JSON.stringify(sliderSnapshots)}`)
+  }
+  await saveRepairScreenshot('image-context-menu-custom-width.png')
+  const editorScrollBefore = await connection.evaluate(`(() => {
+    const scroll = document.querySelector('.editor-scroll'), rect = scroll.getBoundingClientRect();
+    return { top: scroll.scrollTop, x: rect.left + 12, y: rect.top + rect.height / 2 };
+  })()`)
+  await connection.send('Input.dispatchMouseEvent', {
+    type: 'mouseWheel', x: editorScrollBefore.x, y: editorScrollBefore.y,
+    deltaX: 0, deltaY: editorScrollBefore.top > 20 ? -100 : 100,
+  })
+  await waitUntil('user wheel input to scroll the document and close the image menu', () => connection.evaluate(
+    `document.querySelector('.editor-scroll').scrollTop !== ${editorScrollBefore.top} && !document.querySelector('[role="menu"][aria-label="图片操作"]')`,
+  ))
+  assert.equal((await readImages())[1].width, '40', 'scrolling must not alter the image width')
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '自定义宽度…')
+  await waitUntil('custom width slider to reopen for Escape', () => connection.evaluate(
+    `document.querySelector('[role="slider"][aria-label="图片宽度百分比"]')?.value === '40'`,
+  ))
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('custom width Escape to preserve the selected editor image', () => connection.evaluate(
+    `document.activeElement?.classList.contains('ProseMirror-focused') && document.querySelectorAll('.ProseMirror img')[1]?.classList.contains('ProseMirror-selectednode')`,
+  ))
+
+  const handle = await waitUntil('image corner resize handle remains available', () => connection.evaluate(`(() => { const box = document.querySelector('.image-resize-handle')?.getBoundingClientRect(); return box && { x: box.x + box.width / 2, y: box.y + box.height / 2 } })()`))
   await connection.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: handle.x, y: handle.y, button: 'left', clickCount: 1 })
   await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: handle.x + 40, y: handle.y, button: 'left', buttons: 1 })
   await connection.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: handle.x + 40, y: handle.y, button: 'left', clickCount: 1 })
-  await waitUntil('drag changes image width', () => connection.evaluate(`Number(document.querySelector('.ProseMirror img')?.getAttribute('data-image-width')) > 50`))
-  await connection.evaluate(`document.querySelector('[aria-label="图片宽度 75%"]')?.click()`)
-  await waitUntil('preset overrides drag width', () => connection.evaluate(`document.querySelector('.ProseMirror img')?.getAttribute('data-image-width') === '75'`))
+  await waitUntil('drag changes selected image width', () => connection.evaluate(`Number(document.querySelectorAll('.ProseMirror img')[1]?.getAttribute('data-image-width')) > 40`))
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await clickContextMenuItem('图片操作', '宽度75%')
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('preset overrides the selected image drag width', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img')[1]?.getAttribute('data-image-width') === '75'`))
+
+  await setTestViewport(390, 844, true)
+  await dispatchRealInput(firstImage, { touch: true })
+  await waitForSelectedImage(firstImage, 'one mobile tap to select the first image')
+  await saveRepairScreenshot('image-mobile-selected-before-more.png')
+  const mobileMore = await waitForStableObjectMenuButton('更多图片操作', firstImage)
+  assert.equal(mobileMore.hitLabel, '更多图片操作')
+  await assertNoPersistentObjectToolbars()
+  await saveRepairScreenshot('image-more-button-mobile.png')
+  const mobileMenu = await openObjectContextMenu(firstImage, { object: 'image', touch: true })
+  assert.ok(mobileMenu.geometry.visible, 'the image corner touch button should open its menu')
+  assertContextMenuFitsViewport(mobileMenu.geometry, 'mobile image context')
+  await saveRepairScreenshot('image-context-menu-mobile.png')
+  await clickContextMenuItem('图片操作', '宽度75%', { touch: true })
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('touch width command to change the first image while retaining the second', async () => {
+    const images = await readImages()
+    return images[0].width === '75' && images[1].width === '75' && images[1].align === 'left'
+  })
+  await openObjectContextMenu(firstImage, { object: 'image', touch: true })
+  await clickContextMenuItem('图片操作', '宽度50%', { touch: true })
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('touch width command to restore only the first image', async () => {
+    const images = await readImages()
+    return images[0].width === '50' && images[1].width === '75'
+  })
+  await openObjectContextMenu(firstImage, { object: 'image', touch: true })
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
+  await setTestViewport(1195, 751, false)
+
   await clickSave()
-  await waitForDiskMarker(fileName, '<!-- se-image:width=75;align=center -->')
+  await waitForDiskMarker(fileName, '<!-- se-image:width=50;align=center -->')
+  await waitForDiskMarker(fileName, '<!-- se-image:width=75;align=left -->')
   await waitUntil('image save acknowledgment', () => connection.evaluate(`document.querySelector('.save-status')?.innerText.includes('已保存')`))
   const saved = await readFile(path.join(workspace, fileName), 'utf8')
-  assert.match(saved, /!\[diagram\]\(assets\/presentation\.png\)<!-- se-image:width=75;align=center -->/)
+  assert.match(saved, /!\[diagram\]\(assets\/presentation\.png\)<!-- se-image:width=50;align=center -->/)
+  assert.match(saved, /!\[second\]\(assets\/presentation\.png\)<!-- se-image:width=75;align=left -->/)
+  for (const text of ['Before the first image remains intact.', 'Between images remains intact.', 'After the second image remains intact.']) assert.ok(saved.includes(text))
   await setupPage()
   await openFile(fileName, 'Image presentation fixture')
-  await waitUntil('reopened image node', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
-  const reopened = await connection.evaluate(`(() => { const img = document.querySelector('.ProseMirror img'); return img && { width: img.getAttribute('data-image-width'), align: img.getAttribute('data-image-align') } })()`)
-  assert.deepEqual(reopened, { width: '75', align: 'center' }, `disk=${JSON.stringify(await readFile(path.join(workspace, fileName), 'utf8'))}`)
+  await waitUntil('both image nodes to reopen', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img').length === 2`))
+  assert.deepEqual((await readImages()).map(({ width, align }) => ({ width, align })), [
+    { width: '50', align: 'center' }, { width: '75', align: 'left' },
+  ], `disk=${JSON.stringify(await readFile(path.join(workspace, fileName), 'utf8'))}`)
+  await dispatchRealInput(firstImage)
+  await waitForSelectedImage(firstImage)
+  await openObjectContextMenu(secondImage, { object: 'image' })
+  await waitForSelectedImage(secondImage, 'right-click should select the second image before deletion')
+  await clickContextMenuItem('图片操作', '删除图片')
+  await waitForContextMenuClosed('图片操作')
+  await waitUntil('delete only the context-targeted second image', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img').length === 1`))
+  await waitUntil('deleted image action to return focus to a valid editor caret', () => connection.evaluate(`(() => {
+    const anchor = window.getSelection()?.anchorNode;
+    const element = anchor?.nodeType === Node.ELEMENT_NODE ? anchor : anchor?.parentElement;
+    return Boolean(document.activeElement?.classList.contains('ProseMirror-focused') && element?.closest('.ProseMirror'));
+  })()`))
+  assert.deepEqual((await readImages()).map(({ width, align }) => ({ width, align })), [{ width: '50', align: 'center' }])
+  await clickSave()
+  await waitUntil('saved Markdown to contain only the first image after target deletion', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    return content.includes('<!-- se-image:width=50;align=center -->') && !content.includes('![second]') ? content : null
+  })
+  const afterDelete = await readFile(path.join(workspace, fileName), 'utf8')
+  assert.match(afterDelete, /!\[diagram\]\(assets\/presentation\.png\)<!-- se-image:width=50;align=center -->/)
+  assert.doesNotMatch(afterDelete, /!\[second\]/)
+  for (const text of ['Before the first image remains intact.', 'Between images remains intact.', 'After the second image remains intact.']) assert.ok(afterDelete.includes(text))
+  await setupPage()
+  await openFile(fileName, 'Image presentation fixture')
+  await waitUntil('only the untouched first image to remain after reopening the deletion', () => connection.evaluate(`document.querySelectorAll('.ProseMirror img').length === 1`))
+  assert.deepEqual((await readImages()).map(({ width, align }) => ({ width, align })), [{ width: '50', align: 'center' }])
 })
 
 test('explicit left alignment survives rich table editing, save, and reopen', async () => {
@@ -1348,20 +1937,8 @@ test('explicit left alignment survives rich table editing, save, and reopen', as
   assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening an aligned table must not rewrite source')
   assert.equal(workspacePutCount(), initialPuts, 'opening an aligned table must not send a workspace PUT')
 
-  const selectedCell = await connection.evaluate(`(() => {
-    const editor = document.querySelector('.ProseMirror');
-    const cell = editor?.querySelector('table td');
-    if (!editor || !cell) return false;
-    editor.focus();
-    const range = document.createRange();
-    range.selectNodeContents(cell);
-    range.collapse(false);
-    const selection = window.getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    return true;
-  })()`)
-  assert.equal(selectedCell, true, 'the edit must target a body cell in the aligned table')
+  const selectedCell = await dispatchRealInput(`document.querySelector('.ProseMirror table td')`)
+  assert.deepEqual(selectedCell.targetCell, [0, 1, 0], 'the real click must target a body cell in the aligned table')
   await connection.send('Input.insertText', { text: ' 已编辑' })
   await clickSave()
   const saved = await waitForDiskMarker(fileName, '已编辑')
@@ -1409,16 +1986,347 @@ test('table picker chooses dimensions and contextual tools add rows and columns'
   await waitUntil('table dimensions grid', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="4 行 5 列"]'))`))
   await connection.evaluate(`document.querySelector('[aria-label="4 行 5 列"]')?.click()`)
   await waitUntil('4 by 5 table', () => connection.evaluate(`document.querySelectorAll('.ProseMirror table tr').length === 4 && document.querySelectorAll('.ProseMirror table tr:first-child > *').length === 5`))
-  await connection.evaluate(`document.querySelector('.ProseMirror table tr:nth-child(2) td')?.click()`)
-  await waitUntil('table contextual toolbar', () => connection.evaluate(`Boolean(document.querySelector('[aria-label="下方增行"]'))`))
-  await connection.evaluate(`document.querySelector('[aria-label="下方增行"]')?.click()`)
-  await connection.evaluate(`document.querySelector('[aria-label="右侧增列"]')?.click()`)
+  const cell = `document.querySelector('.ProseMirror table tr:nth-child(2) td')`
+  const keyboardMenu = await openObjectContextMenu(cell, { keyboard: true })
+  assert.ok(keyboardMenu.geometry.visible, 'Shift+F10 should open the selected table context menu')
+  assert.equal(await waitForFocusedContextMenuItem('表格操作'), '上方增行',
+    'Shift+F10 should focus the first table command')
+  const firstTableCommand = await connection.evaluate(`document.activeElement.getAttribute('aria-label')`)
+  await pressKey('ArrowDown', 40)
+  await waitUntil('ArrowDown to move through table context commands', () => connection.evaluate(
+    `document.querySelector('[role="menu"][aria-label="表格操作"]')?.contains(document.activeElement) && document.activeElement.getAttribute('aria-label') !== ${JSON.stringify(firstTableCommand)}`,
+  ))
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('表格操作')
+  await waitUntil('Escape should return focus to the current table selection', () => connection.evaluate(
+    `document.activeElement?.classList.contains('ProseMirror-focused')`,
+  ))
+  assert.deepEqual((await readDOMCellSelection()).cell, [0, 1, 0], 'Escape should preserve the clicked table cell selection')
+  await clickTableAction('下方增行', cell, { shape: { table: 0, rows: 5, columns: 5, description: 'context menu row insertion' } })
+  await clickTableAction('右侧增列', cell, { shape: { table: 0, rows: 5, columns: 6, description: 'context menu column insertion' } })
   await waitUntil('expanded table', () => connection.evaluate(`document.querySelectorAll('.ProseMirror table tr').length === 5 && document.querySelectorAll('.ProseMirror table tr:first-child > *').length === 6`))
+  assert.equal(await connection.evaluate(`!document.querySelector('.table-context-tools')`), true, 'table actions should not remain as a toolbar')
   await clickSave()
   await waitUntil('table Markdown persisted', async () => {
     const content = await readFile(path.join(workspace, fileName), 'utf8')
     return content.split('\n').filter(line => line.startsWith('|')).length === 6
   })
+})
+
+test('scrolled desktop table controls edit the clicked Markdown table and preserve its neighbor after deletion', async () => {
+  const fileName = 'scrolled-desktop-table-controls.md'
+  await writeFile(path.join(workspace, fileName), makeLongTableControlsSource())
+  await setupPage()
+  await openFile(fileName, 'Long table controls fixture')
+  await waitUntil('both Markdown tables to open in the rich editor', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror table').length === 2 && !document.querySelector('.source-fidelity-warning')`,
+  ))
+
+  const lowerFirstCell = `Array.from(document.querySelectorAll('.ProseMirror table'))[1]?.rows[1]?.cells[0]`
+  const lowerSecondCell = `Array.from(document.querySelectorAll('.ProseMirror table'))[1]?.rows[1]?.cells[1]`
+  const firstBodyRowCell = (row, column = 1) => `Array.from(document.querySelectorAll('.ProseMirror table'))[1]?.rows[${row}]?.cells[${column - 1}]`
+
+  const beforeTables = await readRichTableState()
+  assert.equal(beforeTables.length, 2)
+  assert.deepEqual(beforeTables[0].rows, [
+    ['UPPER-KEY', 'UPPER-VALUE'],
+    ['UPPER-ROW-1', 'UPPER-CELL-1'],
+    ['UPPER-ROW-2', 'UPPER-CELL-2'],
+  ], 'the first existing table should start with its exact source content')
+  assert.deepEqual(beforeTables[1].rows, [
+    ['LOWER-KEY', 'LOWER-VALUE'],
+    ['LOWER-ROW-1', 'LOWER-CELL-1'],
+    ['LOWER-ROW-2', 'LOWER-CELL-2'],
+  ], 'the lower existing table should start with its exact source content')
+
+  const initialPuts = workspacePutCount()
+  await dispatchRealInput(`Array.from(document.querySelectorAll('.ProseMirror table'))[0]?.rows[1]?.cells[0]`)
+  const lowerCellClick = await dispatchRealInput(lowerFirstCell, { button: 'right' })
+  assert.ok(lowerCellClick.y > 100, `the lower table should be selected after scrolling into the long document: ${JSON.stringify(lowerCellClick)}`)
+  const lowerMenu = await waitForStableContextMenu('表格操作')
+  assert.ok(lowerMenu.visible, `right-click should open the table menu for the lower table: ${JSON.stringify(lowerMenu)}`)
+  assert.deepEqual((await readDOMCellSelection()).cell, [1, 1, 0], 'right-click should move the editor selection into the clicked lower-table cell')
+  assert.equal(await waitForFocusedContextMenuItem('表格操作'), '上方增行', 'right-click should focus the first table command')
+  assertContextMenuFitsViewport(lowerMenu, 'desktop table context')
+  assert.equal(await connection.evaluate(`!document.querySelector('.table-context-tools')`), true, 'the old always-visible table toolbar must be absent')
+  await saveRepairScreenshot('table-context-menu-desktop.png')
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('表格操作')
+  await waitUntil('Escape to restore editor focus on the right-clicked lower table cell', () => connection.evaluate(
+    `document.activeElement?.classList.contains('ProseMirror-focused')`,
+  ))
+  assert.deepEqual((await readDOMCellSelection()).cell, [1, 1, 0], 'Escape should preserve the right-clicked lower-table cell')
+
+  await clickTableAction('下方增行', lowerFirstCell, { shape: { table: 1, rows: 4, columns: 2, description: 'mouse click to add a row below the selected lower-table cell' } })
+  assert.deepEqual((await readRichTableState())[1].rows, [
+    ['LOWER-KEY', 'LOWER-VALUE'],
+    ['LOWER-ROW-1', 'LOWER-CELL-1'],
+    ['', ''],
+    ['LOWER-ROW-2', 'LOWER-CELL-2'],
+  ], 'the inserted lower row should follow the cell the user selected')
+  await clickTableAction('上方增行', lowerFirstCell, { shape: { table: 1, rows: 5, columns: 2, description: 'mouse click to add a row above the selected lower-table cell' } })
+  assert.deepEqual((await readRichTableState())[1].rows, [
+    ['LOWER-KEY', 'LOWER-VALUE'],
+    ['', ''],
+    ['LOWER-ROW-1', 'LOWER-CELL-1'],
+    ['', ''],
+    ['LOWER-ROW-2', 'LOWER-CELL-2'],
+  ], 'the second inserted row should precede the selected row without reordering its neighbors')
+  await clickTableAction('删除行', firstBodyRowCell(1), { shape: { table: 1, rows: 4, columns: 2, description: 'mouse click to delete the newly inserted blank row above' } })
+  assert.deepEqual((await readRichTableState())[1].rows, [
+    ['LOWER-KEY', 'LOWER-VALUE'],
+    ['LOWER-ROW-1', 'LOWER-CELL-1'],
+    ['', ''],
+    ['LOWER-ROW-2', 'LOWER-CELL-2'],
+  ], 'deleting the selected blank row should retain the original row order')
+  await clickTableAction('删除行', firstBodyRowCell(2), { shape: { table: 1, rows: 3, columns: 2, description: 'mouse click to delete the newly inserted blank row below' } })
+
+  await clickTableAction('左侧增列', lowerFirstCell, { shape: { table: 1, rows: 3, columns: 3, description: 'mouse click to add a column before the selected lower-table cell' } })
+  await clickTableAction('右侧增列', lowerSecondCell, { shape: { table: 1, rows: 3, columns: 4, description: 'mouse click to add a column after the selected lower-table cell' } })
+  await clickTableAction('删除列', firstBodyRowCell(1, 1), { shape: { table: 1, rows: 3, columns: 3, description: 'mouse click to delete the newly inserted blank column on the left' } })
+  await clickTableAction('删除列', firstBodyRowCell(1, 2), { shape: { table: 1, rows: 3, columns: 2, description: 'mouse click to delete the newly inserted blank column on the right' } })
+
+  const afterRoundTrip = await readRichTableState()
+  assert.deepEqual(afterRoundTrip[0].rows, beforeTables[0].rows, 'row and column actions on the lower table must not change the first table')
+  assert.deepEqual(afterRoundTrip[1].rows, beforeTables[1].rows, 'adding and deleting blank rows and columns should retain the selected table content')
+  await clickTableAction('删除表格', lowerFirstCell)
+  await waitUntil('mouse click to delete only the selected lower Markdown table', async () => (await readRichTableState()).length === 1)
+
+  const afterDeleteText = await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`)
+  for (const text of ['Adjacent text before the first table', 'Between-table text remains intact.', 'Tail insertion point remains intact.', 'UPPER-ROW-1', 'UPPER-ROW-2']) {
+    assert.ok(afterDeleteText.includes(text), `deleting the lower table must preserve neighboring content “${text}”`)
+  }
+  assert.equal(afterDeleteText.includes('LOWER-ROW-1'), false, 'the selected lower table should be the one removed')
+  assert.deepEqual((await readRichTableState())[0].rows, beforeTables[0].rows, 'whole-table deletion must leave the first Markdown table unchanged')
+
+  await waitUntil('autosave to write the desktop table deletion', () => workspacePutCount() > initialPuts)
+  const saved = await waitUntil('autosaved Markdown to contain only the untouched upper table', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    const tables = marked.lexer(content).filter(token => token.type === 'table')
+    return tables.length === 1 && tables[0].header[0].text === 'UPPER-KEY' && !content.includes('LOWER-ROW-1') ? content : null
+  })
+  for (const text of ['Adjacent text before the first table', 'Between-table text remains intact.', 'Tail insertion point remains intact.']) {
+    assert.ok(saved.includes(text), `autosaved Markdown must preserve neighboring text “${text}”`)
+  }
+
+  await setupPage()
+  await openFile(fileName, 'Long table controls fixture')
+  const reopenedTables = await readRichTableState()
+  assert.equal(reopenedTables.length, 1, 'reopening after autosave should retain only the unmodified first table')
+  assert.deepEqual(reopenedTables[0].rows, beforeTables[0].rows)
+  const reopenedText = await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`)
+  assert.ok(reopenedText.includes('Between-table text remains intact.'))
+  assert.ok(reopenedText.includes('Tail insertion point remains intact.'))
+})
+
+test('mobile touch edits an existing table and an inserted table, then autosaves the exact result', async () => {
+  const fileName = 'mobile-table-controls.md'
+  const source = makeLongTableControlsSource()
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Long table controls fixture')
+  await setTestViewport(390, 844, true)
+  await waitUntil('mobile toolbar to become visible', () => connection.evaluate(`Boolean(document.querySelector('.mobile-toolbar') && getComputedStyle(document.querySelector('.mobile-toolbar')).display !== 'none')`))
+  await waitUntil('both source tables to remain in the mobile rich editor', () => connection.evaluate(`document.querySelectorAll('.ProseMirror table').length === 2`))
+
+  const lowerFirstCell = `Array.from(document.querySelectorAll('.ProseMirror table'))[1]?.rows[1]?.cells[0]`
+  const lowerBlankCell = `Array.from(document.querySelectorAll('.ProseMirror table'))[1]?.rows[1]?.cells[0]`
+  const initialTables = await readRichTableState()
+  assert.deepEqual(initialTables[0].rows, [
+    ['UPPER-KEY', 'UPPER-VALUE'],
+    ['UPPER-ROW-1', 'UPPER-CELL-1'],
+    ['UPPER-ROW-2', 'UPPER-CELL-2'],
+  ])
+  assert.deepEqual(initialTables[1].rows, [
+    ['LOWER-KEY', 'LOWER-VALUE'],
+    ['LOWER-ROW-1', 'LOWER-CELL-1'],
+    ['LOWER-ROW-2', 'LOWER-CELL-2'],
+  ])
+
+  const initialPuts = workspacePutCount()
+  const lowerCellTap = await dispatchRealInput(lowerFirstCell, { touch: true })
+  assert.ok(lowerCellTap.y > 100, `the mobile lower table should be reached by scrolling: ${JSON.stringify(lowerCellTap)}`)
+  await saveRepairScreenshot('table-mobile-selected-before-more.png')
+  const mobileMore = await waitForStableObjectMenuButton('更多表格操作', `(${lowerFirstCell})?.closest('table')`)
+  assert.equal(mobileMore.hitLabel, '更多表格操作')
+  assert.equal(await connection.evaluate(`!document.querySelector('.table-context-tools')`), true, 'the mobile table toolbar should be absent')
+  await saveRepairScreenshot('table-more-button-mobile.png')
+  const mobileMenu = await openObjectContextMenu(lowerFirstCell, { touch: true })
+  assert.ok(mobileMenu.geometry.visible, 'the 44px mobile table entry should open its context menu')
+  assertContextMenuFitsViewport(mobileMenu.geometry, 'mobile table context')
+  await saveRepairScreenshot('table-context-menu-mobile.png')
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('表格操作')
+  await connection.evaluate(`(() => { const scroll = document.querySelector('.editor-scroll'); if (scroll) scroll.scrollTop = 0 })()`)
+  const offscreenTableMore = await waitUntil('table more button to hide when its selected table leaves the editor viewport', () => connection.evaluate(`(() => {
+    const scroll = document.querySelector('.editor-scroll'), button = Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === '更多表格操作');
+    const frame = scroll?.getBoundingClientRect(), rect = button?.getBoundingClientRect(), style = button && getComputedStyle(button);
+    const visible = Boolean(button?.getClientRects().length && rect && style.visibility === 'visible' && style.display !== 'none'
+      && frame && rect.bottom > frame.top && rect.top < frame.bottom && rect.right > frame.left && rect.left < frame.right);
+    return scroll?.scrollTop === 0 && !visible ? { scrollTop: scroll.scrollTop, button: rect && { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, visible } : null;
+  })()`))
+  assert.equal(offscreenTableMore.visible, false)
+
+  await clickTableAction('上方增行', lowerFirstCell, { touch: true, shape: { table: 1, rows: 4, columns: 2, description: 'touch to add a row above the lower existing table cell' } })
+  await clickTableAction('删除行', lowerBlankCell, { touch: true, shape: { table: 1, rows: 3, columns: 2, description: 'touch to remove the newly inserted blank row' } })
+  await clickTableAction('左侧增列', lowerFirstCell, { touch: true, shape: { table: 1, rows: 3, columns: 3, description: 'touch to add a column before the lower existing table cell' } })
+  await clickTableAction('删除列', lowerBlankCell, { touch: true, shape: { table: 1, rows: 3, columns: 2, description: 'touch to remove the newly inserted blank column' } })
+  assert.deepEqual((await readRichTableState())[0].rows, initialTables[0].rows, 'mobile edits to the lower table must not change the upper existing table')
+  assert.deepEqual((await readRichTableState())[1].rows, initialTables[1].rows, 'mobile add/delete actions should preserve lower-table cells')
+
+  const tailParagraph = `Array.from(document.querySelectorAll('.ProseMirror p')).find(paragraph => paragraph.innerText.includes('Tail insertion point remains intact.'))`
+  await dispatchRealInput(tailParagraph, { touch: true })
+  // Move past the last paragraph through actual keyboard input, so insertion
+  // cannot split the neighboring text merely because the tap landed mid-line.
+  for (let step = 0; step < 'Tail insertion point remains intact.'.length; step += 1) {
+    await pressKey('ArrowRight', 39)
+  }
+  const mobileInsertButton = `document.querySelector('.mobile-toolbar button[aria-label="插入表格"]')`
+  await dispatchRealInput(mobileInsertButton, { touch: true })
+  const settledPicker = await waitForStablePickerTarget('3 行 3 列')
+  assertPickerFitsViewport(settledPicker, '390px mobile')
+  await saveRepairScreenshot('table-picker-mobile-open.png')
+  const sizeGridTap = await dispatchRealInput(`document.querySelector('.table-size-grid button[aria-label="3 行 3 列"]')`, { touch: true, scrollIntoView: false })
+  assert.equal(sizeGridTap.hitLabel, '3 行 3 列', `the picker must receive the real touch on its 3x3 cell: ${JSON.stringify(sizeGridTap)}`)
+  await waitForTableShape(2, 3, 3, 'real 3x3 touch to insert the new table after the two Markdown tables')
+
+  await setTestViewport(320, 844, true)
+  await dispatchRealInput(mobileInsertButton, { touch: true })
+  const narrowPicker = await waitForStablePickerTarget('3 行 3 列')
+  assertPickerFitsViewport(narrowPicker, '320px mobile')
+  const gridStart = await connection.evaluate(`(() => {
+    const grid = document.querySelector('.table-size-grid'), rect = grid?.getBoundingClientRect();
+    return grid && rect ? { x: rect.right - 12, y: rect.top + rect.height / 2, width: rect.width,
+      clientWidth: grid.clientWidth, scrollWidth: grid.scrollWidth, overflowX: getComputedStyle(grid).overflowX } : null;
+  })()`)
+  assert.ok(gridStart && gridStart.scrollWidth > gridStart.clientWidth && ['auto', 'scroll'].includes(gridStart.overflowX),
+    `320px picker grid should expose horizontal scrolling: ${JSON.stringify(gridStart)}`)
+  await connection.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ id: 1, x: gridStart.x, y: gridStart.y, radiusX: 1, radiusY: 1, force: 1 }] })
+  await new Promise(resolve => setTimeout(resolve, 45))
+  await connection.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ id: 1, x: gridStart.x - 110, y: gridStart.y, radiusX: 1, radiusY: 1, force: 1 }] })
+  await new Promise(resolve => setTimeout(resolve, 45))
+  await connection.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  const scrolledGrid = await waitUntil('real touch swipe to scroll the narrow table-size grid', () => connection.evaluate(`(() => {
+    const grid = document.querySelector('.table-size-grid');
+    if (!grid || grid.scrollLeft <= 0) return null;
+    const button = Array.from(grid.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === '1 行 8 列');
+    const rect = button?.getBoundingClientRect(), gridRect = grid.getBoundingClientRect();
+    const hit = rect && document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    const hitLabel = hit?.getAttribute?.('aria-label') || hit?.closest?.('[aria-label]')?.getAttribute('aria-label') || null;
+    return button && rect && { scrollLeft: grid.scrollLeft, grid: { left: gridRect.left, right: gridRect.right },
+      target: { left: rect.left, right: rect.right }, hitLabel, overflowX: getComputedStyle(grid).overflowX };
+  })()`))
+  assert.ok(scrolledGrid.scrollLeft > 0, `the real 320px swipe must move the picker grid: ${JSON.stringify(scrolledGrid)}`)
+  assert.equal(scrolledGrid.hitLabel, '1 行 8 列', `the final dimension cell must be touch-reachable after scrolling: ${JSON.stringify(scrolledGrid)}`)
+  assert.ok(scrolledGrid.target.left >= scrolledGrid.grid.left && scrolledGrid.target.right <= scrolledGrid.grid.right,
+    `the last dimension cell must be inside the scrollport after the swipe: ${JSON.stringify(scrolledGrid)}`)
+  assert.equal((await readRichTableState()).length, 3, 'swiping the picker must not select a dimension or insert another table')
+  await pressKey('Escape', 27)
+  await waitUntil('Escape to close the 320px table picker', () => connection.evaluate(`(() => {
+    const panel = document.querySelector('.table-insert-panel'), rect = panel?.getBoundingClientRect();
+    return !panel || !rect || rect.width === 0 || rect.height === 0 || getComputedStyle(panel).visibility === 'hidden' || getComputedStyle(panel).display === 'none';
+  })()`))
+  await setTestViewport(390, 844, true)
+
+  const insertedFirstCell = `Array.from(document.querySelectorAll('.ProseMirror table'))[2]?.rows[1]?.cells[0]`
+  await dispatchRealInput(insertedFirstCell, { touch: true })
+  await connection.send('Input.insertText', { text: 'MOBILE-INSERTED-TABLE-CELL' })
+  await waitUntil('keyboard text to appear in the newly inserted table cell', async () => (await readRichTableState())[2]?.rows[1]?.[0]?.includes('MOBILE-INSERTED-TABLE-CELL'))
+  const mobileInsertedMore = await waitForStableObjectMenuButton('更多表格操作', `(${insertedFirstCell})?.closest('table')`)
+  assert.equal(mobileInsertedMore.hitLabel, '更多表格操作')
+  assert.equal(await connection.evaluate(`!document.querySelector('.table-context-tools')`), true, 'inserted-table controls should use the object menu')
+  await saveRepairScreenshot('table-controls-mobile-inserted-scrolled.png')
+
+  await clickTableAction('上方增行', insertedFirstCell, { touch: true, shape: { table: 2, rows: 4, columns: 3, description: 'touch to add a row above the inserted table cell' } })
+  const insertedBlankRow = `Array.from(document.querySelectorAll('.ProseMirror table'))[2]?.rows[1]?.cells[0]`
+  await clickTableAction('删除行', insertedBlankRow, { touch: true, shape: { table: 2, rows: 3, columns: 3, description: 'touch to delete the newly inserted blank row' } })
+  await clickTableAction('下方增行', insertedFirstCell, { touch: true, shape: { table: 2, rows: 4, columns: 3, description: 'touch to add a retained row below the inserted table cell' } })
+
+  await clickTableAction('左侧增列', insertedFirstCell, { touch: true, shape: { table: 2, rows: 4, columns: 4, description: 'touch to add a column before the inserted table cell' } })
+  const insertedBlankColumn = `Array.from(document.querySelectorAll('.ProseMirror table'))[2]?.rows[1]?.cells[0]`
+  await clickTableAction('删除列', insertedBlankColumn, { touch: true, shape: { table: 2, rows: 4, columns: 3, description: 'touch to delete the newly inserted blank column' } })
+  await clickTableAction('右侧增列', insertedFirstCell, { touch: true, shape: { table: 2, rows: 4, columns: 4, description: 'touch to add a retained column after the inserted table cell' } })
+
+  const editedTables = await readRichTableState()
+  assert.deepEqual(editedTables[0].rows, initialTables[0].rows, 'mobile commands on the inserted table must not alter the first Markdown table')
+  assert.deepEqual(editedTables[1].rows, initialTables[1].rows, 'mobile commands on the inserted table must not alter the second Markdown table')
+  assert.ok(editedTables[2].rows[1][0].includes('MOBILE-INSERTED-TABLE-CELL'))
+  assert.ok((await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`)).includes('Tail insertion point remains intact.'))
+
+  await waitUntil('autosave PUT after mobile table editing', () => workspacePutCount() > initialPuts)
+  const saved = await waitUntil('autosaved Markdown to preserve all three tables and the inserted cell', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    const tables = marked.lexer(content).filter(token => token.type === 'table')
+    return tables.length === 3 && tables[2].header.length === 4 && tables[2].rows.length === 3
+      && content.includes('MOBILE-INSERTED-TABLE-CELL') ? content : null
+  })
+  const savedTables = marked.lexer(saved).filter(token => token.type === 'table')
+  assert.deepEqual(savedTables[0].header.map(cell => cell.text), ['UPPER-KEY', 'UPPER-VALUE'])
+  assert.deepEqual(savedTables[0].rows[0].map(cell => cell.text), ['UPPER-ROW-1', 'UPPER-CELL-1'])
+  assert.deepEqual(savedTables[1].header.map(cell => cell.text), ['LOWER-KEY', 'LOWER-VALUE'])
+  assert.deepEqual(savedTables[1].rows[0].map(cell => cell.text), ['LOWER-ROW-1', 'LOWER-CELL-1'])
+  assert.equal(savedTables[2].header.length, 4, 'the mobile-added column should persist in the new table')
+  assert.equal(savedTables[2].rows.length, 3, 'the mobile-added row should persist in the new table')
+  assert.ok(savedTables[2].rows[0][0].text.includes('MOBILE-INSERTED-TABLE-CELL'))
+
+  await setupPage()
+  await openFile(fileName, 'Long table controls fixture')
+  await setTestViewport(390, 844, true)
+  await waitUntil('mobile toolbar to return after reopening', () => connection.evaluate(`Boolean(document.querySelector('.mobile-toolbar') && getComputedStyle(document.querySelector('.mobile-toolbar')).display !== 'none')`))
+  const reopenedTables = await readRichTableState()
+  assert.equal(reopenedTables.length, 3, 'reopening after autosave should retain both Markdown tables and the inserted table')
+  assert.deepEqual(reopenedTables[0].rows, initialTables[0].rows)
+  assert.deepEqual(reopenedTables[1].rows, initialTables[1].rows)
+  assert.equal(reopenedTables[2].rows.length, 4)
+  assert.ok(reopenedTables[2].rows.every(row => row.length === 4))
+  assert.ok(reopenedTables[2].rows[1][0].includes('MOBILE-INSERTED-TABLE-CELL'))
+  const reopenedText = await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`)
+  assert.ok(reopenedText.includes('Adjacent text before the first table remains intact.'))
+  assert.ok(reopenedText.includes('Between-table text remains intact.'))
+  assert.ok(reopenedText.includes('Tail insertion point remains intact.'))
+})
+
+test('table and image context menus close when changing documents without writing either file', async () => {
+  const sourceFile = 'context-menu-source.md'
+  const targetFile = 'context-menu-target.md'
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  const source = '# Context source fixture\n\nSource stays unchanged.\n\n| SOURCE-KEY | SOURCE-VALUE |\n| --- | --- |\n| SOURCE-ROW | SOURCE-CELL |\n\n![source](assets/context-menu.png)<!-- se-image:width=50;align=left -->\n'
+  const target = '# Context target fixture\n\nTarget stays unchanged.\n\n| TARGET-KEY | TARGET-VALUE |\n| --- | --- |\n| TARGET-ROW | TARGET-CELL |\n\n![target](assets/context-menu.png)<!-- se-image:width=50;align=left -->\n'
+  await mkdir(path.join(workspace, 'assets'), { recursive: true })
+  await writeFile(path.join(workspace, 'assets', 'context-menu.png'), imageBytes)
+  await writeFile(path.join(workspace, sourceFile), source)
+  await writeFile(path.join(workspace, targetFile), target)
+  await setupPage()
+  await openFile(sourceFile, 'Context source fixture')
+  await waitUntil('source document table and image', () => connection.evaluate(
+    `document.querySelectorAll('.ProseMirror table').length === 1 && document.querySelectorAll('.ProseMirror img').length === 1`,
+  ))
+  const initialPuts = workspacePutCount()
+
+  const initialTableMenu = await openObjectContextMenu(`document.querySelector('.ProseMirror table tbody td')`)
+  assert.ok(initialTableMenu.geometry.visible, 'the first interaction after load should right-click the table and open its menu')
+  assert.equal(await waitForFocusedContextMenuItem('表格操作'), '上方增行')
+  await clickFileFromTree(targetFile, 'Context target fixture')
+  await waitForContextMenuClosed('表格操作')
+  await assertNoPersistentObjectToolbars()
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('Target stays unchanged.')`), true)
+  assert.equal(workspacePutCount(), initialPuts, 'opening and dismissing a table menu must not write either document')
+
+  const targetImage = `document.querySelector('.ProseMirror img')`
+  await waitUntil('target image to have enough rendered area for a real mouse click', () => connection.evaluate(
+    `document.querySelector('.ProseMirror img')?.getBoundingClientRect().width >= 100`,
+  ))
+  const initialImageMenu = await openObjectContextMenu(targetImage, { object: 'image' })
+  assert.ok(initialImageMenu.geometry.visible, 'the first interaction after file switch should right-click the image and open its menu')
+  assert.equal(await waitForFocusedContextMenuItem('图片操作'), '左对齐')
+  await clickFileFromTree(sourceFile, 'Context source fixture')
+  await waitForContextMenuClosed('图片操作')
+  await assertNoPersistentObjectToolbars()
+  assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('Source stays unchanged.')`), true)
+  assert.equal(workspacePutCount(), initialPuts, 'switching away from an open image menu must not write either document')
+  assert.equal(await readFile(path.join(workspace, sourceFile), 'utf8'), source)
+  assert.equal(await readFile(path.join(workspace, targetFile), 'utf8'), target)
+  assert.deepEqual(await readFile(path.join(workspace, 'assets', 'context-menu.png')), imageBytes)
 })
 
 test('table picker has one roving tab stop and Escape restores focus to its trigger', async () => {
@@ -1556,10 +2464,22 @@ test('interactive visual review of source, table and image controls', { skip: !p
   await openFile('review-image.md', 'Review image')
   await connection.evaluate(`document.querySelector('[aria-label="切换到浅色模式"]')?.click()`)
   await waitUntil('image visible', () => connection.evaluate(`Boolean(document.querySelector('.ProseMirror img'))`))
-  await connection.evaluate(`document.querySelector('.ProseMirror img')?.click()`)
-  await waitUntil('image controls visible', () => connection.evaluate(`Boolean(document.querySelector('.image-context-tools'))`))
-  await screenshot('image-controls-light.png')
-  await connection.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true })
+  const image = `document.querySelector('.ProseMirror img')`
+  await openObjectContextMenu(image, { object: 'image' })
+  await assertNoPersistentObjectToolbars()
+  await screenshot('image-context-menu-light.png')
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
+  await setTestViewport(390, 844, true)
+  await dispatchRealInput(image, { touch: true })
+  await screenshot('image-mobile-selected-before-more.png')
+  const mobileMore = await waitForStableObjectMenuButton('更多图片操作', image)
+  assert.equal(mobileMore.hitLabel, '更多图片操作')
+  await screenshot('image-more-button-mobile.png')
+  await openObjectContextMenu(image, { object: 'image', touch: true })
+  await screenshot('image-context-menu-mobile.png')
+  await pressKey('Escape', 27)
+  await waitForContextMenuClosed('图片操作')
   const positions = await waitUntil('mobile resize handle aligned with image corner', () => connection.evaluate(`(() => {
     const image = document.querySelector('.ProseMirror img')?.getBoundingClientRect();
     const handle = document.querySelector('.image-resize-handle')?.getBoundingClientRect();

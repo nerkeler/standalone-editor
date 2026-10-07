@@ -30,7 +30,7 @@ import { analyzeMarkdownSource } from './markdownDiagnostics.js'
 import { getMarkdownSourceOutline } from './markdownSourceOutline.js'
 import { proposeSafeMarkdownRepair } from './safeMarkdownNormalization.js'
 import { isPermissionDenied, requestErrorMessage } from '../requestErrorMessage'
-import { TableContextTools } from './TableControls'
+import EditorObjectActions from './EditorObjectActions'
 import ImageControls from './ImageControls'
 import { createSearchCoordinator } from '../searchCoordinator'
 import { createUploadedImageReference } from '../markdownImagePaths'
@@ -358,7 +358,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const [markdownRepairError, setMarkdownRepairError] = useState(null)
   const [markdownRepairSaving, setMarkdownRepairSaving] = useState(false)
   const [, setSelectionEpoch] = useState(0)
-  const [editorInteracted, setEditorInteracted] = useState(false)
   const sourceEditorRef = useRef(null)
   const [largeMarkdownView, setLargeMarkdownView] = useState(null)
   const [editorFullscreen, setEditorFullscreen] = useState(false)
@@ -483,10 +482,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const suppressEditorUpdateRef = useRef(false)
   const handleImageUploadRef = useRef(null)
 
-  const markEditorInteracted = useCallback(() => {
-    setEditorInteracted(true)
-    return false
-  }, [])
   const handleEditorPaste = useCallback((_view, event) => {
     const items = Array.from(event.clipboardData?.items || [])
     const imageItem = items.find(item => item.type.startsWith('image/'))
@@ -498,11 +493,9 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   }, [])
   const editorProps = useMemo(() => ({
     handleDOMEvents: {
-      click: markEditorInteracted,
-      focusin: markEditorInteracted,
       paste: handleEditorPaste,
     },
-  }), [handleEditorPaste, markEditorInteracted])
+  }), [handleEditorPaste])
 
   useEffect(() => { activeFileRef.current = activeFile }, [activeFile])
   useEffect(() => { workspaceInfoRef.current = workspaceInfo }, [workspaceInfo])
@@ -869,7 +862,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         !saveTimersRef.current.has(path) && !saveQueuesRef.current.has(path)
       ) updateMarkdownRepairProposal(repairProposal)
       else clearMarkdownRepairProposal()
-      setEditorInteracted(false)
       const visible = draftContentsRef.current[path] ?? fetched
       sourceContentRef.current = visible
       renderedFileRef.current = path
@@ -2229,6 +2221,10 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const activeSaveStatus = activeLargeMarkdown ? (activeLargeMarkdown.hasUnsavedDraft ? 'error' : 'saved') : activeFile
     ? (activeConflict ? 'conflict' : (saveErrors[activeFile] ? 'error' : (saveStatus === 'idle' ? 'saved' : saveStatus)))
     : 'idle'
+  const objectActionsEnabled = Boolean(
+    editor && activeFile && !fileLoading && !showSource && isMarkdownFile(activeFile) &&
+    renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current
+  )
   const currentImportResult = importResult?.workspaceKey === recoveryWorkspaceKey ? importResult : null
   return (
     <div
@@ -2636,7 +2632,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
                 onToggleSource={handleToggleSource}
                 onInsertLink={handleInsertLink}
                 onUploadImage={() => imageInputRef.current?.click()}
-                onTableInsert={() => setEditorInteracted(true)}
                 showOutline={showOutline}
                 onToggleOutline={() => setShowOutline(value => !value)}
                 editorFullscreen={editorFullscreen}
@@ -2728,8 +2723,19 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
                 </Suspense>
               ) : (
                 <div className="editor-scroll" style={{ flex: 1, overflow: 'auto', padding: '20px 32px', background: 'var(--color-bg-card)' }}>
-                  <TableContextTools editor={editor} visible={editorInteracted} />
-                  <ImageControls editor={editor} visible={editorInteracted} />
+                  <EditorObjectActions
+                    editor={editor}
+                    activeFile={activeFile}
+                    workspaceKey={recoveryWorkspaceKey}
+                    enabled={objectActionsEnabled}
+                    isMobile={isMobile}
+                  />
+                  <ImageControls
+                    editor={editor}
+                    visible={objectActionsEnabled}
+                    activeFile={activeFile}
+                    workspaceKey={recoveryWorkspaceKey}
+                  />
                   <div className="prose-column">
                     <EditorContent editor={editor} style={{ height: '100%' }} />
                   </div>
