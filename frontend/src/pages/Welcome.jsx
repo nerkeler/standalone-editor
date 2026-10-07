@@ -1,5 +1,5 @@
-import React, { useState, useCallback, useRef } from 'react'
-import { Alert, Button, Modal, Breadcrumb, Spin } from 'antd'
+import React, { useState, useCallback, useEffect, useRef } from 'react'
+import { Alert, Button, Modal, Spin } from 'antd'
 import { FolderOpenOutlined, FileOutlined, ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { api, setWorkspaceContext } from '../api'
 
@@ -31,11 +31,21 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
   const [pickerError, setPickerError] = useState('')
   const pickerRequestRef = useRef(0)
   const confirmRequestRef = useRef(0)
+  const pickerLastRequestedPathRef = useRef('')
+
+  useEffect(() => {
+    if (!pickerVisible) return undefined
+    document.body.classList.add('workspace-picker-open')
+    return () => document.body.classList.remove('workspace-picker-open')
+  }, [pickerVisible])
 
   const loadPickerDir = useCallback((dir = '', { fallbackToRoot = false } = {}) => {
     const requestId = ++pickerRequestRef.current
+    pickerLastRequestedPathRef.current = dir
     setPickerError('')
     setPickerLoading(true)
+    // Do not leave the previous path confirmable while a different directory loads.
+    setPickerData(null)
     const url = dir ? `${DIRS_API}?path=${encodeURIComponent(dir)}` : DIRS_API
     api.get(url)
       .then(res => {
@@ -107,6 +117,11 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
     setPickerVisible(false)
   }
 
+  const quickLocations = (pickerData?.locations?.length
+    ? pickerData.locations
+    : pickerData?.roots || [])
+    .filter(location => location.path !== pickerData?.path && location.canNavigate !== false)
+
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
@@ -176,6 +191,7 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
       {/* 目录选择器弹窗 */}
       <Modal
         className="workspace-picker-modal"
+        centered
         title="选择工作目录"
         open={pickerVisible}
         onCancel={closePicker}
@@ -186,68 +202,78 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
         cancelText="取消"
         width="min(560px, calc(100vw - 32px))"
       >
-        {pickerError && <div role="alert" style={{ padding: '6px 8px', fontSize: 12, color: 'var(--color-danger)', background: 'color-mix(in srgb, var(--color-danger) 12%, var(--color-bg-card))', borderRadius: 4, marginBottom: 8 }}>{pickerError}</div>}
+        {pickerError && (
+          <Alert
+            className="workspace-picker-error"
+            type="error"
+            showIcon
+            message={pickerError}
+            action={!pickerData && !pickerLoading ? (
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                onClick={() => loadPickerDir(pickerLastRequestedPathRef.current)}
+              >
+                重试读取
+              </Button>
+            ) : null}
+          />
+        )}
 
-        {/* Root locations come from the host. Keep the complete path in the
-            tooltip and use the backend-provided path when navigating so this
-            works for POSIX roots, Windows drive letters, and UNC shares. */}
-        {(pickerData?.locations || pickerData?.roots || []).length > 0 && (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', marginBottom: 8 }}>
-            <span style={{ fontSize: 12, color: 'var(--color-text-secondary)' }}>位置</span>
-            {(pickerData.locations || pickerData.roots).map(root => (
+        <div className="workspace-picker-navigation" role="group" aria-label="当前目录导航">
+          <Button
+            className="workspace-picker-up"
+            icon={<ArrowLeftOutlined />}
+            onClick={goUp}
+            disabled={pickerLoading || !pickerData?.canGoUp}
+            aria-label="返回上级目录"
+            title="返回上级目录"
+          />
+          {pickerData?.path ? (
+            <code className="workspace-picker-current-path" title={pickerData.path}>
+              {pickerData.path}
+            </code>
+          ) : (
+            <span className="workspace-picker-current-status" role="status" aria-live="polite">
+              {pickerLoading ? '正在读取目录…' : pickerError ? '目录路径暂不可用' : '尚未读取目录'}
+            </span>
+          )}
+        </div>
+
+        {quickLocations.length > 0 && (
+          <div className="workspace-picker-shortcut-list" role="group" aria-label="快捷访问位置">
+            {quickLocations.map(root => (
               <Button
                 key={root.path}
+                className="workspace-picker-shortcut"
                 size="small"
-                type={root.path === pickerData.path ? 'primary' : 'default'}
                 disabled={pickerLoading || confirming || root.canNavigate === false}
                 title={root.path}
-                aria-label={root.path}
+                aria-label={`打开位置 ${root.path}`}
+                data-path={root.path}
                 onClick={() => loadPickerDir(root.path)}
               >
-                {root.name || root.path}
+                <code className="workspace-picker-shortcut-path">{root.path}</code>
               </Button>
             ))}
           </div>
         )}
-
-        {/* 面包屑 + 返回按钮；路径由后端生成，前端不拼接平台分隔符。 */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              <Button size="small" icon={<ArrowLeftOutlined />} onClick={goUp} disabled={pickerLoading || !pickerData?.canGoUp} aria-label="返回上级目录">返回</Button>
-          <Breadcrumb
-            separator={pickerData?.separator || '/'}
-            items={(pickerData?.breadcrumb || []).map((item, index, all) => ({
-              key: item.path,
-              title: (
-                index === all.length - 1 ? (
-                  <span aria-current="page" style={{ fontWeight: 700 }}>{item.name}</span>
-                ) : (
-                  <button
-                    type="button"
-                    className="welcome-breadcrumb-button"
-                    disabled={pickerLoading || !item.canNavigate}
-                    onClick={() => {
-                      if (!pickerLoading && item.canNavigate && item.path !== pickerData.path) loadPickerDir(item.path)
-                    }}
-                  >
-                    {item.name}
-                  </button>
-                )
-              ),
-            }))}
-          />
-        </div>
 
         {/* 目录列表 */}
         <div
           role="group"
           aria-label="当前目录内容"
           aria-busy={pickerLoading}
-          style={{ maxHeight: 'min(360px, 50dvh)', overflowY: 'auto', overflowX: 'hidden', overscrollBehavior: 'contain', border: '1px solid var(--color-border)', borderRadius: 8, padding: '4px 0' }}
+          className="workspace-picker-list"
         >
           {pickerLoading ? (
-            <div style={{ textAlign: 'center', padding: 32 }}><Spin /></div>
-          ) : !pickerData || pickerData.entries?.length === 0 ? (
-            <div style={{ textAlign: 'center', padding: 32, color: 'var(--color-text-secondary)' }}>空目录</div>
+            <div className="workspace-picker-state"><Spin size="small" /><span>正在读取目录…</span></div>
+          ) : pickerError && !pickerData ? (
+            <div className="workspace-picker-state">目录暂不可用，请重试读取。</div>
+          ) : !pickerData ? (
+            <div className="workspace-picker-state">尚未读取目录。</div>
+          ) : pickerData.entries?.length === 0 ? (
+            <div className="workspace-picker-state">空目录</div>
           ) : (
             pickerData.entries.map(entry => (
               <button
@@ -258,19 +284,14 @@ export default function Welcome({ diagnostic, onRetry, onEnter }) {
                 aria-label={entry.type === 'dir' ? `打开文件夹 ${entry.name}` : `${entry.name}，文件`}
                 title={entry.type === 'dir' ? `打开文件夹 ${entry.name}` : entry.name}
                 className="welcome-directory-entry"
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  width: '100%', minHeight: 44, padding: '10px 12px', cursor: entry.type === 'dir' && entry.canNavigate !== false ? 'pointer' : 'default',
-                  border: 0, background: 'transparent', textAlign: 'left', font: 'inherit',
-                  fontSize: 14,
-                  opacity: entry.type === 'dir' && entry.canNavigate === false ? 0.5 : 1,
-                }}
+                data-path={entry.path}
+                style={{ cursor: entry.type === 'dir' && entry.canNavigate !== false ? 'pointer' : 'default' }}
               >
                 {entry.type === 'dir'
                   ? <FolderOpenOutlined aria-hidden="true" style={{ color: 'var(--color-warning)', fontSize: 18 }} />
                   : <FileOutlined aria-hidden="true" style={{ color: 'var(--color-text-secondary)', fontSize: 16 }} />}
-                <span style={{ minWidth: 0, flex: 1, overflowWrap: 'anywhere', color: 'var(--color-text)' }}>{entry.name}</span>
-                {entry.type === 'file' && <span style={{ fontSize: 11, color: 'var(--color-text-secondary)' }}>文件</span>}
+                <span className="welcome-directory-entry-name">{entry.name}</span>
+                {entry.type === 'file' && <span className="welcome-directory-entry-kind">文件</span>}
               </button>
             ))
           )}

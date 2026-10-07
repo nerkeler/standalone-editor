@@ -28,6 +28,28 @@ function stripBlockquotePrefixes(line, limit = Infinity) {
   return { text: line.slice(prefixLength), prefixLength, depth }
 }
 
+function isSafeIntrawordEscapedUnderscore(text, match) {
+  if (match[0] !== '\\_') return false
+  // Inspect at most two UTF-16 code units on either side so astral Unicode
+  // letters/numbers work without copying the whole line for every escape.
+  const before = text.slice(Math.max(0, match.index - 2), match.index)
+  const after = text.slice(match.index + 2, match.index + 4)
+  return /[\p{L}\p{N}]$/u.test(before) && /^[\p{L}\p{N}]/u.test(after)
+}
+
+function isWithinRanges(ranges, position) {
+  let low = 0
+  let high = ranges.length - 1
+  while (low <= high) {
+    const middle = (low + high) >> 1
+    const [start, end] = ranges[middle]
+    if (position < start) high = middle - 1
+    else if (position >= end) low = middle + 1
+    else return true
+  }
+  return false
+}
+
 function normalizeReferenceLabel(label) {
   return String(label || '')
     .replace(/\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~])/g, '$1')
@@ -56,6 +78,68 @@ function hasMultilineHtmlTag(value) {
     }
   }
   return false
+}
+
+function collectImageRanges(tokens, source, scopeStart, scopeEnd, output) {
+  let cursor = scopeStart
+  for (const token of tokens || []) {
+    const raw = String(token.raw || '')
+    let from = raw ? source.indexOf(raw, cursor) : -1
+    if (from < scopeStart || from + raw.length > scopeEnd) from = raw ? source.indexOf(raw, scopeStart) : -1
+    const found = from >= scopeStart && from + raw.length <= scopeEnd
+    // Keep all escapes in image Markdown protected. The codec handles alt text
+    // through a separate serializer path, so text-node underscore guarantees
+    // do not apply there.
+    if (token.type === 'image') {
+      // Container token raw text may omit quote/list prefixes. If an image's
+      // exact raw span cannot be found, conservatively protect its nearest
+      // located source container instead of assuming its escapes are plain text.
+      const start = found ? from : scopeStart
+      const end = found ? from + raw.length : scopeEnd
+      if (end > start) output.push([start, end])
+    }
+    if (found) cursor = Math.max(cursor, from + raw.length)
+
+    if (token.tokens?.length) {
+      collectImageRanges(
+        token.tokens,
+        source,
+        found ? from : scopeStart,
+        found ? from + raw.length : scopeEnd,
+        output,
+      )
+    }
+    if (token.type === 'table') {
+      const cellTokens = [...(token.header || []), ...(token.rows || []).flat()]
+        .flatMap(cell => cell.tokens || [])
+      if (cellTokens.length) {
+        // Flatten all cells into one scan so repeated identical image Markdown
+        // advances through the table source instead of resolving to cell one.
+        collectImageRanges(
+          cellTokens,
+          source,
+          found ? from : scopeStart,
+          found ? from + raw.length : scopeEnd,
+          output,
+        )
+      }
+    }
+    let itemCursor = found ? from : scopeStart
+    for (const item of token.items || []) {
+      const itemRaw = String(item.raw || '')
+      const itemFrom = itemRaw ? source.indexOf(itemRaw, itemCursor) : -1
+      const itemFound = itemFrom >= scopeStart && itemFrom + itemRaw.length <= scopeEnd
+      if (itemFound) itemCursor = itemFrom + itemRaw.length
+      if (!item.tokens?.length) continue
+      collectImageRanges(
+        item.tokens,
+        source,
+        itemFound ? itemFrom : scopeStart,
+        itemFound ? itemFrom + itemRaw.length : scopeEnd,
+        output,
+      )
+    }
+  }
 }
 
 function collectTitledLinkRanges(tokens, source, scopeStart, scopeEnd, output) {
@@ -159,6 +243,16 @@ export function analyzeMarkdownSource(markdown) {
     return items
   }
   const linkDefinitions = tokens.links || Object.create(null)
+  let imageRanges = []
+  collectImageRanges(tokens, source, 0, source.length, imageRanges)
+  imageRanges.sort((left, right) => left[0] - right[0])
+  const mergedImageRanges = []
+  for (const range of imageRanges) {
+    const previous = mergedImageRanges.at(-1)
+    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1])
+    else mergedImageRanges.push([...range])
+  }
+  imageRanges = mergedImageRanges
   let offset = 0
   let fence = null
   let fenceStart = -1
@@ -226,6 +320,10 @@ export function analyzeMarkdownSource(markdown) {
     const code = [...logical.matchAll(/(`+)(.*?)\1/g)].map(match => [match.index, match.index + match[0].length])
     const escapedLiteralFootnotes = [...logical.matchAll(/\\\[\^[^\]\n]+\\\]/g)]
       .map(match => [match.index, match.index + match[0].length])
+    // CommonMark does not treat underscores between letters or numbers as
+    // emphasis delimiters. Turndown escapes text underscores on serialization,
+    // so these intraword escapes survive the complete rich-text round trip.
+    // Keep boundary underscores protected: there they can open or close emphasis.
     const numberedHeading = logical.match(/^ {0,3}#{1,6}[\t ]+\d+\\\./)
     const safeNumberedHeadingDot = numberedHeading
       ? [numberedHeading[0].length - 2, numberedHeading[0].length]
@@ -234,6 +332,7 @@ export function analyzeMarkdownSource(markdown) {
       for (const match of logical.matchAll(regex)) {
         const trailingLinkTitle = /^[\t ]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^\)\r\n]*\))[\t ]*\)/
         const closesInlineLink = /^[\t ]*\)/
+        const inImage = reason === 'escapedSyntax' && isWithinRanges(imageRanges, logicalStart + match.index)
         const insideLinkDestination = reason === 'autolinks' &&
           /\]\([\t ]*$/.test(logical.slice(0, match.index)) &&
           (closesInlineLink.test(logical.slice(match.index + match[0].length)) ||
@@ -242,6 +341,7 @@ export function analyzeMarkdownSource(markdown) {
             !insideLinkDestination &&
             !(reason === 'escapedSyntax' && (
               escapedLiteralFootnotes.some(([start, end]) => match.index >= start && match.index < end) ||
+              (!inImage && isSafeIntrawordEscapedUnderscore(logical, match)) ||
               (safeNumberedHeadingDot && match.index >= safeNumberedHeadingDot[0] && match.index < safeNumberedHeadingDot[1])
             )) &&
             !(reason === 'rawHtml' && /^(?:<https?:\/\/|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@)/i.test(match[0]))) {

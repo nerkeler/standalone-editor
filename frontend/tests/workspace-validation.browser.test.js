@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
 import http from 'node:http'
-import { access, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,8 +12,26 @@ import { startChrome as startChromeProcess } from './helpers/chrome-startup.js'
 const frontendRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const repoRoot = path.resolve(frontendRoot, '..')
 const viteEntry = path.join(frontendRoot, 'node_modules', 'vite', 'bin', 'vite.js')
+let evidenceDir
 const staleWorkspace = '/Volumes/Notes that is offline'
 const selectedWorkspace = '/tmp/standalone-editor-selected-notes'
+const longPickerPath = `/srv/archive/field-notes  ${'archive-'.repeat(9)}final`
+const longPathSegments = longPickerPath.split('/').filter(Boolean)
+const longPathPrefixes = longPathSegments.map((_, index) => `/${longPathSegments.slice(0, index + 1).join('/')}`)
+const longPathBreadcrumb = [
+  { name: '/', path: '/', canNavigate: true, canSelect: false },
+  ...longPathSegments.map((name, index) => ({
+    name,
+    path: longPathPrefixes[index],
+    canNavigate: true,
+    canSelect: index === longPathSegments.length - 1,
+  })),
+]
+const longEntryName = `meeting-notes-${'with-a-very-long-name-'.repeat(5)}2026.md`
+const driveRoot = 'E:\\'
+const driveNotes = 'E:\\Notes'
+const uncRoot = '\\\\nas\\shared'
+const uncTeam = '\\\\nas\\shared\\Team Notes'
 
 let tempRoot
 let frontendPort
@@ -35,7 +53,11 @@ const state = {
   dirRequests: 0,
   dirPaths: [],
   directoryLocationMode: false,
+  directoryScenario: 'posix',
+  dirDelayPath: null,
+  dirDelayGate: null,
   setRequests: 0,
+  setPaths: [],
   requestOrder: [],
 }
 
@@ -163,24 +185,124 @@ function createFakeBackend() {
       state.dirRequests += 1
       const requestedPath = url.searchParams.get('path') || ''
       state.dirPaths.push(requestedPath)
+      if (requestedPath === state.dirDelayPath && state.dirDelayGate) await state.dirDelayGate
       if (state.directoryLocationMode) {
-        const inHome = requestedPath === '/home/alice'
+        if (state.directoryScenario === 'longpath') {
+          const pathIndex = longPathPrefixes.indexOf(requestedPath)
+          const currentPath = pathIndex >= 0 ? longPathPrefixes[pathIndex] : '/'
+          const inArchive = currentPath === longPickerPath
+          return sendJson(response, 200, {
+            path: currentPath,
+            canSelect: inArchive,
+            canGoUp: currentPath !== '/',
+            parent: currentPath === '/' ? null : pathIndex === 0 ? '/' : longPathPrefixes[pathIndex - 1],
+            separator: '/',
+            roots: [{ path: '/', name: '/', canNavigate: true, canSelect: false }],
+            locations: [
+              { path: '/', name: '/', canNavigate: true, canSelect: false },
+              { path: longPickerPath, name: '项目归档', canNavigate: true, canSelect: true },
+            ],
+            breadcrumb: longPathBreadcrumb.slice(0, pathIndex + 2),
+            entries: inArchive
+              ? [{ type: 'file', name: longEntryName, path: `${longPickerPath}/${longEntryName}`, canNavigate: false }]
+              : pathIndex < longPathPrefixes.length - 1
+                ? [{ type: 'dir', name: longPathSegments[pathIndex + 1], path: longPathPrefixes[pathIndex + 1], canNavigate: true, canSelect: false }]
+                : [],
+          })
+        }
+
+        if (state.directoryScenario === 'windows-drive') {
+          const inNotes = requestedPath === driveNotes
+          return sendJson(response, 200, {
+            path: inNotes ? driveNotes : driveRoot,
+            canSelect: inNotes,
+            canGoUp: inNotes,
+            parent: inNotes ? driveRoot : null,
+            separator: '\\',
+            roots: [{ path: driveRoot, name: driveRoot, canNavigate: true, canSelect: false }],
+            locations: [
+              { path: driveRoot, name: driveRoot, canNavigate: true, canSelect: false },
+              { path: driveNotes, name: 'Notes', canNavigate: true, canSelect: true },
+            ],
+            breadcrumb: inNotes
+              ? [
+                { name: driveRoot, path: driveRoot, canNavigate: true, canSelect: false },
+                { name: 'Notes', path: driveNotes, canNavigate: true, canSelect: true },
+              ]
+              : [{ name: driveRoot, path: driveRoot, canNavigate: true, canSelect: false }],
+            entries: inNotes ? [] : [{ type: 'dir', name: 'Notes', path: driveNotes, canNavigate: true, canSelect: true }],
+          })
+        }
+
+        if (state.directoryScenario === 'unc') {
+          const inTeam = requestedPath === uncTeam
+          return sendJson(response, 200, {
+            path: inTeam ? uncTeam : uncRoot,
+            canSelect: inTeam,
+            canGoUp: inTeam,
+            parent: inTeam ? uncRoot : null,
+            separator: '\\',
+            roots: [{ path: uncRoot, name: uncRoot, canNavigate: true, canSelect: false }],
+            locations: [
+              { path: uncRoot, name: uncRoot, canNavigate: true, canSelect: false },
+              { path: uncTeam, name: 'Team Notes', canNavigate: true, canSelect: true },
+            ],
+            breadcrumb: inTeam
+              ? [
+                { name: uncRoot, path: uncRoot, canNavigate: true, canSelect: false },
+                { name: 'Team Notes', path: uncTeam, canNavigate: true, canSelect: true },
+              ]
+              : [{ name: uncRoot, path: uncRoot, canNavigate: true, canSelect: false }],
+            entries: inTeam ? [] : [{ type: 'dir', name: 'Team Notes', path: uncTeam, canNavigate: true, canSelect: true }],
+          })
+        }
+
+        const knownPath = new Map([
+          ['/', '/'],
+          ['/home', '/home'],
+          ['/home/alice', '/home/alice'],
+          ['/mnt', '/mnt'],
+          ['/media', '/media'],
+          ['/tmp', '/tmp'],
+        ])
+        const currentPath = knownPath.get(requestedPath) || '/'
+        const inHome = currentPath === '/home/alice'
+        const currentShortcut = [
+          { name: 'alice', path: '/home/alice' },
+          { name: 'mnt', path: '/mnt' },
+          { name: 'media', path: '/media' },
+          { name: 'tmp', path: '/tmp' },
+        ].find(location => location.path === currentPath)
         return sendJson(response, 200, {
-          path: inHome ? '/home/alice' : '/',
-          canSelect: false,
-          canGoUp: inHome,
-          parent: inHome ? '/' : null,
+          path: currentPath,
+          canSelect: inHome,
+          canGoUp: currentPath !== '/',
+          parent: currentPath !== '/' ? '/' : null,
           separator: '/',
           roots: [{ path: '/', name: '/', canNavigate: true, canSelect: false }],
           locations: [
             { path: '/', name: '/', canNavigate: true, canSelect: false },
             { path: '/home/alice', name: 'alice', canNavigate: true, canSelect: true },
+            { path: '/mnt', name: 'mnt', canNavigate: true, canSelect: false },
+            { path: '/media', name: 'media', canNavigate: true, canSelect: false },
+            { path: '/tmp', name: 'tmp', canNavigate: true, canSelect: false },
           ],
           breadcrumb: inHome
             ? [
               { name: '/', path: '/', canNavigate: true, canSelect: false },
+              { name: 'home', path: '/home', canNavigate: true, canSelect: false },
               { name: 'alice', path: '/home/alice', canNavigate: true, canSelect: true },
             ]
+            : currentPath === '/home'
+              ? [
+                { name: '/', path: '/', canNavigate: true, canSelect: false },
+                { name: 'home', path: '/home', canNavigate: true, canSelect: false },
+              ]
+            : currentShortcut
+              ? [
+                { name: '/', path: '/', canNavigate: true, canSelect: false },
+                { name: currentShortcut.name, path: currentShortcut.path, canNavigate: true, canSelect: false },
+              ]
             : [{ name: '/', path: '/', canNavigate: true, canSelect: false }],
           entries: inHome
             ? [{ type: 'dir', name: 'Projects', path: '/home/alice/Projects', canNavigate: true, canSelect: true }]
@@ -194,7 +316,7 @@ function createFakeBackend() {
           canGoUp: true,
           parent: '/tmp',
           separator: '/',
-          roots: [],
+          roots: [{ path: '/tmp', name: '临时目录', canNavigate: true, canSelect: false }],
           breadcrumb: [{ name: 'tmp', path: '/tmp', canNavigate: true }, { name: 'Notes', path: selectedWorkspace, canNavigate: true }],
           entries: [],
         })
@@ -212,7 +334,8 @@ function createFakeBackend() {
     }
     if (url.pathname === '/api/workspace/set' && request.method === 'POST') {
       state.setRequests += 1
-      await readJson(request)
+      const payload = await readJson(request)
+      state.setPaths.push(payload.path)
       return sendJson(response, 409, {
         code: 'RECOVERY_ROOT_INSIDE_WORKSPACE',
         error: '恢复数据目录位于所选工作区内部。',
@@ -320,12 +443,34 @@ async function findChrome() {
 async function navigateWithLocalStorage() {
   const cached = JSON.stringify({ workspace: staleWorkspace, workspaceId: 'stale-workspace', workspaceVersion: 1 })
   await connection.send('Page.addScriptToEvaluateOnNewDocument', {
-    source: `localStorage.setItem('editor_workspace_info', ${JSON.stringify(cached)}); localStorage.setItem('editor_workspace', ${JSON.stringify(staleWorkspace)});`,
+    source: `localStorage.setItem('editor_workspace_info', ${JSON.stringify(cached)}); localStorage.setItem('editor_workspace', ${JSON.stringify(staleWorkspace)}); localStorage.setItem('editor_theme', 'light');`,
   })
   await connection.send('Page.navigate', { url: `http://127.0.0.1:${frontendPort}/` })
   await waitUntil('workspace selection screen to appear', () => connection.evaluate(
     `Array.from(document.querySelectorAll('button')).some(button => button.innerText.trim() === '选择工作目录')`,
   ))
+}
+
+async function setBrowserViewport(width, height, mobile = false) {
+  await connection.send('Emulation.setDeviceMetricsOverride', {
+    width,
+    height,
+    deviceScaleFactor: 1,
+    mobile,
+  })
+  await connection.send('Emulation.setTouchEmulationEnabled', mobile
+    ? { enabled: true, maxTouchPoints: 1 }
+    : { enabled: false })
+}
+
+async function saveBrowserScreenshot(filePath) {
+  await new Promise(resolve => setTimeout(resolve, 350))
+  const captured = await connection.send('Page.captureScreenshot', {
+    format: 'png',
+    captureBeyondViewport: false,
+  })
+  await writeFile(filePath, Buffer.from(captured.data, 'base64'))
+  return filePath
 }
 
 async function openBrowserTarget() {
@@ -376,9 +521,11 @@ async function clickButton(label) {
 
 before(async () => {
   tempRoot = await mkdtemp(path.join(os.tmpdir(), 'standalone-editor-workspace-check-'))
+  evidenceDir = process.env.WORKSPACE_PICKER_EVIDENCE_DIR || path.join(tempRoot, 'evidence')
+  await mkdir(evidenceDir, { recursive: true })
   frontendPort = await freePort()
   backendPort = await freePort()
-  Object.assign(state, { phase: 'setup', checkMode: 'unavailable', checkCount: 0, editorRequests: 0, editorRequestDetails: [], dirRequests: 0, dirPaths: [], directoryLocationMode: false, setRequests: 0, requestOrder: [] })
+  Object.assign(state, { phase: 'setup', checkMode: 'unavailable', checkCount: 0, editorRequests: 0, editorRequestDetails: [], dirRequests: 0, dirPaths: [], directoryLocationMode: false, directoryScenario: 'posix', dirDelayPath: null, dirDelayGate: null, setRequests: 0, setPaths: [], requestOrder: [] })
 
   backendServer = createFakeBackend()
   await new Promise((resolve, reject) => {
@@ -496,7 +643,10 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   state.dirRequests = 0
   state.dirPaths = []
   state.directoryLocationMode = false
+  state.dirDelayPath = null
+  state.dirDelayGate = null
   state.setRequests = 0
+  state.setPaths = []
   state.requestOrder = []
   state.phase = 'invalid-config'
   await openBrowserTarget()
@@ -511,17 +661,36 @@ test('invalid saved config still allows directory browsing and shows recovery-ro
   await clickButton('选择工作目录')
   await waitUntil('directory roots request despite missing active workspace', () => state.dirRequests > 0)
   await waitUntil('directory entry in picker', () => connection.evaluate(`document.body.innerText.includes('Notes')`))
-  assert.equal(
-    await connection.evaluate(`Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === '/tmp')`),
-    true,
-    'a roots-only response must continue to expose its navigation root',
-  )
-  await connection.evaluate(`(() => {
-    const entry = Array.from(document.querySelectorAll('.ant-modal-body span')).find(item => item.innerText.trim() === 'Notes');
+  assert.equal(await connection.evaluate(`document.querySelector('.workspace-picker-current-path')?.innerText`), '/tmp', 'a roots-only response should show its server current path as the primary location')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-picker-shortcut[data-path="/tmp"]'))`), false, 'the current root-only path should not be repeated as a shortcut')
+  const selectedFolderClicked = await connection.evaluate(`(() => {
+    const entry = document.querySelector('.welcome-directory-entry[data-path="${selectedWorkspace}"]');
     entry?.click();
     return Boolean(entry);
   })()`)
-  await waitUntil('selected folder loaded', () => connection.evaluate(`document.body.innerText.includes('确认选择') && document.querySelector('.ant-modal-body')?.innerText.includes('Notes')`))
+  assert.equal(selectedFolderClicked, true, 'the fake backend folder should be navigable from the listing')
+  await waitUntil('selected folder loaded', () => connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === ${JSON.stringify(selectedWorkspace)}`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-picker-shortcut[data-path="/tmp"]'))`), true, 'the parent root should remain available as a shortcut inside its child directory')
+  const parentShortcutClicked = await connection.evaluate(`(() => {
+    const button = document.querySelector('.workspace-picker-shortcut[data-path="/tmp"]');
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(parentShortcutClicked, true, 'the parent root shortcut should navigate using the backend path')
+  await waitUntil('parent root shortcut to restore /tmp', () => state.dirPaths.at(-1) === '/tmp' && connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === '/tmp'`,
+  ))
+  const selectedFolderClickedAgain = await connection.evaluate(`(() => {
+    const entry = document.querySelector('.welcome-directory-entry[data-path="${selectedWorkspace}"]');
+    entry?.click();
+    return Boolean(entry);
+  })()`)
+  assert.equal(selectedFolderClickedAgain, true)
+  await waitUntil('selected folder to reopen after parent navigation', () => state.dirPaths.at(-1) === selectedWorkspace && connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === ${JSON.stringify(selectedWorkspace)}`,
+  ))
   await clickButton('确认选择')
   await waitUntil('backend rejected invalid recovery location', () => state.setRequests === 1 && connection.evaluate(
     `Array.from(document.querySelectorAll('[role="alert"]')).some(item => item.innerText.includes('恢复数据目录位于所选工作区内部'))`,
@@ -545,25 +714,31 @@ test('directory picker shows and follows Linux locations alongside roots', async
   state.dirRequests = 0
   state.dirPaths = []
   state.directoryLocationMode = true
+  state.directoryScenario = 'posix'
   state.setRequests = 0
+  state.setPaths = []
   state.requestOrder = []
   state.phase = 'directory-locations'
   await openBrowserTarget()
   await navigateWithLocalStorage()
+  await setBrowserViewport(1280, 900)
 
   await clickButton('选择工作目录')
   await waitUntil('directory roots and locations to load', () => state.dirRequests > 0 && connection.evaluate(
-    `Boolean(document.querySelector('button[aria-label="/home/alice"]'))`,
+    `Boolean(document.querySelector('button[data-path="/home/alice"]'))`,
   ))
   assert.deepEqual(state.dirPaths, [''], 'the picker should start from the fake filesystem root')
   assert.equal(
-    await connection.evaluate(`Array.from(document.querySelectorAll('button')).some(button => button.getAttribute('aria-label') === '/home/alice')`),
+    await connection.evaluate(`Array.from(document.querySelectorAll('button[data-path]')).some(button => button.dataset.path === '/home/alice' && button.innerText.includes('/home/alice'))`),
     true,
-    'the home shortcut from locations must be shown even though roots only contains /',
+    'the home shortcut must show its backend path even though roots only contains /',
   )
+  assert.equal(await connection.evaluate(`document.querySelector('.workspace-picker-current-path')?.innerText`), '/', 'the current absolute path should be shown in full')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-picker-shortcut[data-path="/"]'))`), false, 'the root current path should not be repeated in quick access')
+  assert.equal(await connection.evaluate(`document.querySelectorAll('.workspace-picker-shortcut').length`), 4, 'quick access should only show other backend locations')
 
   const clicked = await connection.evaluate(`(() => {
-    const button = document.querySelector('button[aria-label="/home/alice"]');
+    const button = document.querySelector('button[data-path="/home/alice"]');
     button?.click();
     return Boolean(button);
   })()`)
@@ -574,5 +749,182 @@ test('directory picker shows and follows Linux locations alongside roots', async
     ),
   )
   assert.equal(state.dirPaths.at(-1), '/home/alice')
+  assert.equal(await connection.evaluate(`document.querySelector('.workspace-picker-current-path')?.innerText`), '/home/alice')
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.workspace-picker-shortcut[data-path="/home/alice"]'))`), false, 'the current path should not be duplicated in quick access')
+  const desktopShot = await saveBrowserScreenshot(`${evidenceDir}/desktop-light.png`)
+  assert.ok((await readFile(desktopShot)).length > 1000, 'desktop light screenshot should be captured')
+
+  await setBrowserViewport(390, 844, true)
+  await waitUntil('coarse pointer emulation to apply', () => connection.evaluate(`matchMedia('(pointer: coarse)').matches`))
+  const touchTargetGeometry = await connection.evaluate(`(() => {
+    const rect = element => {
+      const value = element?.getBoundingClientRect();
+      return value && { x: value.x, y: value.y, width: value.width, height: value.height };
+    };
+    return {
+      up: rect(document.querySelector('.workspace-picker-up')),
+      shortcutRoot: rect(document.querySelector('.workspace-picker-shortcut[data-path="/"]')),
+    };
+  })()`)
+  assert.ok(touchTargetGeometry.up.width >= 44 && touchTargetGeometry.up.height >= 44, `up navigation target should be at least 44x44: ${JSON.stringify(touchTargetGeometry)}`)
+  assert.ok(touchTargetGeometry.shortcutRoot.width >= 44 && touchTargetGeometry.shortcutRoot.height >= 44, `root shortcut target should be at least 44x44: ${JSON.stringify(touchTargetGeometry)}`)
+  const rootShortcutClicked = await connection.evaluate(`(() => {
+    const button = document.querySelector('.workspace-picker-shortcut[data-path="/"]');
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(rootShortcutClicked, true)
+  await waitUntil('root shortcut to navigate using its backend path', () => state.dirPaths.at(-1) === '/' && connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === '/' && !document.querySelector('.workspace-picker-shortcut[data-path="/"]')`,
+  ))
+  const homeShortcutClickedAgain = await connection.evaluate(`(() => {
+    const button = document.querySelector('.workspace-picker-shortcut[data-path="/home/alice"]');
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(homeShortcutClickedAgain, true)
+  await waitUntil('home shortcut to restore the current path', () => state.dirPaths.at(-1) === '/home/alice' && connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === '/home/alice'`,
+  ))
+  await setBrowserViewport(1280, 900)
+
+  state.dirDelayPath = '/media'
+  let releaseDelayedDirectory
+  state.dirDelayGate = new Promise(resolve => { releaseDelayedDirectory = resolve })
+  try {
+    const mediaShortcutClicked = await connection.evaluate(`(() => {
+      const button = Array.from(document.querySelectorAll('.workspace-picker-shortcut')).find(item => item.dataset.path === '/media');
+      button?.click();
+      return Boolean(button);
+    })()`)
+    assert.equal(mediaShortcutClicked, true)
+    await waitUntil('delayed location request to be in flight', () => state.dirPaths.includes('/media') && connection.evaluate(`(() => {
+      const confirm = document.querySelector('.ant-modal-footer .ant-btn-primary');
+      return document.querySelector('.workspace-picker-list')?.getAttribute('aria-busy') === 'true'
+        && !document.querySelector('.workspace-picker-current-path')
+        && confirm?.disabled === true;
+    })()`))
+    await clickButton('确认选择')
+    assert.equal(state.setRequests, 0, 'a pending directory load must not submit the previous path')
+  } finally {
+    releaseDelayedDirectory()
+    state.dirDelayPath = null
+    state.dirDelayGate = null
+  }
+  await waitUntil('delayed media location response to load', () => connection.evaluate(`document.querySelector('.workspace-picker-current-path')?.innerText === '/media'`))
+  const homeShortcutClicked = await connection.evaluate(`(() => {
+    const button = Array.from(document.querySelectorAll('.workspace-picker-shortcut')).find(item => item.dataset.path === '/home/alice');
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(homeShortcutClicked, true)
+  await waitUntil('home directory to reload after pending-state check', () => connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.innerText === '/home/alice' && document.body.innerText.includes('Projects')`,
+  ))
+  await clickButton('确认选择')
+  await waitUntil('backend rejected fake POSIX selection', () => state.setRequests === 1)
+  assert.equal(state.setPaths.at(-1), '/home/alice', 'selection must submit the exact path from the loaded backend response')
   await clickButton('取消')
+})
+
+test('directory picker keeps long paths readable on mobile and preserves Windows and UNC paths', async () => {
+  state.phase = 'closing-previous-page-for-path-shapes'
+  await closeBrowserTarget()
+  await waitForEditorRequestsToSettle()
+  state.checkMode = 'invalid'
+  state.checkCount = 0
+  state.editorRequests = 0
+  state.dirRequests = 0
+  state.dirPaths = []
+  state.directoryLocationMode = true
+  state.dirDelayPath = null
+  state.dirDelayGate = null
+  state.directoryScenario = 'longpath'
+  state.setRequests = 0
+  state.setPaths = []
+  state.requestOrder = []
+  state.phase = 'directory-path-shapes'
+  await openBrowserTarget()
+  await navigateWithLocalStorage()
+  await setBrowserViewport(390, 844, true)
+
+  await connection.evaluate(`document.querySelector('.theme-toggle')?.click()`)
+  await waitUntil('dark theme to apply', () => connection.evaluate(`document.documentElement.dataset.theme === 'dark'`))
+  await clickButton('选择工作目录')
+  await waitUntil('long path shortcuts to load', () => state.dirRequests > 0 && connection.evaluate(
+    `Array.from(document.querySelectorAll('.workspace-picker-shortcut')).some(button => button.dataset.path === ${JSON.stringify(longPickerPath)})`,
+  ))
+  const openLongPath = await connection.evaluate(`(() => {
+    const button = Array.from(document.querySelectorAll('.workspace-picker-shortcut')).find(item => item.dataset.path === ${JSON.stringify(longPickerPath)});
+    button?.click();
+    return Boolean(button);
+  })()`)
+  assert.equal(openLongPath, true)
+  await waitUntil('long directory path and entry to display', () => state.dirPaths.includes(longPickerPath) && connection.evaluate(
+    `document.querySelector('.workspace-picker-current-path')?.textContent === ${JSON.stringify(longPickerPath)} && document.body.innerText.includes(${JSON.stringify(longEntryName)})`,
+  ))
+  assert.equal(await connection.evaluate(`getComputedStyle(document.querySelector('.workspace-picker-current-path')).whiteSpace`), 'break-spaces', 'repeated spaces in the server path should remain visible')
+  assert.equal(await connection.evaluate(`document.querySelector('.workspace-picker-current-path')?.innerText`), longPickerPath, 'the displayed path text should preserve consecutive spaces verbatim')
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('.workspace-picker-shortcut')).some(button => button.dataset.path === ${JSON.stringify(longPickerPath)})`), false, 'the long current path should not be repeated in the shortcut row')
+  const dimensions = await connection.evaluate(`(() => {
+    const dialog = document.querySelector('.workspace-picker-modal')?.getBoundingClientRect();
+    const body = document.querySelector('.workspace-picker-modal .ant-modal-body');
+    return {
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      documentWidth: document.documentElement.scrollWidth,
+      dialogRight: dialog?.right,
+      dialogBottom: dialog?.bottom,
+      footerBottom: document.querySelector('.workspace-picker-modal .ant-modal-footer')?.getBoundingClientRect().bottom,
+      bodyClientWidth: body?.clientWidth,
+      bodyScrollWidth: body?.scrollWidth,
+    };
+  })()`)
+  assert.equal(dimensions.viewportWidth, 390, 'the narrow viewport should use a 390px layout')
+  assert.ok(dimensions.documentWidth <= dimensions.viewportWidth, `page should not overflow horizontally: ${JSON.stringify(dimensions)}`)
+  assert.ok(dimensions.dialogRight <= dimensions.viewportWidth + 1, `picker should fit the viewport: ${JSON.stringify(dimensions)}`)
+  assert.ok(dimensions.dialogBottom <= dimensions.viewportHeight + 1, `picker should fit the viewport height: ${JSON.stringify(dimensions)}`)
+  assert.ok(dimensions.footerBottom <= dimensions.viewportHeight + 1, `confirmation footer should remain reachable: ${JSON.stringify(dimensions)}`)
+  assert.ok(dimensions.bodyScrollWidth <= dimensions.bodyClientWidth + 1, `modal body should not overflow horizontally: ${JSON.stringify(dimensions)}`)
+  const mobileShot = await saveBrowserScreenshot(`${evidenceDir}/mobile-dark-longpath.png`)
+  assert.ok((await readFile(mobileShot)).length > 1000, 'mobile dark screenshot should be captured')
+
+  await clickButton('确认选择')
+  await waitUntil('long path selection request to reach backend', () => state.setRequests === 1)
+  assert.equal(state.setPaths.at(-1), longPickerPath, 'confirmation must stay bound to the exact loaded long path')
+  await clickButton('取消')
+  await waitUntil('picker cleanup and theme control restoration', () => connection.evaluate(`
+    !document.body.classList.contains('workspace-picker-open')
+      && getComputedStyle(document.querySelector('.theme-toggle')).visibility === 'visible'
+  `))
+
+  for (const [scenario, targetPath, expectedRoot] of [
+    ['windows-drive', driveNotes, driveRoot],
+    ['unc', uncTeam, uncRoot],
+  ]) {
+    state.directoryScenario = scenario
+    state.dirRequests = 0
+    state.dirPaths = []
+    await clickButton('选择工作目录')
+    await waitUntil(`${scenario} root to load`, () => state.dirRequests > 0 && connection.evaluate(
+      `document.querySelector('.workspace-picker-current-path')?.innerText === ${JSON.stringify(expectedRoot)}`,
+    ))
+    const clicked = await connection.evaluate(`(() => {
+      const button = Array.from(document.querySelectorAll('.workspace-picker-shortcut')).find(item => item.dataset.path === ${JSON.stringify(targetPath)});
+      button?.click();
+      return Boolean(button);
+    })()`)
+    assert.equal(clicked, true, `${scenario} shortcut should be available by its original backend path`)
+    await waitUntil(`${scenario} path to load`, () => state.dirPaths.includes(targetPath) && connection.evaluate(
+      `document.querySelector('.workspace-picker-current-path')?.innerText === ${JSON.stringify(targetPath)}`,
+    ))
+    assert.equal(state.dirPaths.at(-1), targetPath, `${scenario} path should reach /api/dirs unchanged`)
+    const previousSetRequests = state.setRequests
+    await clickButton('确认选择')
+    await waitUntil(`${scenario} selection to reach the server`, () => state.setRequests === previousSetRequests + 1)
+    assert.equal(state.setPaths.at(-1), targetPath, `${scenario} confirmation should preserve the exact backend path`)
+    await clickButton('取消')
+  }
+  state.directoryLocationMode = false
+  state.directoryScenario = 'posix'
 })

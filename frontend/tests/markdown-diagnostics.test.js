@@ -139,6 +139,79 @@ test('escaped decimal dots in ATX heading numbers stay rich-safe without hiding 
   assert.ok(diagnostics.some(item => item.reason === 'rawHtml'))
 })
 
+test('intraword escaped underscores stay rich-safe in paragraphs, quotes, tables, and Unicode text', () => {
+  const source = [
+    'Paragraph: stock\\_report and 学习\\_笔记.',
+    '',
+    '> Quoted stock\\_report and 学习\\_笔记.',
+    '',
+    '| Name | Value |',
+    '| --- | --- |',
+    '| Report | stock\\_report |',
+    '| 笔记 | 学习\\_笔记 |',
+    '',
+    '## 1\\. fitness-tracker',
+  ].join('\n')
+  assert.deepEqual(analyzeMarkdownSource(source), [])
+  assert.equal(marked.parse(source), marked.parse(source.replaceAll('\\_', '_').replaceAll('\\.', '.')))
+})
+
+test('escaped delimiters and boundary underscores remain protected when their meaning can change', () => {
+  for (const source of [
+    'Keep \\*literal* markers.\n',
+    'Keep \\[label](https://example.com).\n',
+    '\\_open\\_\n',
+    'word\\\\_report\n',
+    'word\\\\\\_report\n',
+    'stock\\_report and \\*literal*\n',
+  ]) {
+    assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'escapedSyntax'), source)
+  }
+  assert.deepEqual(analyzeMarkdownSource('`\\_inline_`\n\n```md\n\\_fenced_\n```\n'), [])
+})
+
+test('intraword underscores in image tokens stay protected independently of nearby plain text', () => {
+  const source = [
+    'Text stock\\_report and ![stock\\_report](assets/x.png), plus ![stock\\_report](https://example.com/x.png).',
+    '> Quoted ![stock\\_report](assets/quoted.png) and stock\\_report.',
+    '',
+    '| Plain text | First image | Repeated image |',
+    '| --- | --- | --- |',
+    '| stock\\_report | ![stock\\_report](assets/x.png) | ![stock\\_report](assets/x.png) |',
+    '',
+    '> | Plain text | Image |',
+    '> | --- | --- |',
+    '> | stock\\_report | ![stock\\_report](assets/x.png) |',
+    '`![stock\\_report](assets/code-example.png)`',
+  ].join('\n')
+  const matches = analyzeMarkdownSource(source).filter(item => item.reason === 'escapedSyntax')
+  assert.equal(matches.length, 6)
+  for (const match of matches) assert.equal(source.slice(match.from, match.to), '\\_')
+})
+
+test('repeated image tokens in repeated list items retain each image source offset', () => {
+  for (const source of [
+    '- ![a\\_b](x.png)\n- ![a\\_b](x.png)\n',
+    '- Parent\n\n  - ![a\\_b](x.png)\n\n  - ![a\\_b](x.png)\n',
+  ]) {
+    const matches = analyzeMarkdownSource(source).filter(item => item.reason === 'escapedSyntax')
+    assert.equal(matches.length, 2, source)
+    for (const match of matches) assert.equal(source.slice(match.from, match.to), '\\_')
+  }
+})
+
+test('multiline image tokens with stripped quote and list prefixes remain source-protected', () => {
+  for (const source of [
+    '> ![stock\\_report\n> second](assets/x.png)\n',
+    '- ![stock\\_report\n  second](assets/x.png)\n',
+    '> ![stock\\_report](\n> assets/x.png)\n',
+  ]) {
+    const matches = analyzeMarkdownSource(source).filter(item => item.reason === 'escapedSyntax')
+    assert.equal(matches.length, 1, source)
+    assert.equal(source.slice(matches[0].from, matches[0].to), '\\_')
+  }
+})
+
 test('non-autolink angle text is not classified as raw HTML or an autolink', () => {
   for (const source of ['<x:b>\n', '<example.com>\n', '<a@b..com>\n']) {
     const diagnostics = analyzeMarkdownSource(source)

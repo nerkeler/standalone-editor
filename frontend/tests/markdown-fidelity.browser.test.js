@@ -695,6 +695,114 @@ test('numbered Markdown heading dots survive rich editing and save without an op
   await saveRepairScreenshot('numbered-headings-rich.png')
 })
 
+test('intraword escaped underscores in mixed Markdown open cleanly and survive a rich edit', async () => {
+  const fileName = 'intraword-escapes.md'
+  const source = [
+    'Paragraph: stock\\_report and 学习\\_笔记.',
+    '',
+    '> Quoted stock\\_report and 学习\\_笔记.',
+    '',
+    '| Name | Value |',
+    '| --- | --- |',
+    '| Report | stock\\_report |',
+    '| 笔记 | 学习\\_笔记 |',
+    '',
+    '## 1\\. fitness-tracker',
+    '',
+    'Edit elsewhere: keep this line.',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await openFile(fileName, 'Paragraph:')
+
+  await waitUntil('escaped literal Markdown to open in the rich editor', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning') && !document.querySelector('.markdown-repair-banner'))`,
+  ))
+  assert.match(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`), /stock_report/)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`), false)
+  await saveRepairScreenshot('intraword-escapes-rich.png')
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'opening intraword escapes must not send a workspace PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'opening rich-safe escaped text must preserve the original bytes')
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
+
+  await connection.evaluate(`document.querySelector('[aria-label="切换到源码编辑"]')?.click()`)
+  await waitUntil('rich-safe escaped Markdown to switch to source mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view)`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
+  await waitUntil('rich-safe escaped Markdown to return to rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(workspacePutCount(), initialPuts, 'switching modes without editing must not send a workspace PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
+
+  const selected = await connection.evaluate(`(() => {
+    const editor = document.querySelector('.ProseMirror')
+    const paragraph = Array.from(editor?.querySelectorAll('p') || []).find(node => node.innerText.includes('Edit elsewhere: keep this line.'))
+    if (!editor || !paragraph) return false
+    editor.focus()
+    const range = document.createRange()
+    range.selectNodeContents(paragraph)
+    range.collapse(false)
+    const selection = window.getSelection()
+    selection.removeAllRanges()
+    selection.addRange(range)
+    return true
+  })()`)
+  assert.equal(selected, true)
+  await connection.send('Input.insertText', { text: ' edited' })
+  const beforeEditPuts = workspacePutCount()
+  await clickSave()
+  const saved = await waitForDiskMarker(fileName, 'Edit elsewhere: keep this line. edited')
+  assert.equal(workspacePutCount() - beforeEditPuts, 1, 'one explicit rich edit should save one snapshot')
+  assert.ok(saved.includes('stock\\_report'))
+  assert.ok(saved.includes('学习\\_笔记'))
+  assert.ok(saved.includes('> Quoted stock\\_report and 学习\\_笔记.'))
+  assert.ok(saved.includes('| Report | stock\\_report |'))
+  assert.ok(saved.includes('## 1\\. fitness-tracker'))
+  assert.equal(
+    marked.parse(saved),
+    marked.parse(source.replace('Edit elsewhere: keep this line.', 'Edit elsewhere: keep this line. edited')),
+    'the saved conversion chain should keep the original Markdown rendering',
+  )
+
+  const putsBeforeReopen = workspacePutCount()
+  await setupPage()
+  await openFile(fileName, 'Paragraph:')
+  await waitUntil('saved escaped Markdown to reopen without warnings', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror') && !document.querySelector('.source-fidelity-warning') && !document.querySelector('.markdown-repair-banner'))`,
+  ))
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), putsBeforeReopen, 'reopening escaped Markdown must not send an automatic repair PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), saved)
+  assert.match(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText || ''`), /stock_report/)
+})
+
+test('escaped underscores in image alt text remain source-protected without an open-time write', async () => {
+  const fileName = 'image-alt-escape.md'
+  const source = 'Keep stock\\_report as plain text.\n\n![stock\\_report](assets/x.png)\n'
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await openFile(fileName, 'Keep stock')
+
+  await waitUntil('image alt escape to stay in source mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning') && document.querySelector('.cm-protected-range'))`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'image alt source protection must not write the file while opening')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs)
+})
+
 test('lossy quote, reference, and multiline HTML syntax stays byte-identical on a no-op save', async () => {
   const fileName = 'lossy-structure-regression.md'
   const source = [
