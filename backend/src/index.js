@@ -85,6 +85,8 @@ export function createBackend(options = {}) {
   let workspaceCandidate = null
   let configWasMissingAtStartup = false
   const workspaceMutationTails = new Map()
+  const recoveryMaintenance = new Map()
+  const historyCleanupWarnings = new Map()
   let workspaceSelectionTail = Promise.resolve()
 
   function errorStatus(error) {
@@ -95,7 +97,8 @@ export function createBackend(options = {}) {
     }
     if (
       error?.code === 'CONFLICT' || error?.code === 'FILE_CONFLICT' ||
-      error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH'
+      error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH' ||
+      error?.code === 'TRASH_OPERATION_PENDING'
     ) return 409
     if (error?.code === 'REVISION_REQUIRED') return 428
     if (error?.code === 'ENOENT' || error?.code === 'HISTORY_NOT_FOUND') return 404
@@ -129,7 +132,64 @@ export function createBackend(options = {}) {
   }
 
   async function workspaceRecoveryStats(ws) {
-    return getRecoveryStats(ws, { recoveryRoot: RECOVERY_ROOT })
+    const stats = await getRecoveryStats(ws, { recoveryRoot: RECOVERY_ROOT })
+    return {
+      ...stats,
+      maintenance: {
+        historyCleanupWarnings: [...(historyCleanupWarnings.get(ws)?.values() || [])],
+        trash: recoveryMaintenance.get(ws) || { restored: [], completed: [], issues: [] },
+      },
+    }
+  }
+
+  function recordHistoryCleanup(ws, documentPath, result, previousRevision) {
+    const warningPath = result.path || documentPath
+    let warnings = historyCleanupWarnings.get(ws)
+    if (result.recoveryCleanupWarning) {
+      if (!warnings) historyCleanupWarnings.set(ws, warnings = new Map())
+      warnings.set(warningPath, { path: warningPath, ...result.recoveryCleanupWarning })
+    } else if (result.revision && result.revision !== previousRevision) {
+      // An unchanged save does not retry retention cleanup, so it cannot clear
+      // an earlier warning. A completed replacement does attempt that cleanup.
+      warnings?.delete(warningPath)
+    }
+    return result
+  }
+
+  async function reconcileWorkspaceRecovery(ws) {
+    return withWorkspaceMutation(ws, async () => {
+      let report
+      try {
+        report = await workspaceTrashService(ws).reconcilePending()
+        for (const restored of report.restored) {
+          try {
+            const history = await reattachTrashFileHistory(ws, restored.id, recoveryOptions())
+            if (history.retained > 0) report.issues.push({
+              id: restored.id, path: restored.path, code: 'HISTORY_ARCHIVES_RETAINED',
+              message: '原项目已恢复，部分历史仍保留在已删除文件历史中，可在那里查看。',
+            })
+          } catch (error) {
+            report.issues.push({
+              id: restored.id, path: restored.path,
+              code: error.code || 'HISTORY_REATTACH_FAILED',
+              message: '原项目已恢复，但历史记录未能重新关联；请在已删除文件历史中查看。',
+            })
+          }
+        }
+      } catch (error) {
+        // Recovery storage can be offline or read-only independently of the
+        // notes. Keep a readable workspace available and report this separately.
+        report = { restored: [], completed: [], issues: [{
+          code: error.code || 'RECOVERY_RECONCILE_FAILED',
+          message: '未能检查上次中断的回收站操作；已保留现有数据，请稍后重试。',
+        }] }
+      }
+      recoveryMaintenance.set(ws, report)
+      for (const issue of report.issues) {
+        console.warn('恢复检查未完成：', { workspace: ws, path: issue.path, code: issue.code })
+      }
+      return report
+    })
   }
 
   function sendError(res, error, req = res.req) {
@@ -176,6 +236,7 @@ export function createBackend(options = {}) {
       workspace,
       workspaceId: workspaceIdFor(workspace),
       workspaceVersion,
+      ...(recoveryMaintenance.has(workspace) ? { recoveryMaintenance: recoveryMaintenance.get(workspace) } : {}),
     }
   }
 
@@ -432,6 +493,7 @@ export function createBackend(options = {}) {
           throw error
         }
         await activateConfiguredWorkspace(config)
+        await reconcileWorkspaceRecovery(workspace)
         return
       }
       if (!configWasMissingAtStartup) {
@@ -454,6 +516,7 @@ export function createBackend(options = {}) {
       workspace = resolved
       workspaceCandidate = resolved
       workspaceStartupError = null
+      await reconcileWorkspaceRecovery(resolved)
     } catch (error) {
       workspace = null
       workspaceStartupError = asWorkspaceUnavailable(error, error?.details?.workspace || workspaceCandidate)
@@ -498,7 +561,9 @@ export function createBackend(options = {}) {
   // entry point and isolated API tests initialize saved workspace configuration
   // explicitly before accepting requests.
   function initializeBackend() {
-    if (!workspaceInitialization) workspaceInitialization = initializeWorkspace()
+    if (!workspaceInitialization) workspaceInitialization = initializeWorkspace().then(async () => {
+      if (workspace) await reconcileWorkspaceRecovery(workspace)
+    })
     return workspaceInitialization
   }
 
@@ -659,6 +724,7 @@ export function createBackend(options = {}) {
     workspaceCandidate = resolved
     workspaceVersion = nextWorkspaceVersion
     workspaceStartupError = null
+    await reconcileWorkspaceRecovery(resolved)
     return { success: true, ...currentWorkspaceInfo() }
   }
 
@@ -765,9 +831,10 @@ export function createBackend(options = {}) {
       const { orphanId, historyId, path: reqPath, expectedRevision } = req.body || {}
       if (!orphanId || !historyId) throw new Error('缺少 orphanId 或 historyId 参数')
       const ws = workspaceFor(req)
-      const result = await withWorkspaceMutation(ws, () =>
-        restoreOrphanFileHistory(ws, orphanId, historyId, reqPath, expectedRevision, recoveryOptions()),
-      )
+      const result = await withWorkspaceMutation(ws, async () => {
+        const restored = await restoreOrphanFileHistory(ws, orphanId, historyId, reqPath, expectedRevision, recoveryOptions())
+        return recordHistoryCleanup(ws, restored.path, restored, expectedRevision)
+      })
       sendData(res, result, req)
     } catch (error) { sendError(res, error, req) }
   })
@@ -783,6 +850,14 @@ export function createBackend(options = {}) {
   app.get('/api/workspace/recovery/stats', workspaceGuard, async (req, res) => {
     try {
       sendData(res, await workspaceRecoveryStats(workspaceFor(req)), req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/recovery/reconcile', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      const result = await reconcileWorkspaceRecovery(ws)
+      sendData(res, { ...result, stats: await workspaceRecoveryStats(ws) }, req)
     } catch (error) { sendError(res, error, req) }
   })
 
@@ -831,9 +906,8 @@ export function createBackend(options = {}) {
       const { path: reqPath, historyId, expectedRevision } = req.body || {}
       if (!reqPath || !historyId) throw new Error('缺少 path 或 historyId 参数')
       const ws = workspaceFor(req)
-      const result = await withWorkspaceMutation(ws, () =>
-        restoreFileHistory(ws, reqPath, historyId, expectedRevision, recoveryOptions()),
-      )
+      const result = await withWorkspaceMutation(ws, async () => recordHistoryCleanup(ws, reqPath,
+        await restoreFileHistory(ws, reqPath, historyId, expectedRevision, recoveryOptions()), expectedRevision))
       sendData(res, result, req)
     } catch (error) { sendError(res, error, req) }
   })
@@ -876,7 +950,8 @@ export function createBackend(options = {}) {
       const { path: reqPath, content, expectedRevision } = req.body || {}
       if (!reqPath) throw new Error('缺少 path 参数')
       const ws = workspaceFor(req)
-      const result = await withWorkspaceMutation(ws, () => writeFile(ws, reqPath, content ?? '', expectedRevision, recoveryOptions()))
+      const result = await withWorkspaceMutation(ws, async () => recordHistoryCleanup(ws, reqPath,
+        await writeFile(ws, reqPath, content ?? '', expectedRevision, recoveryOptions()), expectedRevision))
       sendData(res, result, req)
     } catch (error) { sendError(res, error, req) }
   })

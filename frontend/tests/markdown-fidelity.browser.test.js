@@ -224,6 +224,48 @@ async function openFile(fileName, expectedText = 'Markdown fidelity fixture') {
   ))
 }
 
+async function switchWorkspace(targetPath) {
+  await connection.evaluate(`document.querySelector('button[aria-label="更改目录"]')?.click()`)
+  await waitUntil('workspace picker path field', () => connection.evaluate(
+    `Boolean(document.querySelector('.workspace-picker-modal input[aria-label="目录路径"]'))`,
+  ))
+  await connection.evaluate(`(() => {
+    const input = document.querySelector('.workspace-picker-modal input[aria-label="目录路径"]');
+    input?.focus();
+    input?.setSelectionRange(0, input.value.length);
+  })()`)
+  await connection.send('Input.insertText', { text: targetPath })
+  assert.equal(await connection.evaluate(`document.querySelector('.workspace-picker-modal input[aria-label="目录路径"]')?.value`), targetPath,
+    'the picker address should accept the exact absolute workspace path')
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await waitUntil('requested workspace path to load in the picker', () => connection.evaluate(
+    `(() => {
+      const modal = document.querySelector('.workspace-picker-modal');
+      const list = modal?.querySelector('.workspace-picker-list');
+      return modal?.dataset.currentPath === ${JSON.stringify(targetPath)}
+        && list?.getAttribute('aria-busy') !== 'true'
+        && !modal.querySelector('button[aria-label="使用当前目录"]')?.disabled;
+    })()`,
+  ))
+  await connection.evaluate(`document.querySelector('.workspace-picker-modal button[aria-label="使用当前目录"]')?.click()`)
+  await waitUntil('selected workspace to load in the editor', () => connection.evaluate(
+    `JSON.parse(localStorage.getItem('editor_workspace_info') || 'null')?.workspace === ${JSON.stringify(targetPath)}
+      && Boolean(document.querySelector('.workspace-sidebar') && document.querySelector('.tree-scroll'))`,
+  ))
+  await waitUntil('workspace picker to close', () => connection.evaluate(
+    `!document.body.classList.contains('workspace-picker-open')`,
+  ))
+}
+
+function workspaceTreeRequestCount() {
+  return connection.networkRequests.filter(request => {
+    if (request.method !== 'GET') return false
+    const url = new URL(request.url)
+    return url.pathname === '/api/workspace' && url.searchParams.get('recursive') === '1'
+  }).length
+}
+
 async function appendToRichEditor(text) {
   await connection.evaluate(`(() => {
     const editor = document.querySelector('.ProseMirror');
@@ -899,6 +941,95 @@ test('source image upload inserts at the CodeMirror cursor, saves, and source ou
   await connection.send('Fetch.disable')
   assert.equal(await readFile(path.join(workspace, richFile), 'utf8'), '# Hidden rich heading\n\nRich body\n')
   assert.equal(await connection.evaluate(`document.querySelector('.ProseMirror')?.innerText.includes('after-mode-switch.png')`), false)
+})
+
+test('image upload refreshes and expands adjacent assets, while a late workspace result stays isolated', async () => {
+  const documentDirectory = 'upload-tree-fixture'
+  const fileName = `${documentDirectory}/upload-tree.md`
+  const assetsDirectory = `${documentDirectory}/assets`
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  const nextWorkspacePath = path.join(tempRoot, 'upload-next-workspace')
+  const nextFile = 'next-workspace.md'
+  await mkdir(path.join(workspace, documentDirectory), { recursive: true })
+  await writeFile(path.join(workspace, fileName), '# Upload tree fixture\n')
+  await mkdir(nextWorkspacePath, { recursive: true })
+  const nextWorkspace = await realpath(nextWorkspacePath)
+  await writeFile(path.join(nextWorkspace, nextFile), '# Next workspace fixture\n')
+  await setupPage()
+  await connection.evaluate(`document.querySelector('[aria-label="更多目录操作"]')?.click()`)
+  await waitUntil('directory action menu to open', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).some(node => node.innerText.trim() === '全部展开')`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-dropdown-menu-item')).find(node => node.innerText.trim() === '全部展开')?.click()`)
+  await openFile('upload-tree.md', 'Upload tree fixture')
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.dataset.path === ${JSON.stringify(assetsDirectory)})`), false,
+    'the test should begin before the adjacent assets directory exists')
+
+  const firstImageName = 'new image.png'
+  assert.equal(await selectImageFile(firstImageName, imageBytes), true)
+  await waitUntil('first upload to insert a relative image reference', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror img[data-markdown-src="assets/new%20image.png"]'))`,
+  ))
+  await waitUntil('new assets directory and uploaded image to appear in the expanded tree', () => connection.evaluate(
+    `(() => {
+      const paths = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).map(node => node.dataset.path);
+      return paths.includes(${JSON.stringify(assetsDirectory)}) && paths.includes(${JSON.stringify(`${assetsDirectory}/${firstImageName}`)});
+    })()`,
+  ))
+  const firstSaved = await waitUntil('first uploaded image reference to autosave', async () => {
+    const content = await readFile(path.join(workspace, fileName), 'utf8').catch(() => '')
+    return content.includes('assets/new%20image.png') ? content : null
+  })
+  assert.match(firstSaved, /!\[[^\]]*\]\(assets\/new%20image\.png\)/)
+  assert.deepEqual(await readFile(path.join(workspace, assetsDirectory, firstImageName)), imageBytes)
+  if (process.env.EDITOR_REVIEW_INTERACTION_DIR) {
+    await mkdir(process.env.EDITOR_REVIEW_INTERACTION_DIR, { recursive: true })
+    const screenshot = await connection.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+    await writeFile(path.join(process.env.EDITOR_REVIEW_INTERACTION_DIR, 'image-upload-refreshed-tree.png'), Buffer.from(screenshot.data, 'base64'))
+  }
+
+  await connection.send('Fetch.enable', { patterns: [{ urlPattern: '*api/workspace/upload*', requestStage: 'Response' }] })
+  const previousPausedRequests = connection.pausedFetchRequests.length
+  connection.pauseNextWorkspaceUpload = true
+  const lateImageName = 'late upload.png'
+  assert.equal(await selectImageFile(lateImageName, imageBytes), true)
+  const pausedUpload = await waitUntil('second upload response to pause after the server stores it', () => (
+    connection.pausedFetchRequests.slice(previousPausedRequests).find(item => item.request?.method === 'POST' && item.request.url.includes('/api/workspace/upload'))
+  ))
+  await waitUntil('late upload to exist only in the original workspace', async () => {
+    try {
+      await access(path.join(workspace, assetsDirectory, lateImageName))
+      return true
+    } catch { return false }
+  })
+  const responseBody = await connection.send('Fetch.getResponseBody', { requestId: pausedUpload.requestId })
+  const responseBodyBase64 = responseBody.base64Encoded
+    ? responseBody.body
+    : Buffer.from(responseBody.body).toString('base64')
+
+  await switchWorkspace(nextWorkspace)
+  await waitUntil('next workspace document to appear in its own file tree', () => connection.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.dataset.path === ${JSON.stringify(nextFile)})`,
+  ))
+  const treeRequestsAfterSwitch = workspaceTreeRequestCount()
+  await connection.send('Fetch.fulfillRequest', {
+    requestId: pausedUpload.requestId,
+    responseCode: pausedUpload.responseStatusCode || 200,
+    responseHeaders: pausedUpload.responseHeaders || [],
+    body: responseBodyBase64,
+  })
+  await waitUntil('late upload completion to report that the current document changed', () => connection.evaluate(
+    `document.querySelector('.ant-message-info')?.innerText.includes('当前文档已变化，未插入')`,
+  ))
+  await connection.send('Fetch.disable')
+
+  assert.equal(workspaceTreeRequestCount(), treeRequestsAfterSwitch,
+    'a late upload from the old workspace must not refresh the newly selected workspace tree')
+  assert.equal(await connection.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(node => node.dataset.path === ${JSON.stringify(assetsDirectory)})`), false,
+    'the new workspace must not display the old workspace asset directory')
+  assert.equal(await readFile(path.join(nextWorkspace, nextFile), 'utf8'), '# Next workspace fixture\n')
+  assert.deepEqual(await readFile(path.join(workspace, assetsDirectory, lateImageName)), imageBytes)
+  await switchWorkspace(await realpath(workspace))
 })
 
 test('document tabs can be selected with the keyboard without closing adjacent tabs', async () => {

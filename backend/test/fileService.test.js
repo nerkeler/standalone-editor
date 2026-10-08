@@ -41,6 +41,30 @@ function revision(content) {
   return createHash('sha256').update(content).digest('hex')
 }
 
+async function historyBucketFor(workspace, recovery, relative = 'note.md') {
+  return path.join(
+    await fs.realpath(recovery),
+    'history',
+    createHash('sha256').update(await fs.realpath(workspace)).digest('hex'),
+    createHash('sha256').update(relative).digest('hex'),
+  )
+}
+
+function setHighInode(stat, index, options = {}) {
+  const device = 9_007_199_254_740_992n
+  const inode = device + BigInt(index)
+  stat.dev = options.bigint ? device : Number(device)
+  stat.ino = options.bigint ? inode : Number(inode)
+  return stat
+}
+
+async function replaceFileWithSameBytes(filePath, bytes) {
+  const replacement = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.replacement`
+  await fs.writeFile(replacement, bytes, { flag: 'wx', mode: 0o600 })
+  await fs.unlink(filePath)
+  await fs.rename(replacement, filePath)
+}
+
 async function temporaryRecovery(t) {
   const recovery = await fs.mkdtemp(path.join(os.tmpdir(), 'standalone-editor-recovery-'))
   t.after(() => fs.rm(recovery, { recursive: true, force: true }))
@@ -320,6 +344,237 @@ test('a failed history cleanup leaves one reusable newest snapshot for subsequen
   const after = await listFileHistory(workspace, 'note.md', { root: recovery })
   assert.deepEqual(after.history.map(entry => entry.id), [retainedId])
   assert.equal(await fs.readFile(target, 'utf8'), 'original')
+})
+
+test('failed-write snapshot discard preserves a same-byte replacement with an adjacent high inode', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'original')
+  const opened = await readFile(workspace, 'note.md')
+  const injected = Object.assign(new Error('injected temporary sync failure'), { code: 'EIO' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      return {
+        stat: (...rest) => handle.stat(...rest),
+        writeFile: (...rest) => handle.writeFile(...rest),
+        chmod: (...rest) => handle.chmod(...rest),
+        sync: async () => { throw injected },
+        close: () => handle.close(),
+      }
+    },
+    rename: (...args) => fs.rename(...args),
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  const bucket = await historyBucketFor(workspace, recovery)
+  const nativeLstat = fs.lstat.bind(fs)
+  const nativeReadFile = fs.readFile.bind(fs)
+  let recordPath
+  let identityReads = 0
+  let replacementDone = false
+  let preservedRecordBytes
+  const warnings = []
+  fs.lstat = async (...args) => {
+    const stat = await nativeLstat(...args)
+    if (
+      args[1]?.bigint && path.dirname(path.resolve(String(args[0]))) === bucket &&
+      String(args[0]).endsWith('.json')
+    ) {
+      recordPath = path.resolve(String(args[0]))
+      identityReads += 1
+      setHighInode(stat, identityReads - 1, args[1])
+    }
+    return stat
+  }
+  fs.readFile = async (...args) => {
+    const bytes = await nativeReadFile(...args)
+    if (recordPath && path.resolve(String(args[0])) === recordPath && !replacementDone) {
+      replacementDone = true
+      preservedRecordBytes = Buffer.from(bytes)
+      await replaceFileWithSameBytes(recordPath, bytes)
+    }
+    return bytes
+  }
+  try {
+    await assert.rejects(
+      writeFile(workspace, 'note.md', 'replacement', opened.revision, {
+        root: recovery,
+        fileSystem,
+        logger: { warn: entry => warnings.push(entry) },
+      }),
+      error => {
+        assert.equal(error, injected)
+        assert.equal(error.details.recoveryCleanupWarning.code, 'RECOVERY_RECORD_CHANGED')
+        return true
+      },
+    )
+  } finally {
+    fs.lstat = nativeLstat
+    fs.readFile = nativeReadFile
+  }
+
+  assert.equal(replacementDone, true)
+  assert.equal(identityReads, 2)
+  assert.deepEqual(warnings, [{ event: 'recovery_history_cleanup_failed', path: 'note.md', code: 'RECOVERY_RECORD_CHANGED' }])
+  assert.equal(await fs.readFile(target, 'utf8'), 'original')
+  const history = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  assert.equal(history.length, 1)
+  assert.equal(history[0].revision, opened.revision)
+  assert.deepEqual(await fs.readFile(recordPath), preservedRecordBytes)
+})
+
+test('a post-commit prune failure warns without failing the save and a later save prunes retained history', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'version-0')
+  let current = await readFile(workspace, 'note.md')
+  for (let version = 1; version <= 50; version += 1) {
+    current = await writeFile(workspace, 'note.md', `version-${version}`, current.revision, { root: recovery })
+  }
+
+  const before = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(before.history.length, 50)
+  const oldest = before.history.at(-1)
+  const bucket = await historyBucketFor(workspace, recovery)
+  const oldestPath = path.join(bucket, `${oldest.id}.json`)
+  const oldestEntry = JSON.parse(await fs.readFile(oldestPath, 'utf8'))
+  oldestEntry.savedAt = '2000-01-01T00:00:00.000Z'
+  await fs.writeFile(oldestPath, JSON.stringify(oldestEntry))
+  const retainedBytes = await fs.readFile(oldestPath)
+
+  const originalUnlink = fs.unlink.bind(fs)
+  const logEntries = []
+  let pruneFailureInjected = false
+  fs.unlink = async targetPath => {
+    if (!pruneFailureInjected && path.resolve(String(targetPath)) === oldestPath) {
+      pruneFailureInjected = true
+      throw Object.assign(new Error('injected recovery prune failure'), { code: 'EACCES' })
+    }
+    return originalUnlink(targetPath)
+  }
+  let saved
+  try {
+    saved = await writeFile(workspace, 'note.md', 'version-51', current.revision, {
+      root: recovery,
+      logger: {
+        warn(entry) {
+          logEntries.push(entry)
+          throw new Error('injected logger failure')
+        },
+      },
+    })
+  } finally {
+    fs.unlink = originalUnlink
+  }
+
+  assert.equal(pruneFailureInjected, true)
+  assert.equal(saved.success, true)
+  assert.equal(saved.recoveryCleanupWarning.code, 'EACCES')
+  assert.match(saved.recoveryCleanupWarning.message, /当前保存已成功/)
+  assert.deepEqual(logEntries, [{ event: 'recovery_history_cleanup_failed', path: 'note.md', code: 'EACCES' }])
+  assert.equal(await fs.readFile(target, 'utf8'), 'version-51')
+  assert.deepEqual(await fs.readFile(oldestPath), retainedBytes)
+  const retained = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(retained.history.length, 51)
+  assert.ok(retained.history.some(entry => entry.id === oldest.id))
+
+  const retried = await writeFile(workspace, 'note.md', 'version-52', saved.revision, { root: recovery })
+  assert.equal(retried.success, true)
+  assert.equal('recoveryCleanupWarning' in retried, false)
+  const cleaned = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(cleaned.history.length, 50)
+  assert.ok(!cleaned.history.some(entry => entry.id === oldest.id))
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version-52')
+})
+
+test('a malformed single history record stops pruning and is reported without failing the save', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'version one')
+  const first = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'version two', first.revision, { root: recovery })
+  const second = await readFile(workspace, 'note.md')
+  const existingRecord = (await listFileHistory(workspace, 'note.md', { root: recovery })).history[0]
+  const brokenPath = path.join(await historyBucketFor(workspace, recovery), `${existingRecord.id}.json`)
+  const brokenBytes = Buffer.from('{broken history record')
+  await fs.writeFile(brokenPath, brokenBytes)
+  const logEntries = []
+
+  const saved = await writeFile(workspace, 'note.md', 'version three', second.revision, {
+    root: recovery,
+    logger: { warn: entry => logEntries.push(entry) },
+  })
+
+  assert.equal(saved.success, true)
+  assert.equal(saved.recoveryCleanupWarning.code, 'RECOVERY_HISTORY_RECORD_INVALID')
+  assert.deepEqual(logEntries, [{
+    event: 'recovery_history_cleanup_failed',
+    path: 'note.md',
+    code: 'RECOVERY_HISTORY_RECORD_INVALID',
+  }])
+  assert.deepEqual(await fs.readFile(brokenPath), brokenBytes)
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version three')
+  assert.equal((await listFileHistory(workspace, 'note.md', { root: recovery })).history.length, 1)
+})
+
+test('history pruning keeps a same-byte replacement with an adjacent high inode', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'version-0')
+  let current = await readFile(workspace, 'note.md')
+  for (let version = 1; version <= 50; version += 1) {
+    current = await writeFile(workspace, 'note.md', `version-${version}`, current.revision, { root: recovery })
+  }
+
+  const oldest = (await listFileHistory(workspace, 'note.md', { root: recovery })).history.at(-1)
+  const bucket = await historyBucketFor(workspace, recovery)
+  const oldestPath = path.join(bucket, `${oldest.id}.json`)
+  const oldestEntry = JSON.parse(await fs.readFile(oldestPath, 'utf8'))
+  oldestEntry.savedAt = '2000-01-01T00:00:00.000Z'
+  await fs.writeFile(oldestPath, JSON.stringify(oldestEntry))
+  const originalBytes = await fs.readFile(oldestPath)
+  const nativeLstat = fs.lstat.bind(fs)
+  const nativeReadFile = fs.readFile.bind(fs)
+  let identityReads = 0
+  let replacementDone = false
+  fs.lstat = async (...args) => {
+    const stat = await nativeLstat(...args)
+    if (path.resolve(String(args[0])) === oldestPath && args[1]?.bigint) {
+      identityReads += 1
+      setHighInode(stat, identityReads - 1, args[1])
+    }
+    return stat
+  }
+  fs.readFile = async (...args) => {
+    const bytes = await nativeReadFile(...args)
+    if (path.resolve(String(args[0])) === oldestPath && identityReads > 0 && !replacementDone) {
+      replacementDone = true
+      await replaceFileWithSameBytes(oldestPath, bytes)
+    }
+    return bytes
+  }
+  let saved
+  try {
+    saved = await writeFile(workspace, 'note.md', 'version-51', current.revision, {
+      root: recovery,
+      logger: { warn: () => {} },
+    })
+  } finally {
+    fs.lstat = nativeLstat
+    fs.readFile = nativeReadFile
+  }
+
+  assert.equal(replacementDone, true)
+  assert.equal(identityReads, 2)
+  assert.equal(saved.success, true)
+  assert.equal(saved.recoveryCleanupWarning.code, 'RECOVERY_RECORD_CHANGED')
+  assert.deepEqual(await fs.readFile(oldestPath), originalBytes)
+  assert.ok((await listFileHistory(workspace, 'note.md', { root: recovery })).history.some(entry => entry.id === oldest.id))
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version-51')
 })
 
 test('a later A-to-C save records a fresh recent A snapshot after A-to-B-to-A', async t => {
@@ -715,6 +970,53 @@ test('deleting one history record preserves the current file and returns not fou
     deleteFileHistory(workspace, 'note.md', record.id, { root: recovery }),
     error => error.code === 'HISTORY_NOT_FOUND',
   )
+})
+
+test('history deletion keeps a same-byte replacement when adjacent inode values exceed Number precision', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const notePath = path.join(workspace, 'note.md')
+  await fs.writeFile(notePath, 'version one')
+  const first = await readFile(workspace, 'note.md')
+  await writeFile(workspace, 'note.md', 'version two', first.revision, { root: recovery })
+  const record = (await listFileHistory(workspace, 'note.md', { root: recovery })).history[0]
+  const entryPath = path.join(await historyBucketFor(workspace, recovery), `${record.id}.json`)
+  const originalRecordBytes = await fs.readFile(entryPath)
+  const nativeLstat = fs.lstat.bind(fs)
+  const nativeReadFile = fs.readFile.bind(fs)
+  let identityReads = 0
+  let replacementDone = false
+  fs.lstat = async (...args) => {
+    const stat = await nativeLstat(...args)
+    if (path.resolve(String(args[0])) === entryPath) {
+      identityReads += 1
+      setHighInode(stat, identityReads - 1, args[1] || {})
+    }
+    return stat
+  }
+  fs.readFile = async (...args) => {
+    const bytes = await nativeReadFile(...args)
+    if (path.resolve(String(args[0])) === entryPath && !replacementDone) {
+      replacementDone = true
+      await replaceFileWithSameBytes(entryPath, bytes)
+    }
+    return bytes
+  }
+  try {
+    await assert.rejects(
+      deleteFileHistory(workspace, 'note.md', record.id, { root: recovery }),
+      error => error.code === 'HISTORY_NOT_FOUND',
+    )
+  } finally {
+    fs.lstat = nativeLstat
+    fs.readFile = nativeReadFile
+  }
+
+  assert.equal(replacementDone, true)
+  assert.equal(identityReads, 2)
+  assert.deepEqual(await fs.readFile(entryPath), originalRecordBytes)
+  assert.equal(JSON.parse(await fs.readFile(entryPath, 'utf8')).id, record.id)
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version two')
 })
 
 test('history deletion rejects invalid paths and IDs and cannot cross file or workspace buckets', async t => {

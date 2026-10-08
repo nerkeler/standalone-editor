@@ -417,6 +417,31 @@
   font-size: 12px;
 }
 
+.recovery-maintenance-notices {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--color-warning);
+  background: var(--color-bg-muted);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.recovery-maintenance-notices p {
+  margin: 0 0 8px;
+}
+
+.recovery-maintenance-issue {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.recovery-maintenance-path {
+  font-family: var(--font-mono);
+}
+
 .trash-items-list {
   display: flex;
   max-height: 42vh;

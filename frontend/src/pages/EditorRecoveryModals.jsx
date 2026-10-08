@@ -9,6 +9,7 @@ export function TrashModal({
   stats,
   formatBytes,
   onRetryStats,
+  onReconcilePending,
   mutationBusy,
   loading,
   onPurgeExpired,
@@ -54,6 +55,30 @@ export function TrashModal({
           </div>
         )}
       </div>
+      {(stats?.maintenance?.historyCleanupWarnings?.length > 0 ||
+        stats?.maintenance?.trash?.issues?.length > 0 ||
+        stats?.maintenance?.trash?.restored?.length > 0) && (
+        <section className="recovery-maintenance-notices" aria-label="恢复检查结果">
+          {stats.maintenance.historyCleanupWarnings?.map(warning => (
+            <p key={`history:${warning.path}`} role="status">
+              <strong>{warning.path}</strong>：文档已保存，旧历史清理未完成；已保留额外版本。
+            </p>
+          ))}
+          {stats.maintenance.trash?.restored?.map(item => (
+            <p key={`restored:${item.id}`} role="status">已恢复上次中断操作的原项目：<strong>{item.path}</strong></p>
+          ))}
+          {stats.maintenance.trash?.issues?.map((issue, index) => (
+            <div key={`${issue.id || issue.code}:${index}`} className="recovery-maintenance-issue" role="status">
+              {issue.path && <strong>{issue.path}</strong>}
+              <span>{issue.message}</span>
+              {issue.sourceQuarantinePath && <span className="recovery-maintenance-path">保留位置：{issue.sourceQuarantinePath}</span>}
+            </div>
+          ))}
+          {stats.maintenance.trash?.issues?.length > 0 && (
+            <Button size="small" disabled={mutationBusy || loading} onClick={onReconcilePending}>检查并恢复中断操作</Button>
+          )}
+        </section>
+      )}
       <div className="trash-maintenance-row">
         <span>只清理已过期项目；每条也可单独永久删除。</span>
         <Button
@@ -76,11 +101,12 @@ export function TrashModal({
                 <div className="trash-item-meta">
                   {item.type === 'directory' ? '文件夹' : '文件'} · 移入时间：{new Date(item.createdAt).toLocaleString()}
                   {item.expiresAt && ` · 到期时间：${new Date(item.expiresAt).toLocaleString()}`}
+                  {item.pendingRecovery && ' · 中断操作待检查，副本已保留'}
                 </div>
               </div>
               <div className="trash-item-actions">
-                <Button size="small" type="primary" disabled={mutationBusy} aria-label={`恢复 ${item.path}`} onClick={() => onRestore(item)}>恢复</Button>
-                <Button size="small" danger disabled={mutationBusy} aria-label={`永久删除 ${item.path}`} onClick={() => onPermanentlyDelete(item)}>永久删除</Button>
+                <Button size="small" type="primary" disabled={mutationBusy || item.pendingRecovery} aria-label={`恢复 ${item.path}`} onClick={() => onRestore(item)}>恢复</Button>
+                <Button size="small" danger disabled={mutationBusy || item.pendingRecovery} aria-label={`永久删除 ${item.path}`} onClick={() => onPermanentlyDelete(item)}>永久删除</Button>
               </div>
             </div>
           ))}

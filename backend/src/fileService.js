@@ -57,6 +57,29 @@ function makeCausedError(message, code, cause) {
   return error
 }
 
+function reportRecoveryCleanupWarning(options, reqPath, error, { saveCommitted = true } = {}) {
+  const code = typeof error?.code === 'string' ? error.code : 'RECOVERY_CLEANUP_FAILED'
+  const warning = {
+    code,
+    message: saveCommitted
+      ? '恢复历史清理未完成，当前保存已成功。后续保存时会再次尝试清理。'
+      : '未能清理恢复历史记录，原记录已保留以避免误删。',
+  }
+  const logger = typeof options?.logger?.warn === 'function' ? options.logger : console
+  try {
+    const logged = logger.warn({ event: 'recovery_history_cleanup_failed', path: reqPath, code })
+    if (logged && typeof logged.catch === 'function') logged.catch(() => {})
+  } catch {
+    // Logging is diagnostic only. It must not change the result of a save that
+    // has already committed to disk.
+  }
+  return warning
+}
+
+function recoveryCleanupFailure(message, code = 'RECOVERY_CLEANUP_FAILED') {
+  return makeError(message, code)
+}
+
 function conflict(message = '目标已存在') {
   return makeError(message, 'CONFLICT')
 }
@@ -810,70 +833,138 @@ async function storeHistory(workspace, base, target, bytes, { root } = {}) {
 // recovery point even when opening or syncing the replacement later fails.
 async function pruneHistory(workspace, base, target, { root } = {}, preserveId = null) {
   const { bucket, recovery } = await historyBucket(base, target, root)
-  if (!await historyBucketIsSafe(recovery, bucket)) return
+  if (!await historyBucketIsSafe(recovery, bucket)) {
+    throw recoveryCleanupFailure('恢复历史目录安全性无法确认')
+  }
   const entries = []
-  for (const name of (await fs.readdir(bucket)).filter(item => item.endsWith('.json'))) {
+  for (const name of (await fs.readdir(bucket)).filter(item =>
+    item.endsWith('.json') && HISTORY_ID_PATTERN.test(item.slice(0, -'.json'.length)))) {
+    const entryPath = path.join(bucket, name)
+    let stat
     try {
-      const entryPath = path.join(bucket, name)
-      const stat = await fs.lstat(entryPath)
-      if (!stat.isFile() || stat.isSymbolicLink()) continue
-      const bytes = await fs.readFile(entryPath)
-      const entry = JSON.parse(bytes.toString('utf-8'))
-      if (typeof entry.savedAt === 'string') entries.push({ name, savedAt: entry.savedAt, stat, bytes })
-    } catch {}
+      stat = await fs.lstat(entryPath, { bigint: true })
+    } catch (error) {
+      // Another cleanup can remove an entry after readdir; that is already
+      // the desired result. Other per-record failures must remain visible.
+      if (error.code === 'ENOENT') continue
+      throw error
+    }
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw recoveryCleanupFailure('恢复历史目录包含无法安全清理的记录', 'RECOVERY_HISTORY_RECORD_INVALID')
+    }
+
+    let bytes
+    let entry
+    try {
+      bytes = await fs.readFile(entryPath)
+      entry = JSON.parse(bytes.toString('utf-8'))
+    } catch (error) {
+      throw makeCausedError('恢复历史记录无法读取或解析', 'RECOVERY_HISTORY_RECORD_INVALID', error)
+    }
+    if (typeof entry?.savedAt !== 'string' || !Number.isFinite(Date.parse(entry.savedAt))) {
+      throw recoveryCleanupFailure('恢复历史记录的保存时间无效', 'RECOVERY_HISTORY_RECORD_INVALID')
+    }
+    entries.push({ name, savedAt: entry.savedAt, stat, bytes })
   }
   entries.sort((a, b) => a.savedAt.localeCompare(b.savedAt))
   const excess = entries.length - HISTORY_RETENTION_PER_FILE
   if (excess > 0) {
     const oldest = entries.filter(entry => entry.name !== `${preserveId}.json`)
     for (const entry of oldest.slice(0, excess)) {
-      if (!await historyBucketIsSafe(recovery, bucket)) return
+      if (!await historyBucketIsSafe(recovery, bucket)) {
+        throw recoveryCleanupFailure('恢复历史目录在清理时已变化')
+      }
       const entryPath = path.join(bucket, entry.name)
-      const currentStat = await fs.lstat(entryPath).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+      const currentStat = await fs.lstat(entryPath, { bigint: true }).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+      if (!currentStat) continue
       if (
-        !currentStat || !currentStat.isFile() || currentStat.isSymbolicLink() ||
+        !currentStat.isFile() || currentStat.isSymbolicLink() ||
         currentStat.dev !== entry.stat.dev || currentStat.ino !== entry.stat.ino
-      ) continue
+      ) {
+        throw recoveryCleanupFailure('恢复历史记录在清理时已变化', 'RECOVERY_RECORD_CHANGED')
+      }
       const currentBytes = await fs.readFile(entryPath)
-      if (!currentBytes.equals(entry.bytes)) continue
+      if (!currentBytes.equals(entry.bytes)) {
+        throw recoveryCleanupFailure('恢复历史记录在清理时已变化', 'RECOVERY_RECORD_CHANGED')
+      }
       await fs.unlink(entryPath)
     }
   }
 }
 
 async function discardStoredHistory(stored) {
-  if (!stored?.created) return
+  if (!stored?.created) return null
   const entryPath = path.join(stored.bucket, `${stored.id}.json`)
   try {
-    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) return
-    const recordStat = await fs.lstat(entryPath)
-    if (!recordStat.isFile() || recordStat.isSymbolicLink()) return
-    const recordBytes = await fs.readFile(entryPath)
-    const entry = JSON.parse(recordBytes.toString('utf-8'))
+    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) {
+      throw recoveryCleanupFailure('恢复历史目录安全性无法确认')
+    }
+    let recordStat
+    let recordBytes
+    try {
+      recordStat = await fs.lstat(entryPath, { bigint: true })
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
+    if (!recordStat.isFile() || recordStat.isSymbolicLink()) {
+      throw recoveryCleanupFailure('恢复历史记录类型无法安全清理', 'RECOVERY_HISTORY_RECORD_INVALID')
+    }
+    try {
+      recordBytes = await fs.readFile(entryPath)
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
+    let entry
+    try {
+      entry = JSON.parse(recordBytes.toString('utf-8'))
+    } catch (error) {
+      throw makeCausedError('恢复历史记录无法解析', 'RECOVERY_HISTORY_RECORD_INVALID', error)
+    }
     if (
       entry?.version !== 1 || entry.id !== stored.id || entry.path !== stored.relative ||
       entry.revision !== stored.revision || !Number.isSafeInteger(entry.size) ||
       typeof entry.contentBase64 !== 'string'
-    ) return
+    ) {
+      throw recoveryCleanupFailure('恢复历史记录内容无效', 'RECOVERY_HISTORY_RECORD_INVALID')
+    }
     const bytes = decodeEditableHistoryBytes(entry.contentBase64, entry.size)
-    if (contentRevision(bytes) !== stored.revision) return
+    if (contentRevision(bytes) !== stored.revision) {
+      throw recoveryCleanupFailure('恢复历史记录校验失败', 'HISTORY_CORRUPT')
+    }
 
     // Mirror deleteFileHistory's fail-closed unlink checks: validate the
     // complete bucket path again and refuse to unlink if either the entry
     // inode or its bytes changed while cleanup was preparing.
-    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) return
-    const currentStat = await fs.lstat(entryPath)
+    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) {
+      throw recoveryCleanupFailure('恢复历史目录在清理时已变化')
+    }
+    let currentStat
+    let currentBytes
+    try {
+      currentStat = await fs.lstat(entryPath, { bigint: true })
+      currentBytes = await fs.readFile(entryPath)
+    } catch (error) {
+      if (error.code === 'ENOENT') return null
+      throw error
+    }
     if (
       !currentStat.isFile() || currentStat.isSymbolicLink() ||
       currentStat.dev !== recordStat.dev || currentStat.ino !== recordStat.ino
-    ) return
-    const currentBytes = await fs.readFile(entryPath)
-    if (!currentBytes.equals(recordBytes)) return
+    ) {
+      throw recoveryCleanupFailure('恢复历史记录在清理时已变化', 'RECOVERY_RECORD_CHANGED')
+    }
+    if (!currentBytes.equals(recordBytes)) {
+      throw recoveryCleanupFailure('恢复历史记录在清理时已变化', 'RECOVERY_RECORD_CHANGED')
+    }
     await fs.unlink(entryPath)
     await cleanupEmptyHistoryBucket(stored.recovery, stored.bucket).catch(() => {})
-  } catch {
+    return null
+  } catch (error) {
     // The replacement failure remains primary. If exact cleanup cannot be
     // verified, retain the recovery point rather than risking another record.
+    return error
   }
 }
 
@@ -1628,17 +1719,30 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
             originalStillPresent = latestBytes.equals(existing.bytes)
           }
         } catch {}
-        if (originalStillPresent) await discardStoredHistory(storedHistory)
+        if (originalStillPresent) {
+          const cleanupError = await discardStoredHistory(storedHistory)
+          if (cleanupError) {
+            const warning = reportRecoveryCleanupWarning(options, relativePath(base, target), cleanupError, { saveCommitted: false })
+            error.details = { ...(error.details || {}), recoveryCleanupWarning: warning }
+          }
+        }
       }
       throw error
     }
+    let cleanupWarning
     if (storedHistory) {
       // File replacement has committed. Retention cleanup is best effort so a
       // pruning error cannot make the API report that the already-written
       // document failed to save.
-      try { await pruneHistory(workspace, base, target, options, storedHistory.id) } catch {}
+      try {
+        await pruneHistory(workspace, base, target, options, storedHistory.id)
+      } catch (error) {
+        cleanupWarning = reportRecoveryCleanupWarning(options, relative, error)
+      }
     }
-    return { success: true, path: relative, revision: contentRevision(bytes) }
+    const result = { success: true, path: relative, revision: contentRevision(bytes) }
+    if (cleanupWarning) result.recoveryCleanupWarning = cleanupWarning
+    return result
   } finally {
     await guard.close()
   }
@@ -1680,7 +1784,7 @@ export async function deleteFileHistory(workspace, reqPath, historyId, options =
   let recordStat
   let recordBytes
   try {
-    recordStat = await fs.lstat(entryPath)
+    recordStat = await fs.lstat(entryPath, { bigint: true })
     if (!recordStat.isFile() || recordStat.isSymbolicLink()) throw historyNotFound()
     recordBytes = await fs.readFile(entryPath)
   } catch (error) {
@@ -1726,7 +1830,7 @@ export async function deleteFileHistory(workspace, reqPath, historyId, options =
   let currentStat
   let currentBytes
   try {
-    currentStat = await fs.lstat(entryPath)
+    currentStat = await fs.lstat(entryPath, { bigint: true })
     if (
       !currentStat.isFile() || currentStat.isSymbolicLink() ||
       currentStat.dev !== recordStat.dev || currentStat.ino !== recordStat.ino

@@ -37,6 +37,43 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+test('pending recovery uses the guarded mutation flow and refreshes the current workspace', async () => {
+  const calls = []
+  const report = { restored: [{ id: 'pending-1', path: 'notes/old.md' }], completed: [], issues: [] }
+  const harness = createHarness({
+    get: async (url, config) => {
+      calls.push(['get', url, config])
+      return { data: url.endsWith('/trash') ? { items: [] } : { maintenance: { trash: report } } }
+    },
+    post: async (...args) => { calls.push(['post', ...args]); return { data: report } },
+    delete: async () => { throw new Error('recovery must not delete a trash entry') },
+  })
+  const result = await harness.coordinator.runIntent(harness.coordinator.createIntent('reconcile-pending'))
+  assert.equal(result.ok, true)
+  assert.equal(result.currentWorkspace, true)
+  assert.deepEqual(result.data.restored, report.restored)
+  assert.equal(calls[0][1], '/api/workspace/recovery/reconcile')
+  assert.equal(calls[0][3].headers['X-Workspace-Id'], 'workspace-id-a')
+  assert.equal(calls[0][3].headers['X-Workspace-Version'], '3')
+  assert.equal(harness.state.stats.maintenance.trash.restored[0].path, 'notes/old.md')
+  assert.equal(harness.state.mutationBusy, false)
+})
+
+test('a pending recovery intent cannot resume an operation in a newly selected workspace', async () => {
+  let called = false
+  const harness = createHarness({
+    get: async () => ({ data: {} }),
+    post: async () => { called = true; return { data: {} } },
+    delete: async () => ({ data: {} }),
+  })
+  const intent = harness.coordinator.createIntent('reconcile-pending')
+  harness.context.workspaceKey = 'workspace-b'
+  harness.context.workspaceId = 'workspace-id-b'
+  harness.context.workspaceEpoch += 1
+  assert.equal((await harness.coordinator.runIntent(intent)).reason, 'stale-workspace')
+  assert.equal(called, false)
+})
+
 test('a delayed destructive confirmation cannot mutate the newly selected workspace', async () => {
   const calls = []
   const harness = createHarness({

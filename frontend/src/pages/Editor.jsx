@@ -12,8 +12,6 @@ import {
 } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
 import { Extension } from '@tiptap/core'
-import { EditorState } from '@tiptap/pm/state'
-import { redoDepth, undoDepth } from '@tiptap/pm/history'
 import StarterKit from '@tiptap/starter-kit'
 import Image from '@tiptap/extension-image'
 import Link from '@tiptap/extension-link'
@@ -28,6 +26,7 @@ import { readJsonStorage, readStorage, writeStorage } from '../safeStorage.js'
 import { common, createLowlight } from 'lowlight'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
+import useDocumentHistory from './useDocumentHistory.js'
 import { requiresSourceMode } from './markdownSourcePolicy'
 import { analyzeMarkdownSource } from './markdownDiagnostics.js'
 import { getMarkdownSourceOutline } from './markdownSourceOutline.js'
@@ -369,15 +368,10 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const moveTreeSelect = useCallback((...args) => fileTreeHandlersRef.current.moveSelect?.(...args), [])
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
-  const [sourceHistoryGeneration, setSourceHistoryGeneration] = useState(0)
-  const [sourceHistoryDepths, setSourceHistoryDepths] = useState({ undo: 0, redo: 0 })
-  const [historyComposition, setHistoryComposition] = useState(false)
   const [markdownRepairProposal, setMarkdownRepairProposal] = useState(null)
   const [markdownRepairError, setMarkdownRepairError] = useState(null)
   const [markdownRepairSaving, setMarkdownRepairSaving] = useState(false)
   const [, setSelectionEpoch] = useState(0)
-  const sourceHistoryGenerationRef = useRef(0)
-  const sourceEditorRef = useRef(null)
   const [largeMarkdownView, setLargeMarkdownView] = useState(null)
   const [editorFullscreen, setEditorFullscreen] = useState(false)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
@@ -433,6 +427,15 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   }, [recoveryWorkspaceKey])
 
   useEffect(() => {
+    const report = workspaceInfo?.recoveryMaintenance
+    if (report?.issues?.length) {
+      message.warning({ key: 'workspace-recovery-maintenance', content: '上次回收站操作未完成，数据已保留。请打开回收站查看并处理。', duration: 6 })
+    } else if (report?.restored?.length) {
+      message.success({ key: 'workspace-recovery-maintenance', content: `已恢复上次中断操作的 ${report.restored.length} 个原项目。`, duration: 5 })
+    }
+  }, [workspaceInfo?.recoveryMaintenance])
+
+  useEffect(() => {
     setImportModal(false)
     setImportResult(null)
     setImportWarningDismissed(false)
@@ -476,15 +479,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const markdownRepairOperationRef = useRef(false)
   const openFilesRef = useRef([])
 
-  const replaceSourceContent = useCallback(content => {
-    sourceContentRef.current = content
-    setSourceContent(content)
-    const nextGeneration = sourceHistoryGenerationRef.current + 1
-    sourceHistoryGenerationRef.current = nextGeneration
-    setSourceHistoryGeneration(nextGeneration)
-    setSourceHistoryDepths({ undo: 0, redo: 0 })
-  }, [])
-
   const {
     savedContents, setSavedContents,
     isDirty, setIsDirty,
@@ -520,11 +514,12 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     if (file) handleImageUploadRef.current?.(file)
     return true
   }, [])
+  const historyCompositionChangeRef = useRef(null)
   const editorProps = useMemo(() => ({
     handleDOMEvents: {
       paste: handleEditorPaste,
-      compositionstart: () => { setHistoryComposition(true); return false },
-      compositionend: () => { setHistoryComposition(false); return false },
+      compositionstart: () => { historyCompositionChangeRef.current?.(true); return false },
+      compositionend: () => { historyCompositionChangeRef.current?.(false); return false },
     },
   }), [handleEditorPaste])
 
@@ -598,6 +593,40 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       Strike,
     ],
   }, [])
+
+  const documentHistory = useDocumentHistory({
+    activeFile,
+    activeFileRef,
+    editor,
+    fileLoading,
+    loadingRef,
+    markdownRepairOperationRef,
+    markdownRepairSaving,
+    readOnlyMarkdownRef,
+    renderedFileRef,
+    saveBlockedRef,
+    showSource,
+    showSourceRef,
+  })
+  historyCompositionChangeRef.current = documentHistory.onCompositionChange
+  const {
+    onCompositionChange,
+    onSourceHistoryChange,
+    redoDisabled,
+    resetRichSession: resetRichHistorySession,
+    resetSession: resetDocumentHistorySession,
+    runHistoryCommand,
+    sourceEditorRef,
+    sourceHistoryDepths,
+    sourceHistoryGeneration,
+    undoDisabled,
+  } = documentHistory
+
+  const replaceSourceContent = useCallback(content => {
+    sourceContentRef.current = content
+    setSourceContent(content)
+    resetDocumentHistorySession()
+  }, [resetDocumentHistorySession])
 
   useEffect(() => {
     if (!editor) return
@@ -763,16 +792,14 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       // new editing session, so reinitialize plugin state (including history)
       // without treating the load as an edit or destroying the editor.
       editor.commands.setContent(html, { emitUpdate: false })
-      const { schema, doc, plugins } = editor.state
-      const cleanState = EditorState.create({ schema, doc, plugins })
-      editor.view.updateState(cleanState)
+      resetRichHistorySession(editor)
     } finally {
       suppressEditorUpdateRef.current = false
     }
     refreshOutline()
     setSelectionEpoch(value => value + 1)
     return true
-  }, [editor, refreshOutline])
+  }, [editor, refreshOutline, resetRichHistorySession])
 
   const serializeCurrentEditor = useCallback(() => {
     if (!editor) return ''
@@ -1535,7 +1562,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     if (!showSourceRef.current) {
       const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
       replaceSourceContent(content)
-      setSourceHistoryDepths({ undo: 0, redo: 0 })
       setEditorMarkdown('', path)
       showSourceRef.current = true
       setShowSource(true)
@@ -1714,6 +1740,11 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     const requestId = openRequestRef.current
     const sourceModeAtUpload = showSourceRef.current
     const sourceEditorAtUpload = sourceEditorRef.current
+    const workspaceKeyAtUpload = recoveryWorkspaceKeyRef.current
+    const workspaceIntentAtUpload = createRecoveryIntent('refresh')
+    const isUploadWorkspaceCurrent = () => workspaceIntentAtUpload
+      ? isRecoveryIntentCurrent(workspaceIntentAtUpload)
+      : workspaceKeyAtUpload === recoveryWorkspaceKeyRef.current
     if (
       !isMarkdownFile(targetFile) || loadingRef.current ||
       renderedFileRef.current !== targetFile || readOnlyMarkdownRef.current ||
@@ -1740,6 +1771,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       if (
         activeFileRef.current === targetFile &&
         openRequestRef.current === requestId &&
+        isUploadWorkspaceCurrent() &&
         !loadingRef.current && renderedFileRef.current === targetFile &&
         !readOnlyMarkdownRef.current && !saveBlockedRef.current.has(targetFile) &&
         showSourceRef.current === sourceModeAtUpload &&
@@ -1753,8 +1785,21 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       } else {
         message.info('图片已上传，但当前文档已变化，未插入')
       }
+      if (isUploadWorkspaceCurrent()) {
+        const treeLoaded = await loadTree()
+        if (!isUploadWorkspaceCurrent()) return
+        if (treeLoaded) {
+          const targetDirectory = targetFile.includes('/') ? targetFile.slice(0, targetFile.lastIndexOf('/')) : ''
+          const assetsDirectory = targetDirectory ? `${targetDirectory}/assets` : 'assets'
+          setExpandedKeys(current => isUploadWorkspaceCurrent() && !current.includes(assetsDirectory)
+            ? [...current, assetsDirectory]
+            : current)
+        } else {
+          message.warning('图片已上传，但目录刷新失败，请刷新目录。')
+        }
+      }
     } catch (e) { message.error('上传失败：' + (e.response?.data?.error || e.message)) }
-    finally { setUploading(false) }
+    finally { if (isUploadWorkspaceCurrent()) setUploading(false) }
   }
 
   handleImageUploadRef.current = handleImageUpload
@@ -1848,6 +1893,22 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     setTrashModalOpen(true)
     await refreshTrashAndRecoveryStats()
   }, [refreshTrashAndRecoveryStats])
+
+  const handleReconcilePending = useCallback(async () => {
+    const intent = createRecoveryIntent('reconcile-pending')
+    if (!intent) return
+    const result = await runRecoveryIntent(intent)
+    if (!isRecoveryIntentCurrent(intent) || result.currentWorkspace !== true) return
+    if (!result.ok) {
+      message.warning(result.reason === 'busy' ? '另一个恢复操作正在进行，请稍后重试' : '检查未完成，已有数据仍保留。请稍后重试。')
+      return
+    }
+    if (result.data?.restored?.length) await loadTree()
+    if (!isRecoveryIntentCurrent(intent)) return
+    reportRecoveryRefresh(result.refresh, intent.workspaceKey)
+    if (result.data?.issues?.length) message.warning('仍有无法自动处理的项目，保留位置和原因已列在下方。')
+    else message.success(result.data?.restored?.length ? '中断操作的原项目已恢复' : '检查完成，没有待恢复的中断操作')
+  }, [createRecoveryIntent, isRecoveryIntentCurrent, loadTree, reportRecoveryRefresh, runRecoveryIntent])
 
   const handleRestoreTrashItem = useCallback(async item => {
     const intent = createRecoveryIntent('restore-trash', { id: item?.id })
@@ -2265,31 +2326,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     editor && activeFile && !fileLoading && !showSource && isMarkdownFile(activeFile) &&
     renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current
   )
-  const historyDocumentReady = Boolean(
-    activeFile && isMarkdownFile(activeFile) && !fileLoading && !loadingRef.current &&
-    renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current &&
-    !saveBlockedRef.current.has(activeFile) && !markdownRepairSaving && !historyComposition
-  )
-  const undoDisabled = !historyDocumentReady || (showSource
-    ? !sourceEditorRef.current || sourceHistoryDepths.undo === 0
-    : !editor || undoDepth(editor.state) === 0)
-  const redoDisabled = !historyDocumentReady || (showSource
-    ? !sourceEditorRef.current || sourceHistoryDepths.redo === 0
-    : !editor || redoDepth(editor.state) === 0)
-  const runHistoryCommand = direction => {
-    if (
-      !activeFileRef.current || !isMarkdownFile(activeFileRef.current) ||
-      loadingRef.current || readOnlyMarkdownRef.current ||
-      saveBlockedRef.current.has(activeFileRef.current) || markdownRepairOperationRef.current ||
-      historyComposition
-    ) return false
-    if (showSourceRef.current) return sourceEditorRef.current?.[direction]() || false
-    const currentEditor = editor
-    if (!currentEditor || currentEditor.isDestroyed || currentEditor.view.composing) return false
-    const depth = direction === 'undo' ? undoDepth(currentEditor.state) : redoDepth(currentEditor.state)
-    if (depth === 0) return false
-    return currentEditor.chain().focus()[direction]().run()
-  }
   const currentImportResult = importResult?.workspaceKey === recoveryWorkspaceKey ? importResult : null
   return (
     <div
@@ -2536,6 +2572,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         stats={recoveryStats}
         formatBytes={formatRecoveryBytes}
         onRetryStats={refreshTrashAndRecoveryStats}
+        onReconcilePending={handleReconcilePending}
         mutationBusy={trashMutationBusy}
         loading={trashLoading}
         onPurgeExpired={handlePurgeExpiredTrash}
@@ -2779,8 +2816,8 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
                       renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current &&
                       !saveBlockedRef.current.has(activeFile) && !markdownRepairSaving
                     )}
-                    onHistoryChange={setSourceHistoryDepths}
-                    onCompositionChange={setHistoryComposition}
+                    onHistoryChange={onSourceHistoryChange}
+                    onCompositionChange={onCompositionChange}
                     onChange={value => {
                       if (!isEditableMarkdownSize(value)) {
                         replaceSourceContent(sourceContentRef.current)

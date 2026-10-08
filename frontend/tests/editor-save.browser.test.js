@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { createServer } from 'node:net'
 import { spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, truncate, writeFile } from 'node:fs/promises'
+import { createHash, randomUUID } from 'node:crypto'
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, truncate, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -19,6 +19,38 @@ const firstFile = 'first.md'
 const secondFile = 'second.md'
 const firstSeed = 'First file seed'
 const secondSeed = 'Second file seed'
+
+// Seed a recorded interruption, including exact native identities and bytes,
+// rather than relying on a timing-dependent process termination in a UI test.
+async function seedPendingTrashFile(fileName, content) {
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  const id = randomUUID()
+  const source = path.join(workspace, fileName)
+  await writeFile(source, content, { mode: 0o600 })
+  const sourceStat = await lstat(source, { bigint: true })
+  const mode = Number(sourceStat.mode & 0o777n)
+  const entryDirectory = path.join(tempRoot, 'recovery', 'trash', hash(await realpath(workspace)), id)
+  const payload = path.join(entryDirectory, 'payload')
+  const quarantine = path.join(workspace, `.trash-pending-${id}`)
+  await mkdir(entryDirectory, { recursive: true, mode: 0o700 })
+  await writeFile(payload, content, { mode: 0o600 })
+  await chmod(payload, mode)
+  const payloadStat = await lstat(payload, { bigint: true })
+  const identity = stat => ({ dev: String(stat.dev), ino: String(stat.ino), type: 'file', mode: Number(stat.mode & 0o777n) })
+  await rename(source, quarantine)
+  const createdAt = new Date().toISOString()
+  await writeFile(path.join(entryDirectory, 'entry.json'), JSON.stringify({
+    version: 1, id, workspaceId: hash(await realpath(workspace)), originalPath: fileName,
+    type: 'file', state: 'ready', createdAt,
+    expiresAt: new Date(Date.now() + 86400000).toISOString(),
+    sourceRemoval: {
+      version: 1, phase: 'quarantined', sourceQuarantinePath: `.trash-pending-${id}`,
+      sourceIdentity: identity(sourceStat), payloadIdentity: identity(payloadStat),
+      treeFingerprint: { entries: 1, sha256: hash(`${JSON.stringify(['', 'file', Buffer.byteLength(content), mode, hash(content)])}\n`) },
+    },
+  }), { mode: 0o600 })
+  return { id, source, quarantine, payload }
+}
 
 let tempRoot
 let workspace
@@ -599,6 +631,15 @@ async function openTrash(connection = cdp) {
     (await readVisibleAntModals(connection)).some(modal => modal.title.includes('回收站')))
   await new Promise(resolve => setTimeout(resolve, 250))
   await captureAntModalEvidence('trash-modal', connection)
+}
+
+async function closeTrash(connection = cdp) {
+  await connection.evaluate(`(() => {
+    const modal = Array.from(document.querySelectorAll('.ant-modal')).find(item => item.querySelector('.ant-modal-title')?.innerText.includes('回收站'));
+    modal?.querySelector('.ant-modal-close')?.click();
+  })()`)
+  await waitUntil('trash modal to close', async () =>
+    !(await readVisibleAntModals(connection)).some(modal => modal.title.includes('回收站')))
 }
 
 function formatDisplayedBytes(value) {
@@ -3176,4 +3217,89 @@ test('orphan history can be previewed, restored without silent overwrite, and ex
     return modal?.innerText.includes('当前没有孤儿历史');
   })()`))
   assert.equal(await readFile(path.join(workspace, restoredPath), 'utf8'), orphanSeed, 'deleting orphan history must not delete the restored workspace file')
+})
+
+
+test('saved document remains saved while recovery cleanup warnings are visible in the trash dialog', async () => {
+  await openFile(firstFile, firstSeed)
+  await insertAtSourceEnd('HISTORY-WARNING-INITIAL')
+  await waitUntil('initial history snapshot', async () => {
+    const history = await readWorkspaceHistory(firstFile)
+    return (await readFile(path.join(workspace, firstFile), 'utf8')).includes('HISTORY-WARNING-INITIAL') && history.data.history?.length
+  })
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  const bucket = path.join(tempRoot, 'recovery', 'history', hash(await realpath(workspace)), hash(firstFile))
+  const invalidRecord = path.join(bucket, `${randomUUID()}.json`)
+  await writeFile(invalidRecord, 'invalid history JSON')
+  try {
+    await insertAtSourceEnd('HISTORY-WARNING-SAVED')
+    await waitUntil('committed save with a nonfatal cleanup warning', async () => {
+      const stats = await readWorkspaceRecoveryStats()
+      return (await readFile(path.join(workspace, firstFile), 'utf8')).includes('HISTORY-WARNING-SAVED') &&
+        stats.data.maintenance?.historyCleanupWarnings?.some(warning => warning.path === firstFile)
+    })
+    await waitUntil('successful save status', () => cdp.evaluate(`document.querySelector('.save-status')?.innerText === '已保存'`))
+    await openTrash()
+    await waitUntil('cleanup warning in recovery UI', () => cdp.evaluate(`(() => {
+      const notice = document.querySelector('[aria-label="恢复检查结果"]');
+      return notice?.innerText.includes(${JSON.stringify(firstFile)}) && notice.innerText.includes('文档已保存，旧历史清理未完成');
+    })()`))
+    await saveHistoryReviewScreenshot('history-cleanup-warning.png')
+    assert.equal(await cdp.evaluate(`document.querySelector('.save-status')?.innerText`), '已保存')
+    await closeTrash()
+    await rm(invalidRecord)
+    await insertAtSourceEnd('HISTORY-WARNING-RETRY')
+    await waitUntil('real save retries cleanup and clears its warning', async () => {
+      const stats = await readWorkspaceRecoveryStats()
+      return (await readFile(path.join(workspace, firstFile), 'utf8')).includes('HISTORY-WARNING-RETRY') &&
+        !stats.data.maintenance.historyCleanupWarnings.some(warning => warning.path === firstFile)
+    })
+  } finally {
+    await rm(invalidRecord, { force: true })
+  }
+})
+
+test('pending trash recovery preserves an occupied path and restores its original through the recovery dialog', async () => {
+  const fileName = `pending-recovery-${Date.now()}.md`
+  const content = 'Original quarantined note'
+  const pending = await seedPendingTrashFile(fileName, content)
+  await writeFile(pending.source, 'Newer occupying note')
+  const report = await cdp.evaluate(`(async () => {
+    const info = JSON.parse(localStorage.getItem('editor_workspace_info'));
+    const response = await fetch('/api/workspace/recovery/reconcile', { method: 'POST', headers: {
+      'X-Workspace-Id': info.workspaceId, 'X-Workspace-Version': String(info.workspaceVersion),
+    }});
+    return { status: response.status, data: await response.json() };
+  })()`)
+  assert.equal(report.status, 200)
+  assert.equal(report.data.issues.find(issue => issue.id === pending.id)?.code, 'RESTORE_PATH_OCCUPIED')
+  assert.equal(await readFile(pending.source, 'utf8'), 'Newer occupying note')
+  assert.equal(await readFile(pending.quarantine, 'utf8'), content)
+  assert.equal(await readFile(pending.payload, 'utf8'), content)
+  await openTrash()
+  await waitUntil('pending entry and safe recovery actions', () => cdp.evaluate(`(() => {
+    const notice = document.querySelector('[aria-label="恢复检查结果"]');
+    const restore = Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(`恢复 ${fileName}`)});
+    const remove = Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(`永久删除 ${fileName}`)});
+    return notice?.innerText.includes(${JSON.stringify(fileName)}) && notice.innerText.includes('原路径已有内容') && restore?.disabled && remove?.disabled;
+  })()`))
+  await saveHistoryReviewScreenshot('trash-interruption-path-occupied.png')
+  await rm(pending.source)
+  await clickVisibleButton('检查并恢复中断操作')
+  await waitUntil('exact original restored and pending actions released', async () => {
+    const stats = await readWorkspaceRecoveryStats()
+    return (await readFile(pending.source, 'utf8').catch(() => null)) === content &&
+      !stats.data.maintenance.trash.issues.length &&
+      await cdp.evaluate(`(() => {
+        const restore = Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(`恢复 ${fileName}`)});
+        return restore && !restore.disabled && document.querySelector('[aria-label="恢复检查结果"]')?.innerText.includes('已恢复上次中断操作的原项目');
+      })()`)
+  })
+  assert.equal(await readFile(pending.payload, 'utf8'), content, 'the verified full recovery copy must remain available')
+  await assert.rejects(lstat(pending.quarantine), error => error.code === 'ENOENT')
+  await saveHistoryReviewScreenshot('trash-interruption-restored.png')
+  await closeTrash()
+  await waitUntil('restored file appears in the refreshed tree', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.innerText.trim() === ${JSON.stringify(fileName)})`,
+  ))
 })

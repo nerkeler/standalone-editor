@@ -1,5 +1,5 @@
 const API = '/api/workspace'
-const ACTIONS = new Set(['refresh', 'restore-trash', 'purge-expired', 'delete-trash'])
+const ACTIONS = new Set(['refresh', 'restore-trash', 'purge-expired', 'delete-trash', 'reconcile-pending'])
 
 export function createWorkspaceRecoveryState(context) {
   return {
@@ -195,6 +195,8 @@ export function createWorkspaceRecoveryCoordinator({ api, getWorkspaceContext, o
         response = await api.post(`${API}/trash/restore`, { id: intent.id }, requestConfig(context))
       } else if (intent.action === 'purge-expired') {
         response = await api.post(`${API}/trash/purge-expired`, undefined, requestConfig(context))
+      } else if (intent.action === 'reconcile-pending') {
+        response = await api.post(`${API}/recovery/reconcile`, undefined, requestConfig(context))
       } else if (intent.action === 'delete-trash') {
         response = await api.delete(`${API}/trash`, {
           params: { id: intent.id },
