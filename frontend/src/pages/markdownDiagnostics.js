@@ -11,6 +11,7 @@ const MESSAGES = {
   escapedSyntax: '转义符可能丢失；请保留源码。',
   tableAlignment: '表格列对齐信息可能丢失；请保留源码。',
   nestedLists: '嵌套列表的缩进可能改变；请保留源码。',
+  taskListCompatibility: '混合普通项与任务项或有序任务列表无法由富文本无损保留；请保留源码。',
   rawHtml: '原始 HTML 可能被过滤或重排；请保留源码。',
   codeFenceMetadata: '代码围栏附加信息可能丢失；请保留源码。',
   unparseableMarkdown: 'Markdown 无法解析；请保留源码并检查内容。',
@@ -222,6 +223,23 @@ function collectListItemMarkers(tokens, output = [], parentItem = null, insideBl
   return output
 }
 
+function hasUnsupportedTaskList(token) {
+  if (token.type === 'list') {
+    const taskStates = (token.items || []).map(item => Boolean(item.task))
+    const containsTask = taskStates.some(Boolean)
+    if (containsTask && (token.ordered || taskStates.some(isTask => !isTask))) return true
+  }
+  for (const child of token.tokens || []) {
+    if (hasUnsupportedTaskList(child)) return true
+  }
+  for (const item of token.items || []) {
+    for (const child of item.tokens || []) {
+      if (hasUnsupportedTaskList(child)) return true
+    }
+  }
+  return false
+}
+
 function hasUnsupportedTableAlignment(token, nested = false) {
   return token.type === 'table' && token.align?.some(Boolean) &&
     (nested || !token.align.every(value => value === 'left'))
@@ -243,6 +261,19 @@ export function analyzeMarkdownSource(markdown) {
     return items
   }
   const linkDefinitions = tokens.links || Object.create(null)
+  // The rich editor represents homogeneous unordered task lists. It cannot
+  // represent ordinary items mixed into that list or tasks under an ordered
+  // marker, so protect those complete source list blocks before opening it.
+  let taskListSourceCursor = 0
+  for (const token of tokens) {
+    const raw = String(token.raw || '')
+    const from = raw ? source.indexOf(raw, taskListSourceCursor) : -1
+    if (from >= 0) {
+      const to = Math.min(source.length, from + raw.length)
+      if (hasUnsupportedTaskList(token)) add('taskListCompatibility', from, to)
+      taskListSourceCursor = to
+    }
+  }
   let imageRanges = []
   collectImageRanges(tokens, source, 0, source.length, imageRanges)
   imageRanges.sort((left, right) => left[0] - right[0])

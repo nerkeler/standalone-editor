@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@ant-design/icons": "^5.3.0",
+    "@codemirror/commands": "^6.11.1",
     "@codemirror/lang-markdown": "^6.5.2",
     "@codemirror/lint": "^6.9.7",
     "@tiptap/extension-code-block-lowlight": "^3.31.4",

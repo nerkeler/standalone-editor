@@ -11,6 +11,9 @@ import {
   UploadOutlined
 } from '@ant-design/icons'
 import { useEditor, EditorContent } from '@tiptap/react'
+import { Extension } from '@tiptap/core'
+import { EditorState } from '@tiptap/pm/state'
+import { redoDepth, undoDepth } from '@tiptap/pm/history'
 import StarterKit from '@tiptap/starter-kit'
 import Image from '@tiptap/extension-image'
 import Link from '@tiptap/extension-link'
@@ -48,6 +51,18 @@ import './Editor.css'
 const lowlight = createLowlight(common)
 const MarkdownSourceEditor = lazy(() => import('./MarkdownSourceEditor'))
 const markdownCodec = createMarkdownCodec()
+const isApplePlatform = typeof navigator !== 'undefined' && /Mac|iPhone|iPad|iPod/i.test(`${navigator.platform || ''} ${navigator.userAgent || ''}`)
+const MacControlYRedo = Extension.create({
+  name: 'macControlYRedo',
+  addKeyboardShortcuts() {
+    return {
+      'Ctrl-y': () => {
+        if (!isApplePlatform || !this.editor.isEditable || this.editor.view.composing) return false
+        return this.editor.commands.redo()
+      },
+    }
+  },
+})
 
 const API = '/api/workspace'
 
@@ -354,10 +369,14 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const moveTreeSelect = useCallback((...args) => fileTreeHandlersRef.current.moveSelect?.(...args), [])
   const [showSource, setShowSource] = useState(false)
   const [sourceContent, setSourceContent] = useState('')
+  const [sourceHistoryGeneration, setSourceHistoryGeneration] = useState(0)
+  const [sourceHistoryDepths, setSourceHistoryDepths] = useState({ undo: 0, redo: 0 })
+  const [historyComposition, setHistoryComposition] = useState(false)
   const [markdownRepairProposal, setMarkdownRepairProposal] = useState(null)
   const [markdownRepairError, setMarkdownRepairError] = useState(null)
   const [markdownRepairSaving, setMarkdownRepairSaving] = useState(false)
   const [, setSelectionEpoch] = useState(0)
+  const sourceHistoryGenerationRef = useRef(0)
   const sourceEditorRef = useRef(null)
   const [largeMarkdownView, setLargeMarkdownView] = useState(null)
   const [editorFullscreen, setEditorFullscreen] = useState(false)
@@ -456,6 +475,16 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const markdownRepairProposalRef = useRef(null)
   const markdownRepairOperationRef = useRef(false)
   const openFilesRef = useRef([])
+
+  const replaceSourceContent = useCallback(content => {
+    sourceContentRef.current = content
+    setSourceContent(content)
+    const nextGeneration = sourceHistoryGenerationRef.current + 1
+    sourceHistoryGenerationRef.current = nextGeneration
+    setSourceHistoryGeneration(nextGeneration)
+    setSourceHistoryDepths({ undo: 0, redo: 0 })
+  }, [])
+
   const {
     savedContents, setSavedContents,
     isDirty, setIsDirty,
@@ -494,6 +523,8 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const editorProps = useMemo(() => ({
     handleDOMEvents: {
       paste: handleEditorPaste,
+      compositionstart: () => { setHistoryComposition(true); return false },
+      compositionend: () => { setHistoryComposition(false); return false },
     },
   }), [handleEditorPaste])
 
@@ -552,6 +583,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     editorProps,
     extensions: [
       StarterKit.configure({ heading: false, strike: false, codeBlock: false, link: false, underline: false }),
+      ...(isApplePlatform ? [MacControlYRedo] : []),
       MarkdownHeading.configure({ levels: [1, 2, 3, 4, 5, 6] }),
       CodeBlockLowlight.configure({ lowlight, defaultLanguage: 'plaintext' }),
       MarkdownImage.configure({ inline: false, allowBase64: true }),
@@ -613,8 +645,8 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   useEffect(() => {
     if (!editor) return
     const rerender = () => setSelectionEpoch(value => value + 1)
-    editor.on('selectionUpdate', rerender)
-    return () => editor.off('selectionUpdate', rerender)
+    editor.on('transaction', rerender)
+    return () => editor.off('transaction', rerender)
   }, [editor])
 
   // 键盘快捷键
@@ -720,19 +752,27 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   useEffect(() => { loadTree() }, [loadTree])
 
   const setEditorMarkdown = useCallback((content, documentPath = activeFileRef.current) => {
-    if (!editor) return
+    if (!editor || editor.isDestroyed || documentPath !== activeFileRef.current) return false
     suppressEditorUpdateRef.current = true
     try {
-      // The codec adapter feeds the editor's HTML representation into TipTap.
-      // Keep the guard around replacement so no programmatic update becomes a draft.
-      editor.commands.setContent(markdownCodec.toEditorHtml(content, {
+      const html = markdownCodec.toEditorHtml(content, {
         imageIdentity: workspaceInfoRef.current,
         documentPath,
-      }), { emitUpdate: false })
+      })
+      // Keep the mounted view and its object controls. A replacement is a
+      // new editing session, so reinitialize plugin state (including history)
+      // without treating the load as an edit or destroying the editor.
+      editor.commands.setContent(html, { emitUpdate: false })
+      const { schema, doc, plugins } = editor.state
+      const cleanState = EditorState.create({ schema, doc, plugins })
+      editor.view.updateState(cleanState)
     } finally {
       suppressEditorUpdateRef.current = false
     }
-  }, [editor])
+    refreshOutline()
+    setSelectionEpoch(value => value + 1)
+    return true
+  }, [editor, refreshOutline])
 
   const serializeCurrentEditor = useCallback(() => {
     if (!editor) return ''
@@ -801,8 +841,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         setFileLoading(false)
         setShowSource(false)
         showSourceRef.current = false
-        sourceContentRef.current = ''
-        setSourceContent('')
+        replaceSourceContent('')
         setEditorMarkdown('', path)
         editor?.setEditable(false, false)
         setSaveStatus(hasUnsavedDraft ? 'error' : 'saved')
@@ -863,31 +902,29 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       ) updateMarkdownRepairProposal(repairProposal)
       else clearMarkdownRepairProposal()
       const visible = draftContentsRef.current[path] ?? fetched
-      sourceContentRef.current = visible
       renderedFileRef.current = path
-      loadingRef.current = false
-      setFileLoading(false)
       const keepSource = requiresSourceMode(visible)
       showSourceRef.current = keepSource
       setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(visible, path)
-      setSourceContent(visible)
+      loadingRef.current = false
+      setFileLoading(false)
+      setEditorMarkdown(keepSource ? '' : visible, path)
+      replaceSourceContent(visible)
       setSaveStatus(conflictsRef.current[path] ? 'conflict' : (saveErrorsRef.current[path] ? 'error' : (dirtyRef.current[path] ? 'modified' : 'saved')))
       if (window.matchMedia('(max-width: 768px)').matches) setMobileSidebarOpen(false)
     } catch (error) {
       if (requestId !== openRequestRef.current || activeFileRef.current !== path) return
-      loadingRef.current = false
       renderedFileRef.current = ''
+      loadingRef.current = false
       setFileLoading(false)
-      setEditorMarkdown('')
-      sourceContentRef.current = ''
-      setSourceContent('')
+      setEditorMarkdown('', path)
+      replaceSourceContent('')
       setSaveStatus('idle')
       readOnlyMarkdownRef.current = false
       setLargeMarkdownView(null)
       message.error('打开文件失败：' + (error.response?.data?.error || error.message))
     }
-  }, [clearFileConflict, clearMarkdownRepairProposal, editor, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked, updateMarkdownRepairProposal])
+  }, [clearFileConflict, clearMarkdownRepairProposal, editor, replaceSourceContent, setEditorMarkdown, setDraft, setFileConflict, setFileRevision, setSaveBlocked, updateMarkdownRepairProposal])
 
   const handleFileOpen = useCallback(async node => {
     // The tab identity probe and own-tab crash recovery must finish before a
@@ -928,6 +965,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     loadingRef.current = true
     setFileLoading(true)
     editor?.setEditable(false, false)
+    setEditorMarkdown('', path)
 
     if (isImageFile(node.name || path)) {
       try {
@@ -957,14 +995,13 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       loadingRef.current = false
       setFileLoading(false)
       setEditorMarkdown('')
-      sourceContentRef.current = ''
-      setSourceContent('')
+      replaceSourceContent('')
       setAttachmentViewer({ path, name: node.name || path.split('/').pop() })
       setSaveStatus('idle')
       return
     }
     await loadFile(path, requestId, workspaceKeyAtOpen)
-  }, [captureCurrentDraft, clearMarkdownRepairProposal, collectDirtyDrafts, editor, loadFile, setSaveBlocked, waitForDraftRestore, writePendingDrafts])
+  }, [captureCurrentDraft, clearMarkdownRepairProposal, collectDirtyDrafts, editor, loadFile, replaceSourceContent, setSaveBlocked, waitForDraftRestore, writePendingDrafts])
 
   const handleConfirmMarkdownRepair = useCallback(async () => {
     const proposal = markdownRepairProposalRef.current
@@ -992,12 +1029,11 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     setMarkdownRepairSaving(true)
     try {
       setDraft(path, proposal.content, true)
-      sourceContentRef.current = proposal.content
-      setSourceContent(proposal.content)
+      replaceSourceContent(proposal.content)
       const keepSource = requiresSourceMode(proposal.content)
       showSourceRef.current = keepSource
       setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(proposal.content, path)
+      setEditorMarkdown(keepSource ? '' : proposal.content, path)
       editor?.setEditable(!keepSource, false)
       setSaveStatus('modified')
       const saved = await doSave(path, proposal.content)
@@ -1007,8 +1043,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       const currentDraft = draftContentsRef.current[path]
       if (workspaceStillMatches && currentDraft === proposal.content && !dirtyRef.current[path]) {
         if (activeFileRef.current === path && openRequestRef.current === proposal.requestId && renderedFileRef.current === path) {
-          sourceContentRef.current = proposal.content
-          setSourceContent(proposal.content)
           setSaveStatus('saved')
         }
         clearMarkdownRepairProposal(proposal)
@@ -1036,7 +1070,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       markdownRepairOperationRef.current = false
       setMarkdownRepairSaving(false)
     }
-  }, [clearMarkdownRepairProposal, doSave, editor, setDraft, setEditorMarkdown])
+  }, [clearMarkdownRepairProposal, doSave, editor, replaceSourceContent, setDraft, setEditorMarkdown])
 
   const handleCancelMarkdownRepair = useCallback(() => {
     const proposal = markdownRepairProposalRef.current
@@ -1126,12 +1160,11 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         setFileLoading(false)
         renderedFileRef.current = ''
         setEditorMarkdown('')
-        sourceContentRef.current = ''
-        setSourceContent('')
+        replaceSourceContent('')
         setSaveStatus('idle')
       }
     }
-  }, [handleFileOpen, removeTabState, setEditorMarkdown])
+  }, [handleFileOpen, removeTabState, replaceSourceContent, setEditorMarkdown])
 
   const handleClose = useCallback(async (path, e) => {
     e?.stopPropagation()
@@ -1247,18 +1280,17 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       applyRecoveryAlternative(path, entry)
       const content = entry.snapshot.content
       const keepSource = requiresSourceMode(content)
-      sourceContentRef.current = content
-      setSourceContent(content)
+      replaceSourceContent(content)
       showSourceRef.current = keepSource
       setShowSource(keepSource)
-      if (!keepSource) setEditorMarkdown(content)
+      setEditorMarkdown(keepSource ? '' : content, path)
       setSaveStatus('conflict')
       setRecoveryModalOpen(false)
       await handleShowConflictReview(path, conflictsRef.current[path])
     } catch (error) {
       message.error('载入恢复草稿失败：' + (error.response?.data?.error || error.message))
     }
-  }, [applyRecoveryAlternative, clearMarkdownRepairProposal, clearSaveTimer, handleFileOpen, handleShowConflictReview, saveBlockedRef, setEditorMarkdown])
+  }, [applyRecoveryAlternative, clearMarkdownRepairProposal, clearSaveTimer, handleFileOpen, handleShowConflictReview, replaceSourceContent, saveBlockedRef, setEditorMarkdown])
 
   const handleSaveLocalConflict = useCallback(async () => {
     if (!conflictReview?.path || conflictReview.diskRevision == null || conflictReview.diskContent == null) return
@@ -1314,8 +1346,8 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
           setSaveStatus('modified')
           scheduleSave(path, currentDraft)
         } else {
-          sourceContentRef.current = localContent
-          setSourceContent(localContent)
+          // Saving the selected draft does not replace the document. Keep the
+          // current source view and its native undo/redo history, as for autosave.
           setSaveStatus('saved')
         }
       }
@@ -1395,19 +1427,18 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         saveErrorsRef.current = nextErrors
         setSaveErrors(nextErrors)
         if (activeFileRef.current === path) {
-          sourceContentRef.current = content
-          setSourceContent(content)
+          replaceSourceContent(content)
           const keepSource = requiresSourceMode(content)
           showSourceRef.current = keepSource
           setShowSource(keepSource)
-          if (!keepSource) setEditorMarkdown(content)
+          setEditorMarkdown(keepSource ? '' : content, path)
           setSaveStatus('saved')
         }
         setConflictReview(null)
         message.success('已载入磁盘版本')
       },
     })
-  }, [clearFileConflict, clearMarkdownRepairProposal, clearPendingDraft, conflictReview, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
+  }, [clearFileConflict, clearMarkdownRepairProposal, clearPendingDraft, conflictReview, replaceSourceContent, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleOpenHistory = useCallback(async (path = activeFileRef.current) => {
     if (!isMarkdownFile(path)) return
@@ -1468,12 +1499,11 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
             setDraft(path, content, false)
             clearPendingDraft(path)
             if (activeFileRef.current === path) {
-              sourceContentRef.current = content
-              setSourceContent(content)
+              replaceSourceContent(content)
               const keepSource = requiresSourceMode(content)
               showSourceRef.current = keepSource
               setShowSource(keepSource)
-              if (!keepSource) setEditorMarkdown(content)
+              setEditorMarkdown(keepSource ? '' : content, path)
               setSaveStatus('saved')
             }
             message.success('已恢复历史版本')
@@ -1496,7 +1526,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         }
       },
     })
-  }, [clearMarkdownRepairProposal, clearPendingDraft, historyModal.path, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
+  }, [clearMarkdownRepairProposal, clearPendingDraft, historyModal.path, replaceSourceContent, setDraft, setEditorMarkdown, setFileConflict, setFileRevision])
 
   const handleToggleSource = useCallback(() => {
     const path = activeFileRef.current
@@ -1504,8 +1534,9 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     if (!path || readOnlyMarkdownRef.current || saveBlockedRef.current.has(path) || loadingRef.current || renderedFileRef.current !== path) return
     if (!showSourceRef.current) {
       const content = captureCurrentDraft() ?? draftContentsRef.current[path] ?? ''
-      sourceContentRef.current = content
-      setSourceContent(content)
+      replaceSourceContent(content)
+      setSourceHistoryDepths({ undo: 0, redo: 0 })
+      setEditorMarkdown('', path)
       showSourceRef.current = true
       setShowSource(true)
       return
@@ -1521,7 +1552,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     if (requiresSourceMode(content)) {
       Modal.confirm({
         title: '此文档包含源码模式保护内容',
-        content: '富文本编辑器无法完整保留 YAML、WikiLinks、嵌套列表、引用链接、脚注、转义语法、表格对齐、原始 HTML 或代码围栏附加信息。继续使用源码模式可以原样保存；仍切换后，下一次富文本编辑可能改写这些内容。',
+        content: '富文本编辑器无法完整保留 YAML、WikiLinks、嵌套列表、混合或有序任务列表、引用链接、脚注、转义语法、表格对齐、原始 HTML 或代码围栏附加信息。继续使用源码模式可以原样保存；仍切换后，下一次富文本编辑可能改写这些内容。',
         okText: '仍切换到富文本',
         cancelText: '继续源码模式',
         onOk: enterRichMode,
@@ -1529,7 +1560,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       return
     }
     enterRichMode()
-  }, [captureCurrentDraft, saveBlockedRef, setEditorMarkdown])
+  }, [captureCurrentDraft, replaceSourceContent, saveBlockedRef, setEditorMarkdown])
 
   const prepareWorkspaceSelection = useCallback(async () => {
     const retainedBlockedDrafts = Object.entries(dirtyRef.current)
@@ -1603,12 +1634,11 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         setFileLoading(false)
         renderedFileRef.current = ''
         setEditorMarkdown('')
-        sourceContentRef.current = ''
-        setSourceContent('')
+        replaceSourceContent('')
         setSaveStatus('idle')
       }
     }
-  }, [flushPaths, handleFileOpen, removeTabState, setEditorMarkdown])
+  }, [flushPaths, handleFileOpen, removeTabState, replaceSourceContent, setEditorMarkdown])
 
   // 导出当前文件。下载请求也要经过 API 客户端，以带上工作空间标识。
   const handleExport = async (targetPath = activeFileRef.current) => {
@@ -1754,8 +1784,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
             setFileLoading(false)
             renderedFileRef.current = ''
             setEditorMarkdown('')
-            sourceContentRef.current = ''
-            setSourceContent('')
+            replaceSourceContent('')
             setSaveStatus('idle')
           }
         }
@@ -2130,10 +2159,21 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     parts.slice(0, -1).forEach(p => { cur += (cur ? '/' : '') + p; parents.push(cur) })
     setExpandedKeys(p => [...new Set([...p, ...parents])])
     setSelectedKey(activeFile)
-    setTimeout(() => {
-      const el = document.querySelector(`[data-node-key="${activeFile}"]`)
-      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-    }, 100)
+    let frames = 0
+    const scrollToFile = () => {
+      const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+        .find(node => node.getAttribute('data-path') === activeFile)
+      const row = item?.closest('.ant-tree-treenode') || item
+      if (row && !row.closest('.ant-tree-treenode-motion')) {
+        row.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+        return
+      }
+      if (frames < 120) {
+        frames += 1
+        requestAnimationFrame(scrollToFile)
+      }
+    }
+    requestAnimationFrame(scrollToFile)
   }
 
   const nodeContextItems = contextMenu.node ? [
@@ -2225,6 +2265,31 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     editor && activeFile && !fileLoading && !showSource && isMarkdownFile(activeFile) &&
     renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current
   )
+  const historyDocumentReady = Boolean(
+    activeFile && isMarkdownFile(activeFile) && !fileLoading && !loadingRef.current &&
+    renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current &&
+    !saveBlockedRef.current.has(activeFile) && !markdownRepairSaving && !historyComposition
+  )
+  const undoDisabled = !historyDocumentReady || (showSource
+    ? !sourceEditorRef.current || sourceHistoryDepths.undo === 0
+    : !editor || undoDepth(editor.state) === 0)
+  const redoDisabled = !historyDocumentReady || (showSource
+    ? !sourceEditorRef.current || sourceHistoryDepths.redo === 0
+    : !editor || redoDepth(editor.state) === 0)
+  const runHistoryCommand = direction => {
+    if (
+      !activeFileRef.current || !isMarkdownFile(activeFileRef.current) ||
+      loadingRef.current || readOnlyMarkdownRef.current ||
+      saveBlockedRef.current.has(activeFileRef.current) || markdownRepairOperationRef.current ||
+      historyComposition
+    ) return false
+    if (showSourceRef.current) return sourceEditorRef.current?.[direction]() || false
+    const currentEditor = editor
+    if (!currentEditor || currentEditor.isDestroyed || currentEditor.view.composing) return false
+    const depth = direction === 'undo' ? undoDepth(currentEditor.state) : redoDepth(currentEditor.state)
+    if (depth === 0) return false
+    return currentEditor.chain().focus()[direction]().run()
+  }
   const currentImportResult = importResult?.workspaceKey === recoveryWorkspaceKey ? importResult : null
   return (
     <div
@@ -2629,6 +2694,10 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
                 showSource={showSource}
                 fileLoading={fileLoading}
                 uploading={uploading}
+                undoDisabled={undoDisabled}
+                redoDisabled={redoDisabled}
+                onUndo={() => runHistoryCommand('undo')}
+                onRedo={() => runHistoryCommand('redo')}
                 onToggleSource={handleToggleSource}
                 onInsertLink={handleInsertLink}
                 onUploadImage={() => imageInputRef.current?.click()}
@@ -2702,10 +2771,19 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
               {showSource ? (
                 <Suspense fallback={<div className="source-editor" aria-label="正在加载源码编辑器" />}>
                   <MarkdownSourceEditor
+                    key={JSON.stringify([recoveryWorkspaceKey, activeFile, sourceHistoryGeneration])}
                     ref={sourceEditorRef}
                     value={sourceContent}
+                    editable={Boolean(
+                      activeFile && isMarkdownFile(activeFile) && !fileLoading && !loadingRef.current &&
+                      renderedFileRef.current === activeFile && !readOnlyMarkdownRef.current &&
+                      !saveBlockedRef.current.has(activeFile) && !markdownRepairSaving
+                    )}
+                    onHistoryChange={setSourceHistoryDepths}
+                    onCompositionChange={setHistoryComposition}
                     onChange={value => {
                       if (!isEditableMarkdownSize(value)) {
+                        replaceSourceContent(sourceContentRef.current)
                         message.warning('文档超过 5 MiB 可编辑上限，已撤销这次输入')
                         return false
                       }

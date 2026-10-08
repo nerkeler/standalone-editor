@@ -178,6 +178,102 @@ test('EXDEV uses a verified copy before removing the original', async t => {
   assert.equal(await fs.readFile(path.join(source, 'normal.md'), 'utf8'), 'kept too')
 })
 
+test('EXDEV preserves and restores a source changed after copy verification, then removes the staged entry', async t => {
+  const { workspace, recovery } = await workspaceFixture(t)
+  const sourcePath = path.join(workspace, 'folder')
+  await fs.mkdir(sourcePath)
+  const source = await fs.realpath(sourcePath)
+  const note = path.join(source, 'note.md')
+  await fs.writeFile(note, 'version copied to recovery')
+  let simulatedExdev = false
+  let concurrentEditApplied = false
+  const rename = async (from, to) => {
+    if (!simulatedExdev && from === source && to.endsWith(`${path.sep}payload`)) {
+      simulatedExdev = true
+      const error = new Error('simulated device boundary')
+      error.code = 'EXDEV'
+      throw error
+    }
+    if (
+      simulatedExdev && !concurrentEditApplied && from === source &&
+      path.basename(to).startsWith('.trash-pending-')
+    ) {
+      // This is after the source and recovery copy were verified, immediately
+      // before the source is moved aside for the delete decision.
+      concurrentEditApplied = true
+      await fs.writeFile(note, 'external edit after copy verification')
+    }
+    return fs.rename(from, to)
+  }
+  const trash = createTrashService(workspace, { recoveryRoot: recovery, rename })
+
+  await assert.rejects(trash.trash('folder'), error => error.code === 'FILE_CHANGED')
+  assert.equal(simulatedExdev, true)
+  assert.equal(concurrentEditApplied, true)
+  assert.equal(await fs.readFile(note, 'utf8'), 'external edit after copy verification')
+  assert.deepEqual(await fs.readdir(workspace), ['folder'])
+  assert.deepEqual(await trash.list(), [], 'the stale staged payload and ready manifest must be rolled back')
+})
+
+test('EXDEV retains the verified recovery payload when source cleanup partially deletes then fails', async t => {
+  const { workspace, recovery } = await workspaceFixture(t)
+  const source = path.join(workspace, 'folder')
+  await fs.mkdir(source)
+  await fs.writeFile(path.join(source, 'first.md'), 'first original')
+  await fs.writeFile(path.join(source, 'second.md'), 'second original')
+  const realSource = await fs.realpath(source)
+  let simulatedExdev = false
+  const rename = async (from, to) => {
+    if (!simulatedExdev && from === realSource && to.endsWith(`${path.sep}payload`)) {
+      simulatedExdev = true
+      const error = new Error('simulated device boundary')
+      error.code = 'EXDEV'
+      throw error
+    }
+    return fs.rename(from, to)
+  }
+  const trash = createTrashService(workspace, { recoveryRoot: recovery, rename })
+  const originalRm = fs.rm
+  let cleanupInjected = false
+  fs.rm = async (target, options) => {
+    if (path.basename(target).startsWith('.trash-pending-')) {
+      cleanupInjected = true
+      await fs.unlink(path.join(target, 'first.md'))
+      const error = new Error('simulated partial recursive cleanup')
+      error.code = 'EIO'
+      throw error
+    }
+    return originalRm.call(fs, target, options)
+  }
+
+  let failure
+  try {
+    await assert.rejects(trash.trash('folder'), error => {
+      failure = error
+      return error.code === 'EIO' && error.details?.trashEntryId &&
+        error.details.restoredSourcePath === 'folder' && error.details.recoveryCopyRetained === true
+    })
+  } finally {
+    fs.rm = originalRm
+  }
+
+  assert.equal(simulatedExdev, true)
+  assert.equal(cleanupInjected, true)
+  assert.deepEqual(await fs.readdir(source), ['second.md'], 'the incomplete source is restored to its original path')
+  assert.equal(await fs.readFile(path.join(source, 'second.md'), 'utf8'), 'second original')
+  assert.deepEqual(await fs.readdir(workspace), ['folder'], 'the quarantine sibling is no longer left behind')
+  const entries = await trash.list()
+  assert.equal(entries.length, 1)
+  assert.equal(entries[0].id, failure.details.trashEntryId)
+  assert.equal(entries[0].state, 'ready')
+
+  const workspaceHash = (await fs.readdir(path.join(recovery, 'trash')))[0]
+  const payload = path.join(recovery, 'trash', workspaceHash, failure.details.trashEntryId, 'payload')
+  assert.deepEqual((await fs.readdir(payload)).sort(), ['first.md', 'second.md'])
+  assert.equal(await fs.readFile(path.join(payload, 'first.md'), 'utf8'), 'first original')
+  assert.equal(await fs.readFile(path.join(payload, 'second.md'), 'utf8'), 'second original')
+})
+
 test('a failed EXDEV copy leaves the source untouched and creates no trash entry', async t => {
   const { workspace, recovery } = await workspaceFixture(t)
   const original = path.join(workspace, 'important.md')

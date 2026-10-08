@@ -200,6 +200,45 @@ export default function EditorObjectActions({ editor, activeFile, workspaceKey, 
   useEffect(() => {
     if (!editor) return undefined
     const dom = editor.view.dom
+    let emptyCellTap = null
+    const onEmptyCellTouchStart = event => {
+      emptyCellTap = null
+      if (!enabled || !editor.isEditable || editor.view.composing || event.touches.length !== 1) return
+      const cell = asElement(event.target)?.closest('td, th')
+      if (!cell || !dom.contains(cell)) return
+      const target = findTableTarget(editor, cell)
+      const node = target && editor.state.doc.nodeAt(target.cellPos)
+      // A blank paragraph has no native text hit target. Some touch browsers
+      // keep the previous caret there, which would apply row actions elsewhere.
+      if (node?.childCount !== 1 || node.firstChild?.type.name !== 'paragraph' || node.firstChild.content.size !== 0) return
+      const touch = event.touches[0]
+      emptyCellTap = { cell, id: touch.identifier, x: touch.clientX, y: touch.clientY, time: Date.now(), doc: editor.state.doc }
+    }
+    const onEmptyCellTouchMove = event => {
+      if (!emptyCellTap) return
+      const touch = event.touches[0]
+      if (event.touches.length !== 1 || touch.identifier !== emptyCellTap.id ||
+        Math.hypot(touch.clientX - emptyCellTap.x, touch.clientY - emptyCellTap.y) > 8) emptyCellTap = null
+    }
+    const onEmptyCellTouchEnd = event => {
+      const tap = emptyCellTap
+      emptyCellTap = null
+      if (!tap || event.touches.length || event.changedTouches.length !== 1 ||
+        !enabled || !editor.isEditable || editor.view.composing || editor.state.doc !== tap.doc) return
+      const touch = event.changedTouches[0]
+      if (touch.identifier !== tap.id || Date.now() - tap.time > 400 ||
+        Math.hypot(touch.clientX - tap.x, touch.clientY - tap.y) > 8 ||
+        !dom.contains(tap.cell)) return
+      const target = findTableTarget(editor, tap.cell)
+      if (!target) return
+      // Handle only a short stationary tap; scrolling and long press keep
+      // their browser behavior. No content change or history entry is added.
+      event.preventDefault()
+      const { state, view } = editor
+      view.dispatch(state.tr.setSelection(TextSelection.near(state.doc.resolve(target.cellPos + 1), 1)))
+      view.focus()
+    }
+    const cancelEmptyCellTap = () => { emptyCellTap = null }
     const onObjectMouseDownCapture = event => {
       if (event.button !== 2 || !enabled || !editor.isEditable) return
       const element = asElement(event.target)
@@ -241,10 +280,18 @@ export default function EditorObjectActions({ editor, activeFile, workspaceKey, 
     dom.addEventListener('mousedown', onObjectMouseDownCapture, true)
     dom.addEventListener('contextmenu', onContextMenu)
     dom.addEventListener('keydown', onContextKey)
+    dom.addEventListener('touchstart', onEmptyCellTouchStart, { passive: true })
+    dom.addEventListener('touchmove', onEmptyCellTouchMove, { passive: true })
+    dom.addEventListener('touchend', onEmptyCellTouchEnd, { passive: false })
+    dom.addEventListener('touchcancel', cancelEmptyCellTap)
     return () => {
       dom.removeEventListener('mousedown', onObjectMouseDownCapture, true)
       dom.removeEventListener('contextmenu', onContextMenu)
       dom.removeEventListener('keydown', onContextKey)
+      dom.removeEventListener('touchstart', onEmptyCellTouchStart)
+      dom.removeEventListener('touchmove', onEmptyCellTouchMove)
+      dom.removeEventListener('touchend', onEmptyCellTouchEnd)
+      dom.removeEventListener('touchcancel', cancelEmptyCellTap)
     }
   }, [captureTarget, editor, enabled])
 

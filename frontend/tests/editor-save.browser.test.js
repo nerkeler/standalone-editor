@@ -317,6 +317,105 @@ async function clickExactAriaButton(label, connection = cdp) {
   await connection.evaluate(`Array.from(document.querySelectorAll('button')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(label)} && button.getBoundingClientRect().width > 0)?.click()`)
 }
 
+async function readHistoryButton(label, connection = cdp) {
+  return connection.evaluate(`(() => {
+    const button = Array.from(document.querySelectorAll('button')).find(item =>
+      item.getAttribute('aria-label') === ${JSON.stringify(label)} && item.getClientRects().length > 0
+      && getComputedStyle(item).visibility !== 'hidden' && getComputedStyle(item).display !== 'none');
+    if (!button) return null;
+    const rect = button.getBoundingClientRect();
+    return {
+      disabled: button.disabled || button.getAttribute('aria-disabled') === 'true',
+      x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+      hitIsButton: document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)?.closest('button') === button,
+    };
+  })()`)
+}
+
+async function clickHistoryButton(label, { touch = false, connection = cdp } = {}) {
+  const point = await waitUntil(`${label} history button to be visible and enabled`, async () => {
+    const state = await readHistoryButton(label, connection)
+    return state && !state.disabled && state.width > 0 && state.height > 0 && state.hitIsButton ? state : null
+  })
+  const x = point.x + point.width / 2
+  const y = point.y + point.height / 2
+  if (touch) {
+    await connection.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] })
+    await connection.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] })
+  } else {
+    await connection.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y })
+    await connection.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
+    await connection.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
+  }
+  return point
+}
+
+async function pressHistoryShortcut(key, { control = false, shift = false, nativeInput = false, connection = cdp } = {}) {
+  const isMac = await connection.evaluate(`navigator.platform.toLowerCase().includes('mac')`)
+  const platformModifier = control ? 2 : isMac ? 4 : 2
+  const modifiers = platformModifier | (shift ? 8 : 0)
+  const upper = key.toUpperCase()
+  const keyEvent = { key: shift ? upper : key.toLowerCase(), code: `Key${upper}`, windowsVirtualKeyCode: upper.charCodeAt(0), modifiers }
+  const commands = nativeInput && isMac && upper === 'Z' ? [shift ? 'redo' : 'undo'] : undefined
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyDown', ...keyEvent, ...(commands ? { commands } : {}) })
+  await connection.send('Input.dispatchKeyEvent', { type: 'keyUp', ...keyEvent })
+}
+
+async function setHistoryTestViewport(width, height, mobile) {
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile })
+  await cdp.send('Emulation.setTouchEmulationEnabled', mobile
+    ? { enabled: true, maxTouchPoints: 1 }
+    : { enabled: false })
+
+  const expectMobileLayout = width <= 768
+  let previousGeometry = null
+  let stablePolls = 0
+  return waitUntil(`${expectMobileLayout ? 'mobile' : 'desktop'} history toolbar layout to settle`, async () => {
+    const state = await cdp.evaluate(`(async () => {
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const expectMobile = ${expectMobileLayout};
+      const toolbar = document.querySelector(expectMobile ? '.mobile-toolbar' : '.editor-toolbar');
+      const statusbar = document.querySelector('.editor-statusbar');
+      const sidebar = document.querySelector('.workspace-sidebar');
+      const responsiveReady = matchMedia('(max-width: 768px)').matches === expectMobile
+        && statusbar?.classList.contains('editor-statusbar-theme-slot') === expectMobile
+        && Boolean(sidebar) !== expectMobile
+        && Boolean(toolbar?.getClientRects().length && getComputedStyle(toolbar).display !== 'none');
+      if (!responsiveReady) return null;
+
+      const buttons = ['撤销', '重做'].map(label => {
+        const button = Array.from(toolbar.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === label);
+        const rect = button?.getBoundingClientRect();
+        return rect ? [rect.x, rect.y, rect.width, rect.height].map(value => Math.round(value * 100) / 100) : null;
+      });
+      const rect = toolbar.getBoundingClientRect();
+      const root = document.querySelector('#editor-root');
+      const signature = JSON.stringify({ toolbar: [rect.x, rect.y, rect.width, rect.height], buttons,
+        rootWidth: root?.getBoundingClientRect().width, scrollWidth: document.documentElement.scrollWidth });
+      return { signature };
+    })()`)
+    if (!state) {
+      previousGeometry = null
+      stablePolls = 0
+      return false
+    }
+    stablePolls = state.signature === previousGeometry ? stablePolls + 1 : 1
+    previousGeometry = state.signature
+    return stablePolls >= 3 ? state : null
+  })
+}
+
+async function saveHistoryReviewScreenshot(name) {
+  const directory = process.env.EDITOR_REVIEW_INTERACTION_DIR
+  if (!directory) return null
+  await mkdir(directory, { recursive: true })
+  const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+  const filePath = path.join(directory, name)
+  await writeFile(filePath, Buffer.from(screenshot.data, 'base64'))
+  console.log(`[EDITOR_HISTORY_SCREENSHOT] ${filePath}`)
+  return filePath
+}
+
 async function cancelVisibleConfirmation(connection = cdp) {
   await waitUntil('confirmation cancel action', () => connection.evaluate(
     `Array.from(document.querySelectorAll('.ant-modal-confirm')).some(dialog => {
@@ -795,6 +894,640 @@ test('an edit is persisted by the three-second autosave', async () => {
   assert.equal((await readFile(path.join(workspace, secondFile), 'utf8')), secondSeed)
 })
 
+test('rich undo and redo shortcuts and toolbar stay document-scoped across autosave', async () => {
+  await openFile(firstFile, firstSeed)
+  await setHistoryTestViewport(1195, 751, false)
+
+  const initialButtons = await Promise.all(['撤销', '重做'].map(label => readHistoryButton(label)))
+  assert.deepEqual(initialButtons.map(button => button?.disabled), [true, true], 'loading a document must not create undo history')
+  const desktopToolbar = await cdp.evaluate(`(() => {
+    const toolbar = document.querySelector('.editor-toolbar');
+    const read = label => {
+      const button = Array.from(toolbar?.querySelectorAll('button') || []).find(item => item.getAttribute('aria-label') === label);
+      const rect = button?.getBoundingClientRect();
+      return rect && { width: rect.width, height: rect.height, visible: Boolean(button.getClientRects().length) };
+    };
+    return { visible: Boolean(toolbar?.getClientRects().length && getComputedStyle(toolbar).display !== 'none'), undo: read('撤销'), redo: read('重做') };
+  })()`)
+  assert.equal(desktopToolbar.visible, true, JSON.stringify(desktopToolbar))
+  assert.ok(desktopToolbar.undo?.visible && desktopToolbar.undo.width > 0 && desktopToolbar.undo.height > 0, JSON.stringify(desktopToolbar))
+  assert.ok(desktopToolbar.redo?.visible && desktopToolbar.redo.width > 0 && desktopToolbar.redo.height > 0, JSON.stringify(desktopToolbar))
+  await saveHistoryReviewScreenshot('editor-history-desktop.png')
+
+  const token = `RICH-HISTORY-${Date.now()}`
+  await insertAtDocumentEnd(token)
+  await waitUntil('rich history edit to appear and focus the editor', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(`${firstSeed}${token}`)}
+      && document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await waitUntil('rich undo enabled and redo disabled after typing', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo && redo && !undo.disabled && redo.disabled
+  })
+
+  await pressHistoryShortcut('z')
+  await waitUntil('platform undo to restore the exact rich seed once', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(firstSeed)}`,
+  ))
+  await waitUntil('undo state and editor focus after shortcut', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && !redo?.disabled && await cdp.evaluate(
+      `document.activeElement === document.querySelector('.ProseMirror')`,
+    )
+  })
+
+  await pressHistoryShortcut('y', { control: true })
+  await waitUntil('Ctrl+Y to redo the same rich edit once', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(`${firstSeed}${token}`)}`,
+  ))
+  await waitUntil('redo to disable after Ctrl+Y', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+
+  await pressHistoryShortcut('z')
+  await waitUntil('platform undo after Ctrl+Y to restore the exact rich seed once', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(firstSeed)}`,
+  ))
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('platform Shift+Z redo to restore the rich edit once', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(`${firstSeed}${token}`)}`,
+  ))
+
+  const richAfterFirstStep = `${firstSeed}${token}RICH-HISTORY-STEP-ONE`
+  const richAfterSecondStep = `${richAfterFirstStep}RICH-HISTORY-STEP-TWO`
+  await new Promise(resolve => setTimeout(resolve, 650))
+  await insertAtDocumentEnd('RICH-HISTORY-STEP-ONE')
+  await waitUntil('first distinct rich typing event to append its text', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}`,
+  ))
+  await new Promise(resolve => setTimeout(resolve, 650))
+  await insertAtDocumentEnd('RICH-HISTORY-STEP-TWO')
+  await waitUntil('second distinct rich typing event to append its text', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterSecondStep)}`,
+  ))
+  await pressHistoryShortcut('z')
+  await waitUntil('one undo to remove only the second distinct rich edit', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}`,
+  ))
+  await pressHistoryShortcut('z')
+  await waitUntil('a second undo to remove only the first distinct rich edit', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(`${firstSeed}${token}`)}`,
+  ))
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('one redo to restore only the first distinct rich edit', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}`,
+  ))
+  const lastRedoAt = Date.now()
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('a second redo to restore only the second distinct rich edit', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterSecondStep)}`,
+  ))
+  const initiallySaved = await waitUntil('the rich redo value to autosave after the three-second debounce', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterSecondStep ? content : null
+  }, 10000)
+  assert.equal(initiallySaved, richAfterSecondStep)
+  assert.ok(Date.now() - lastRedoAt >= 2700, 'redo must remain a real document edit and use the normal autosave debounce')
+
+  await clickHistoryButton('撤销')
+  await waitUntil('desktop toolbar undo to restore the prior rich edit and return focus', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}
+      && document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await waitUntil('desktop toolbar undo to enable redo while preserving older undo history', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && !redo?.disabled
+  })
+  assert.equal(await waitUntil('desktop toolbar undo value to autosave', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterFirstStep ? content : null
+  }, 10000), richAfterFirstStep)
+
+  await clickHistoryButton('重做')
+  await waitUntil('desktop toolbar redo to restore the rich edit and editor focus', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterSecondStep)}
+      && document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await waitUntil('desktop toolbar redo to disable after restoring the edit', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+  assert.equal(await waitUntil('desktop toolbar redo value to autosave', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterSecondStep ? content : null
+  }, 10000), richAfterSecondStep)
+
+  const mobileLayout = await setHistoryTestViewport(390, 844, true)
+  const mobileToolbarGeometry = await cdp.evaluate(`(() => {
+    const toolbar = document.querySelector('.mobile-toolbar');
+    const rect = toolbar?.getBoundingClientRect();
+    const buttons = ['撤销', '重做'].map(label => {
+      const button = Array.from(toolbar?.querySelectorAll('button') || []).find(item => item.getAttribute('aria-label') === label);
+      const box = button?.getBoundingClientRect();
+      return box && { width: box.width, height: box.height, left: box.left, right: box.right, visible: Boolean(button.getClientRects().length) };
+    });
+    return { viewportWidth: innerWidth, toolbarVisible: Boolean(toolbar?.getClientRects().length), toolbarWidth: rect?.width,
+      toolbarScrollWidth: toolbar?.scrollWidth, toolbarClientWidth: toolbar?.clientWidth,
+      documentScrollWidth: document.documentElement.scrollWidth, bodyScrollWidth: document.body.scrollWidth,
+      rootScrollWidth: document.querySelector('#editor-root')?.scrollWidth, rootClientWidth: document.querySelector('#editor-root')?.clientWidth,
+      buttons };
+  })()`)
+  assert.ok(mobileLayout?.signature, 'mobile layout geometry should settle before touch input')
+  assert.equal(mobileToolbarGeometry.toolbarVisible, true, JSON.stringify(mobileToolbarGeometry))
+  assert.ok(mobileToolbarGeometry.toolbarWidth > 0, JSON.stringify(mobileToolbarGeometry))
+  assert.ok(mobileToolbarGeometry.buttons.every(button => button?.visible && button.width >= 44 && button.height >= 44), JSON.stringify(mobileToolbarGeometry))
+  assert.ok(mobileToolbarGeometry.buttons.every(button => button.left >= 0 && button.right <= mobileToolbarGeometry.viewportWidth + 1), JSON.stringify(mobileToolbarGeometry))
+  assert.ok(mobileToolbarGeometry.documentScrollWidth <= mobileToolbarGeometry.viewportWidth + 1
+    && mobileToolbarGeometry.bodyScrollWidth <= mobileToolbarGeometry.viewportWidth + 1
+    && mobileToolbarGeometry.rootScrollWidth <= mobileToolbarGeometry.rootClientWidth + 1
+    && mobileToolbarGeometry.toolbarScrollWidth <= mobileToolbarGeometry.toolbarClientWidth + 1,
+  `mobile history toolbar must not introduce horizontal overflow: ${JSON.stringify(mobileToolbarGeometry)}`)
+  await saveHistoryReviewScreenshot('editor-history-mobile.png')
+
+  await clickHistoryButton('撤销', { touch: true })
+  await waitUntil('one real mobile toolbar touch to undo only the last edit and restore editor focus', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}
+      && document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await waitUntil('mobile undo to retain older undo and expose redo', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && !redo?.disabled
+  })
+  assert.equal(await waitUntil('mobile toolbar undo value to autosave', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterFirstStep ? content : null
+  }, 10000), richAfterFirstStep)
+
+  await clickHistoryButton('重做', { touch: true })
+  await waitUntil('one real mobile toolbar touch to redo and restore editor focus', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterSecondStep)}
+      && document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await waitUntil('mobile redo to update toolbar availability', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+  assert.equal(await waitUntil('mobile toolbar redo value to autosave', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterSecondStep ? content : null
+  }, 10000), richAfterSecondStep)
+
+  await pressHistoryShortcut('z')
+  await waitUntil('undo before branching rich history to restore only the final edit', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterFirstStep)}`,
+  ))
+  await waitUntil('an undone rich edit to expose its redo branch before new input', async () => {
+    const redo = await readHistoryButton('重做')
+    return redo && !redo.disabled
+  })
+  const branchToken = 'RICH-HISTORY-BRANCH'
+  const richAfterBranch = `${richAfterFirstStep}${branchToken}`
+  await insertAtDocumentEnd(branchToken)
+  await waitUntil('a new real rich edit to replace the previous redo branch', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(richAfterBranch)}`,
+  ))
+  await waitUntil('new rich input to clear redo after undo', async () => {
+    const redo = await readHistoryButton('重做')
+    return redo?.disabled
+  })
+  await pressHistoryShortcut('z', { shift: true })
+  await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`)
+  assert.equal(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText`), richAfterBranch,
+    'redo after a new edit must not restore the abandoned branch')
+  assert.equal((await readHistoryButton('重做'))?.disabled, true,
+    'the redo button must remain disabled after the abandoned-branch shortcut')
+  assert.equal(await waitUntil('branched rich edit to autosave without the abandoned redo', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === richAfterBranch ? content : null
+  }, 10000), richAfterBranch)
+
+  await setHistoryTestViewport(1195, 751, false)
+  await openFile(secondFile, secondSeed)
+  await waitUntil('loading the second rich document to clear the first document history', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+      && await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(secondSeed)}`)
+  })
+  await cdp.evaluate(`document.querySelector('.ProseMirror')?.focus()`)
+  await waitUntil('second document editor to own keyboard focus', () => cdp.evaluate(
+    `document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await pressHistoryShortcut('z')
+  await waitUntil('undo in a freshly loaded second document to leave its contents intact', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(secondSeed)}`,
+  ))
+  await waitUntil('fresh document history buttons to stay disabled', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+  })
+
+  const searchInput = await cdp.evaluate(`(() => {
+    const input = document.querySelector('.sidebar-search input');
+    input?.focus();
+    return Boolean(input);
+  })()`)
+  assert.equal(searchInput, true, 'the file search input should exist on desktop')
+  const searchText = `history-search-${Date.now()}`
+  await cdp.send('Input.insertText', { text: searchText })
+  await waitUntil('real typing to update the file search input', () => cdp.evaluate(
+    `document.querySelector('.sidebar-search input')?.value === ${JSON.stringify(searchText)}`,
+  ))
+  await cdp.evaluate(`(() => {
+    const search = document.querySelector('.sidebar-search input');
+    window.__searchHistoryKeyEvents = [];
+    window.__searchHistoryKeyHandler = event => {
+      if (event.key.toLowerCase() !== 'z' || !(event.metaKey || event.ctrlKey)) return;
+      const record = {
+        key: event.key,
+        trusted: event.isTrusted,
+        targetIsSearch: event.target === search,
+        defaultPrevented: null,
+      };
+      window.__searchHistoryKeyEvents.push(record);
+      queueMicrotask(() => { record.defaultPrevented = event.defaultPrevented; });
+    };
+    document.addEventListener('keydown', window.__searchHistoryKeyHandler, true);
+    return Boolean(search);
+  })()`)
+  await pressHistoryShortcut('z', { nativeInput: true })
+  await waitUntil('search input undo to restore its own empty value', () => cdp.evaluate(
+    `document.querySelector('.sidebar-search input')?.value === ''`,
+  ))
+  assert.equal(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText`), secondSeed,
+    'undo in search must not alter the document')
+  await pressHistoryShortcut('z', { shift: true, nativeInput: true })
+  await waitUntil('search input redo to restore its own text', () => cdp.evaluate(
+    `document.querySelector('.sidebar-search input')?.value === ${JSON.stringify(searchText)}`,
+  ))
+  assert.equal(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText`), secondSeed,
+    'redo in search must not alter the document')
+  const inputHistoryEvents = await waitUntil('native search undo and redo key events to finish propagation', () => cdp.evaluate(`(() => {
+    const events = window.__searchHistoryKeyEvents || [];
+    return events.length === 2 && events.every(event => event.defaultPrevented !== null) ? events : null;
+  })()`))
+  assert.ok(inputHistoryEvents.every(event => event.targetIsSearch && event.defaultPrevented === false && event.trusted),
+    `search shortcuts must remain unhandled by the document and default input editor: ${JSON.stringify(inputHistoryEvents)}`)
+  await cdp.evaluate(`document.removeEventListener('keydown', window.__searchHistoryKeyHandler, true)`)
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(await readFile(path.join(workspace, firstFile), 'utf8'), richAfterBranch)
+  assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed,
+    'document and search history in B must not write A history into the second file')
+})
+
+test('source undo and redo preserve exact bytes and loaded source has no history', async () => {
+  const original = '# Source history fixture\n\n## Source body\n\nTwo spaces stay here.  '
+  const marker = 'SOURCE-HISTORY-EDIT'
+  const changed = `${original}${marker}`
+  await writeFile(path.join(workspace, firstFile), original)
+  await openFile(firstFile, 'Source body')
+  const firstFileAlreadyUsesSource = await cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`)
+  if (!firstFileAlreadyUsesSource) await clickExactAriaButton('切换到源码编辑')
+  await waitUntil('programmatically loaded exact source bytes', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}`,
+  ))
+  await waitUntil('programmatic source load to leave both history buttons disabled', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+  })
+
+  await cdp.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    if (!view) return false;
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    return true;
+  })()`)
+  await cdp.send('Input.insertText', { text: marker })
+  await waitUntil('source edit to retain exact trailing spaces and original bytes', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(changed)}`,
+  ))
+  await waitUntil('source undo enabled after input and redo disabled', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+
+  await pressHistoryShortcut('z')
+  await waitUntil('source shortcut undo to restore every original byte', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}`,
+  ))
+  await waitUntil('source undo state to enable redo', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && !redo?.disabled
+  })
+  await pressHistoryShortcut('y', { control: true })
+  await waitUntil('source Ctrl+Y redo to restore the exact edited bytes', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(changed)}`,
+  ))
+
+  await clickHistoryButton('撤销')
+  await waitUntil('source toolbar undo to restore original bytes and CodeMirror focus', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}
+      && document.querySelector('.source-editor .cm-editor')?.classList.contains('cm-focused')`,
+  ))
+  await clickHistoryButton('重做')
+  await waitUntil('source toolbar redo to restore edited bytes and CodeMirror focus', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(changed)}
+      && document.querySelector('.source-editor .cm-editor')?.classList.contains('cm-focused')`,
+  ))
+  assert.equal(await waitUntil('source edit autosave to preserve exact original-byte content', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === changed ? content : null
+  }, 10000), changed)
+  await waitUntil('source history controls to remain available after saving', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+
+  await pressHistoryShortcut('z')
+  await waitUntil('undo after source autosave to restore original exact bytes', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}`,
+  ))
+  await waitUntil('saved source undo to expose redo', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && !redo?.disabled
+  })
+  assert.equal(await waitUntil('source undo after save to persist the original exact bytes', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === original ? content : null
+  }, 10000), original)
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('redo after source autosave to restore edited exact bytes', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(changed)}`,
+  ))
+  await waitUntil('saved source redo to remain available with no redo remaining', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return !undo?.disabled && redo?.disabled
+  })
+  assert.equal(await waitUntil('source redo after save to persist edited exact bytes again', async () => {
+    const content = await readFile(path.join(workspace, firstFile), 'utf8')
+    return content === changed ? content : null
+  }, 10000), changed)
+
+  await openFile(secondFile, secondSeed)
+  const secondFileAlreadyUsesSource = await cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`)
+  if (!secondFileAlreadyUsesSource) await clickExactAriaButton('切换到源码编辑')
+  await waitUntil('programmatic source load of another file to start with empty history', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+      && await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(secondSeed)}`)
+  })
+  await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.focus()`)
+  await pressHistoryShortcut('z')
+  assert.equal(await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), secondSeed,
+    'undo in a programmatically loaded source file must not reach the previous source file')
+  assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
+
+  await clickExactAriaButton('切换到富文本编辑')
+  await waitUntil('return from source mode to render the clean rich document', () => cdp.evaluate(
+    `document.querySelector('.ProseMirror')?.innerText === ${JSON.stringify(secondSeed)}`,
+  ))
+  await waitUntil('switching from source to rich mode to leave history empty', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+  })
+  await cdp.evaluate(`document.querySelector('.ProseMirror')?.focus()`)
+  await pressHistoryShortcut('z')
+  assert.equal(await cdp.evaluate(`document.querySelector('.ProseMirror')?.innerText`), secondSeed,
+    'switching the loaded source value to rich mode must not create an undo transaction')
+  assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
+})
+
+test('source conflict overwrite keeps undo and redo while disk reload starts a new history', async () => {
+  const original = '---\nkind: source-conflict-history\n---\n\nOriginal source.  \n'
+  const saved = `${original}FIRST`
+  const local = `${saved}-LOCAL`
+  const redone = `${local}-REDO`
+  const filePath = path.join(workspace, firstFile)
+  const sourceIs = content => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(content)}`,
+  )
+  const typeAtEnd = async text => {
+    assert.equal(await cdp.evaluate(`(() => {
+      const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+      if (!view) return false;
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+      view.focus();
+      return true;
+    })()`), true)
+    await cdp.send('Input.insertText', { text })
+  }
+  const diskIs = async content => (await readFile(filePath, 'utf8')) === content
+  const waitForConflict = () => waitUntil('source save conflict without overwriting external bytes', () => cdp.evaluate(
+    `Boolean(document.querySelector('.file-conflict-banner'))`,
+  ))
+
+  await writeFile(filePath, original)
+  await openFile(firstFile, 'Original source')
+  await waitUntil('protected source to load exact bytes', () => sourceIs(original))
+  await typeAtEnd('FIRST')
+  await clickAriaButton('保存当前文件')
+  await waitUntil('ordinary source save to persist exact bytes', () => diskIs(saved))
+  assert.equal((await readHistoryButton('撤销')).disabled, false, 'ordinary save must retain history')
+
+  // Separate native history groups, leaving both undo and redo available when
+  // the conflict is resolved. All edits use actual browser keyboard input.
+  await new Promise(resolve => setTimeout(resolve, 600))
+  await typeAtEnd('-LOCAL')
+  await new Promise(resolve => setTimeout(resolve, 600))
+  await typeAtEnd('-REDO')
+  await pressHistoryShortcut('z')
+  await waitUntil('undo of the latest source edit to leave a local draft', () => sourceIs(local))
+  await waitUntil('source history to contain both undo and redo before conflict', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo && redo && !undo.disabled && !redo.disabled
+  })
+  await cdp.evaluate(`(() => {
+    window.__sourceBeforeConflict = document.querySelector('.source-editor .cm-content').cmTile.root.view;
+    return true;
+  })()`)
+  const external = `${original}EXTERNAL`
+  await writeFile(filePath, external)
+  await clickAriaButton('保存当前文件')
+  await waitForConflict()
+  assert.equal(await readFile(filePath, 'utf8'), external)
+  await clickVisibleButton('查看磁盘版本')
+  await waitUntil('comparison to show the exact source draft and external version', () => cdp.evaluate(
+    `document.querySelector('[aria-label="本地草稿内容"]')?.value === ${JSON.stringify(local)}
+      && document.querySelector('[aria-label="当前磁盘版本内容"]')?.value === ${JSON.stringify(external)}`,
+  ))
+  await clickVisibleButton('覆盖磁盘并保存本地草稿')
+  await clickVisibleButton('确认并保存本地草稿')
+  await waitUntil('conflict overwrite to save local bytes and become clean', async () =>
+    await diskIs(local) && await cdp.evaluate(
+      `document.querySelector('.save-status')?.innerText === '已保存' && !document.querySelector('.file-conflict-banner')`,
+    ),
+  )
+  const historyAfterSave = await cdp.evaluate(`({
+    sameView: window.__sourceBeforeConflict === document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view,
+    undoDisabled: document.querySelector('button[aria-label="撤销"]')?.disabled,
+    redoDisabled: document.querySelector('button[aria-label="重做"]')?.disabled,
+  })`)
+  assert.deepEqual(historyAfterSave, { sameView: true, undoDisabled: false, redoDisabled: false },
+    'saving the reviewed source draft must retain its editor and both native history branches')
+  await saveHistoryReviewScreenshot('source-conflict-history-after-save.png')
+
+  await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.focus()`)
+  await pressHistoryShortcut('z')
+  await waitUntil('shortcut undo after conflict save to restore the earlier edit', () => sourceIs(saved))
+  await waitUntil('undo after conflict save to autosave with the new revision', () => diskIs(saved))
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('shortcut redo after conflict save to restore local content', () => sourceIs(local))
+  await clickHistoryButton('重做')
+  await waitUntil('original redo branch after conflict save to remain usable', () => sourceIs(redone))
+  await waitUntil('redone source bytes to autosave exactly', () => diskIs(redone))
+
+  const replacement = `${original}DISK REPLACEMENT`
+  await writeFile(filePath, replacement)
+  await typeAtEnd('-DISCARD')
+  await clickAriaButton('保存当前文件')
+  await waitForConflict()
+  await clickVisibleButton('查看磁盘版本')
+  await waitUntil('reload comparison to show the latest external version and local draft', () => cdp.evaluate(
+    `document.querySelector('[aria-label="本地草稿内容"]')?.value === ${JSON.stringify(`${redone}-DISCARD`)}
+      && document.querySelector('[aria-label="当前磁盘版本内容"]')?.value === ${JSON.stringify(replacement)}`,
+  ))
+  await clickVisibleButton('丢弃草稿并重载')
+  await clickConfirmButton('丢弃草稿并载入')
+  await waitUntil('intentional disk reload to start a clean source history', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled && await sourceIs(replacement)
+  })
+  await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.focus()`)
+  await pressHistoryShortcut('z')
+  assert.equal(await sourceIs(replacement), true, 'undo must not cross an intentional disk reload')
+  assert.equal(await readFile(filePath, 'utf8'), replacement)
+})
+
+test('locating the current file handles selector metacharacters in POSIX paths', {
+  skip: process.platform === 'win32' && 'Windows filenames cannot contain double quotes',
+}, async () => {
+  const directories = ['引用"与[括号]', '深层 雪国[资料]']
+  const directoryPaths = directories.map((_, index) => directories.slice(0, index + 1).join('/'))
+  const fileName = '报告"名 [草稿] — 中文.md'
+  const relativePath = [...directories, fileName].join('/')
+  const filePath = path.join(workspace, ...directories, fileName)
+  const seed = 'Locate unusual filename seed'
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, seed)
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('editor to reload after creating the unusual-path file', () => pageIsReady())
+  const waitForFolderState = (directory, expanded) => waitUntil(
+    `${directory} to finish ${expanded ? 'expanding' : 'collapsing'}`,
+    () => cdp.evaluate(`(() => {
+      const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+        .find(node => node.getAttribute('data-path') === ${JSON.stringify(directory)});
+      const row = item?.closest('.ant-tree-treenode');
+      return row?.getAttribute('aria-expanded') === ${JSON.stringify(String(expanded))}
+        && !document.querySelector('.ant-tree-treenode-motion');
+    })()`),
+  )
+
+  for (const directory of directoryPaths) {
+    await waitUntil(`${directory} to appear in the file tree`, () => cdp.evaluate(
+      `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).some(item => item.getAttribute('data-path') === ${JSON.stringify(directory)})`,
+    ))
+    assert.equal(await cdp.evaluate(`(() => {
+      const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+        .find(node => node.getAttribute('data-path') === ${JSON.stringify(directory)});
+      const row = item?.closest('.ant-tree-treenode');
+      if (!row) return false;
+      if (row.getAttribute('aria-expanded') !== 'true') row.querySelector('.ant-tree-switcher')?.click();
+      return true;
+    })()`), true, `the ${directory} folder should expand`)
+    await waitForFolderState(directory, true)
+  }
+
+  await waitUntil('the expanded nested tree to render the exact file path', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+      .some(item => item.getAttribute('data-path') === ${JSON.stringify(relativePath)})`,
+  ))
+  const renderedTreeItems = await cdp.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]')).map(item => ({
+    path: item.getAttribute('data-path'),
+    text: item.innerText.trim(),
+    visible: item.getClientRects().length > 0,
+  }))`)
+  const renderedFile = renderedTreeItems.find(item => item.path === relativePath)
+  assert.ok(renderedFile, `the exact nested file path should render after expanding both folders: ${JSON.stringify(renderedTreeItems)}`)
+  assert.equal(renderedFile.text, fileName, 'the tree should display the filename without selector-related truncation')
+  assert.equal(renderedFile.visible, true, 'the nested filename should be visible before opening')
+  await cdp.evaluate(`Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+    .find(item => item.getAttribute('data-path') === ${JSON.stringify(relativePath)})?.click()`)
+  await waitUntil(`${relativePath} content`, () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(seed)}) || document.querySelector('.ProseMirror[contenteditable="true"]')?.innerText.includes(${JSON.stringify(seed)})`,
+  ))
+  assert.equal(await cdp.evaluate(`(() => {
+    const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+      .find(node => node.getAttribute('data-path') === ${JSON.stringify(directoryPaths[0])});
+    const row = item?.closest('.ant-tree-treenode');
+    if (!row) return false;
+    row.querySelector('.ant-tree-switcher')?.click();
+    return true;
+  })()`), true, 'the active file ancestor should collapse before locating it')
+  await waitForFolderState(directoryPaths[0], false)
+
+  assert.equal(await cdp.evaluate(`Array.from(document.querySelectorAll('.document-tab'))
+    .some(tab => tab.getAttribute('title') === ${JSON.stringify(relativePath)} && tab.querySelector('[role="tab"]')?.getAttribute('aria-selected') === 'true')`), true,
+  'the unusual path should remain the active document before locating it')
+  await cdp.evaluate(`(() => {
+    window.__locateErrors = [];
+    window.addEventListener('error', event => window.__locateErrors.push(event.error?.name || event.message));
+    window.addEventListener('unhandledrejection', event => window.__locateErrors.push(event.reason?.name || String(event.reason)));
+    window.__locateScrollKeys = [];
+    window.__locateScrollCalls = [];
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = function (...args) {
+      const path = this.getAttribute?.('data-path')
+        || this.querySelector?.('[data-testid="file-tree-item"]')?.getAttribute('data-path');
+      window.__locateScrollCalls.push({ path, className: String(this.className || ''), tagName: this.tagName });
+      if (path === ${JSON.stringify(relativePath)}) {
+        window.__locateScrollKeys.push(path);
+      }
+      return originalScrollIntoView?.apply(this, args);
+    };
+  })()`)
+  await clickAriaButton('更多目录操作')
+  await waitUntil('locate current file menu item', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('[role="menuitem"]')).some(item => item.innerText.trim() === '定位当前文件' && item.getClientRects().length > 0 && item.getAttribute('aria-disabled') !== 'true')`,
+  ))
+  await clickMenuItem('定位当前文件')
+  for (const directory of directoryPaths) await waitForFolderState(directory, true)
+  const targetRowIsRendered = () => cdp.evaluate(`(() => {
+    const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+      .find(node => node.getAttribute('data-path') === ${JSON.stringify(relativePath)});
+    const row = item?.closest('.ant-tree-treenode');
+    return Boolean(row && row.getClientRects().length && !row.closest('.ant-tree-treenode-motion'));
+  })()`)
+  await waitUntil('locate to render the target as a real tree row', targetRowIsRendered)
+  const isTargetInsideTreeViewport = () => cdp.evaluate(`(() => {
+    const item = Array.from(document.querySelectorAll('[data-testid="file-tree-item"]'))
+      .find(node => node.getAttribute('data-path') === ${JSON.stringify(relativePath)});
+    const row = item?.closest('.ant-tree-treenode');
+    const container = row?.closest('.tree-scroll');
+    if (!row || !container) return false;
+    const rowRect = row.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    return row.getClientRects().length > 0
+      && rowRect.top >= containerRect.top
+      && rowRect.bottom <= containerRect.bottom;
+  })()`)
+  await waitUntil('locate to place the target row inside the tree scroll viewport', isTargetInsideTreeViewport)
+  const locateState = await cdp.evaluate(`(() => ({
+    errors: window.__locateErrors,
+    scrollKeys: window.__locateScrollKeys,
+    scrollCalls: window.__locateScrollCalls,
+  }))()`)
+  assert.deepEqual(locateState.errors, [], `locate should not throw for selector metacharacters: ${JSON.stringify(locateState)}`)
+  assert.deepEqual(locateState.scrollKeys, [relativePath], `locate should scroll the exact active path: ${JSON.stringify(locateState)}`)
+  assert.equal(await isTargetInsideTreeViewport(), true, 'locate should expand the path and bring its row inside the tree scroll viewport')
+  if (process.env.EDITOR_REVIEW_INTERACTION_DIR) {
+    const directory = process.env.EDITOR_REVIEW_INTERACTION_DIR
+    await mkdir(directory, { recursive: true })
+    const screenshot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+    await writeFile(path.join(directory, 'locate-unusual-path.png'), Buffer.from(screenshot.data, 'base64'))
+  }
+})
+
 test('ZIP import cleanup warnings remain visible, readable on a narrow screen, and dismissible', { timeout: 75_000 }, async t => {
   const importEntries = Array.from({ length: 8 }, (_, index) => ({
     name: `界面告警/深层中文资料目录/这是一条用于窄屏自动换行和滚动验收的长中文Markdown文件名-${String(index + 1).padStart(2, '0')}.md`,
@@ -1127,6 +1860,7 @@ test('restoring history in source mode stays clean and does not schedule another
   await waitUntil('saved source version to become clean', () => cdp.evaluate(
     `document.querySelector('.save-status')?.innerText.includes('已保存')`,
   ))
+  assert.equal((await readHistoryButton('撤销')).disabled, false, 'saved source edits must have history before restoration')
 
   await clickAriaButton('查看版本历史')
   await waitUntil('source history dialog to finish loading', () => cdp.evaluate(`(() => {
@@ -1147,7 +1881,14 @@ test('restoring history in source mode stays clean and does not schedule another
   await waitUntil('restored source content to reach CodeMirror', () => cdp.evaluate(
     `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original)}`,
   ))
-  await new Promise(resolve => setTimeout(resolve, 100))
+  await waitUntil('history restoration to intentionally reset source undo and redo', async () => {
+    const [undo, redo] = await Promise.all([readHistoryButton('撤销'), readHistoryButton('重做')])
+    return undo?.disabled && redo?.disabled
+  })
+  await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.focus()`)
+  await pressHistoryShortcut('z')
+  assert.equal(await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), original,
+    'undo must not restore edits from before an intentional history restoration')
 
   assert.equal(await cdp.evaluate(`document.querySelector('.save-status')?.innerText`), '已保存')
   await new Promise(resolve => setTimeout(resolve, 3300))

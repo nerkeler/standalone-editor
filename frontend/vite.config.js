@@ -13,6 +13,11 @@ const allowedHosts = (process.env.FRONTEND_ALLOWED_HOSTS || '')
 
 export default defineConfig({
   plugins: [react()],
+  optimizeDeps: {
+    // Both editing engines load lazily. Prebundle their history entry points
+    // so opening source mode does not trigger a dependency-discovery reload.
+    include: ['@tiptap/core', '@tiptap/pm/state', '@tiptap/pm/history', '@codemirror/commands'],
+  },
   server: {
     host: '127.0.0.1',
     port: frontendPort,

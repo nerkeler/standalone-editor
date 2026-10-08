@@ -14,12 +14,31 @@ import {
   MoreOutlined,
   OrderedListOutlined,
   ReadOutlined,
+  RedoOutlined,
   ShrinkOutlined,
   StrikethroughOutlined,
+  UndoOutlined,
   UnorderedListOutlined,
   UploadOutlined,
 } from '@ant-design/icons'
 import { TableInsertButton } from './TableControls'
+
+function HistoryButtons({ undoDisabled, redoDisabled, onUndo, onRedo }) {
+  return (
+    <div className="toolbar-group toolbar-history-group">
+      <Tooltip title="撤销 (⌘/Ctrl+Z)">
+        <span className="history-button-tooltip-target">
+          <Button type="text" className="history-toolbar-button" aria-label="撤销" size="small" disabled={undoDisabled} onClick={onUndo} icon={<UndoOutlined />} />
+        </span>
+      </Tooltip>
+      <Tooltip title="重做 (⌘/Ctrl+Shift+Z；Ctrl+Y)">
+        <span className="history-button-tooltip-target">
+          <Button type="text" className="history-toolbar-button" aria-label="重做" size="small" disabled={redoDisabled} onClick={onRedo} icon={<RedoOutlined />} />
+        </span>
+      </Tooltip>
+    </div>
+  )
+}
 
 const headingItems = [
   { key: 'paragraph', label: '正文' },
@@ -70,6 +89,10 @@ export default function WorkbenchToolbar({
   showSource,
   fileLoading,
   uploading,
+  undoDisabled,
+  redoDisabled,
+  onUndo,
+  onRedo,
   onToggleSource,
   onInsertLink,
   onUploadImage,
@@ -107,6 +130,7 @@ export default function WorkbenchToolbar({
     if (!showToolbar) return null
     return (
       <div className="mobile-toolbar" role="toolbar" aria-label="移动端编辑工具栏">
+        <HistoryButtons undoDisabled={undoDisabled} redoDisabled={redoDisabled} onUndo={onUndo} onRedo={onRedo} />
         {!showSource && <>
           <Tooltip title="加粗"><Button aria-label="加粗" {...buttonProps(editor?.isActive('bold'))} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>
           <Tooltip title="斜体"><Button aria-label="斜体" {...buttonProps(editor?.isActive('italic'))} onClick={() => editor?.chain().focus().toggleItalic().run()} icon={<ItalicOutlined />} /></Tooltip>
@@ -157,6 +181,7 @@ export default function WorkbenchToolbar({
 
   return (
     <div className="editor-toolbar" role="toolbar" aria-label="编辑工具栏">
+      <HistoryButtons undoDisabled={undoDisabled} redoDisabled={redoDisabled} onUndo={onUndo} onRedo={onRedo} />
       {!showSource && <>
         <div className="toolbar-group toolbar-format-group">
           <Tooltip title="加粗 (⌘/Ctrl+B)"><Button aria-label="加粗" {...buttonProps(editor?.isActive('bold'))} onClick={() => editor?.chain().focus().toggleBold().run()} icon={<BoldOutlined />} /></Tooltip>

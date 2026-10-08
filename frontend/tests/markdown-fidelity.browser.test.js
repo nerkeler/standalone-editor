@@ -256,6 +256,42 @@ async function setTestViewport(width, height, mobile = false) {
   await connection.send('Emulation.setTouchEmulationEnabled', mobile
     ? { enabled: true, maxTouchPoints: 1 }
     : { enabled: false })
+
+  const expectMobileLayout = width <= 768
+  let previousGeometry = null
+  let stableGeometryPolls = 0
+  await waitUntil(`${expectMobileLayout ? 'mobile' : 'desktop'} editor layout and geometry to settle`, async () => {
+    const layout = await connection.evaluate(`(async () => {
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const expectMobile = ${expectMobileLayout};
+      const mobileMedia = matchMedia('(max-width: 768px)').matches;
+      const sidebar = document.querySelector('.workspace-sidebar');
+      const statusbar = document.querySelector('.editor-statusbar');
+      const statusbarUsesMobileLayout = statusbar?.classList.contains('editor-statusbar-theme-slot');
+      const responsiveLayoutReady = mobileMedia === expectMobile && statusbar
+        && statusbarUsesMobileLayout === expectMobile && Boolean(sidebar) !== expectMobile;
+      if (!responsiveLayoutReady) return null;
+
+      const layoutElements = [
+        ...document.querySelectorAll('#editor-root, .workspace-sidebar, .editor-main, .editor-scroll, .ProseMirror, .editor-statusbar, .mobile-toolbar'),
+        ...document.querySelectorAll('.ProseMirror img, .ProseMirror table'),
+      ];
+      const geometry = layoutElements.map(element => {
+        const rect = element.getBoundingClientRect();
+        return [rect.x, rect.y, rect.width, rect.height, element.scrollWidth, element.scrollHeight]
+          .map(value => Math.round(value * 100) / 100);
+      });
+      return JSON.stringify(geometry);
+    })()`)
+    if (!layout) {
+      previousGeometry = null
+      stableGeometryPolls = 0
+      return false
+    }
+    stableGeometryPolls = layout === previousGeometry ? stableGeometryPolls + 1 : 1
+    previousGeometry = layout
+    return stableGeometryPolls >= 3
+  })
 }
 
 async function dispatchRealInput(targetExpression, { touch = false, scrollIntoView = true, button = 'left' } = {}) {
@@ -1455,6 +1491,110 @@ test('tab-indented unordered and nested ordered tasks are protected in source mo
   assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false)
 })
 
+test('mixed and ordered task states survive source autosave and reopen', async () => {
+  const switchFile = 'task-state-switch.md'
+  await writeFile(path.join(workspace, switchFile), '# Switch away from task states\n')
+  const cases = [
+    {
+      fileName: 'mixed-task-state.md',
+      source: '# Mixed task state preservation\n\n- ordinary item\n- [x] checked task\n- [ ] pending task\n\nNeighbor paragraph: untouched.\n',
+      ordered: false,
+      taskStates: [false, true, true],
+      checkedStates: [undefined, true, false],
+    },
+    {
+      fileName: 'ordered-task-state.md',
+      source: '# Ordered task state preservation\n\n1. [x] checked task\n2. [ ] pending task\n\nNeighbor paragraph: untouched.\n',
+      ordered: true,
+      taskStates: [true, true],
+      checkedStates: [true, false],
+    },
+  ]
+
+  for (const scenario of cases) {
+    await writeFile(path.join(workspace, scenario.fileName), scenario.source)
+    await setupPage()
+    const initialPuts = workspacePutCount()
+    await openFile(scenario.fileName, 'task state preservation')
+    await waitUntil(`${scenario.fileName} source protection`, () => connection.evaluate(
+      `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning') && document.querySelector('.cm-protected-range'))`,
+    ))
+    assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), scenario.source)
+    assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false, 'incompatible task Markdown must not enter the rich editor')
+    assert.equal(await connection.evaluate(`Boolean(document.querySelector('.markdown-repair-banner'))`), false, 'valid task Markdown must stay unmodified instead of receiving a repair proposal')
+
+    const originalParagraph = 'Neighbor paragraph: untouched.'
+    await connection.evaluate(`(() => {
+      const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view
+      const text = view?.state.doc.toString() || ''
+      const from = text.indexOf(${JSON.stringify(originalParagraph)})
+      if (!view || from < 0) return false
+      view.dispatch({ selection: { anchor: from, head: from + ${originalParagraph.length} } })
+      view.focus()
+      return true
+    })()`)
+    const editedParagraph = 'Neighbor paragraph: edited.'
+    await connection.send('Input.insertText', { text: editedParagraph })
+    const saved = await waitUntil(`${scenario.fileName} source autosave`, async () => {
+      const content = await readFile(path.join(workspace, scenario.fileName), 'utf8').catch(() => '')
+      return content.includes(editedParagraph) ? content : null
+    }, 15000)
+    assert.equal(saved, scenario.source.replace(originalParagraph, editedParagraph), 'editing a neighboring paragraph must preserve the source list syntax exactly')
+    assert.ok(workspacePutCount() > initialPuts, 'the source edit should reach disk through autosave')
+    const taskList = marked.lexer(saved).find(token => token.type === 'list')
+    assert.equal(taskList?.ordered, scenario.ordered)
+    assert.deepEqual(taskList?.items.map(item => Boolean(item.task)), scenario.taskStates)
+    assert.deepEqual(taskList?.items.map(item => item.checked), scenario.checkedStates)
+
+    await openFile(switchFile, 'Switch away from task states')
+    await connection.evaluate(`Array.from(document.querySelectorAll('.tab-close')).find(button => button.getAttribute('aria-label') === ${JSON.stringify(`关闭 ${scenario.fileName}`)})?.click()`)
+    await waitUntil(`${scenario.fileName} saved tab to close`, () => connection.evaluate(
+      `!Array.from(document.querySelectorAll('.document-tab')).some(tab => tab.innerText.includes(${JSON.stringify(scenario.fileName)}))`,
+    ))
+    await openFile(scenario.fileName, 'task state preservation')
+    await waitUntil(`${scenario.fileName} task source to reopen from disk`, () => connection.evaluate(
+      `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(saved)}`,
+    ))
+    assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-editor .cm-content') && !document.querySelector('.ProseMirror'))`), true)
+    assert.equal(await readFile(path.join(workspace, scenario.fileName), 'utf8'), saved)
+  }
+})
+
+test('nested task checkboxes do not convert their ordinary parent list item', async () => {
+  const fileName = 'nested-task-boundary.md'
+  const source = '- Parent\n  - [x] Nested checked task\n  - [ ] Nested pending task\n'
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Nested checked task')
+  await waitUntil('nested task source guard before explicit rich conversion', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning'))`,
+  ))
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
+  await waitUntil('explicit rich conversion prompt for the nested list', () => connection.evaluate(
+    `Boolean(document.querySelector('.ant-modal-confirm')?.innerText.includes('此文档包含源码模式保护内容'))`,
+  ))
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal-confirm button')).find(button => button.innerText.trim() === '仍切换到富文本')?.click()`)
+  await waitUntil('explicit nested task conversion to render', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror ul') && document.querySelector('.ProseMirror li[data-type="taskItem"]'))`,
+  ))
+  const structure = await connection.evaluate(`(() => {
+    const lists = Array.from(document.querySelectorAll('.ProseMirror ul'))
+    const outerItem = lists[0]?.querySelector(':scope > li')
+    const inner = lists[1]
+    const items = Array.from(inner?.querySelectorAll(':scope > li') || [])
+    return {
+      outerType: lists[0]?.getAttribute('data-type') || null,
+      outerItemType: outerItem?.getAttribute('data-type') || null,
+      innerType: inner?.getAttribute('data-type') || null,
+      innerChecks: items.map(item => item.getAttribute('data-checked')),
+    }
+  })()`)
+  assert.equal(structure.outerType, null, 'the child checkboxes must not turn the ordinary parent list into a task list')
+  assert.equal(structure.outerItemType, null, 'the ordinary parent item must remain ordinary')
+  assert.equal(structure.innerType, 'taskList')
+  assert.deepEqual(structure.innerChecks, ['true', 'false'])
+})
+
 test('task checkboxes align with wrapped Chinese text and checked state survives save and reopen', async () => {
   const fileName = 'task-layout-persistence.md'
   const switchFile = 'task-layout-switch.md'
@@ -2157,6 +2297,10 @@ test('mobile touch edits an existing table and an inserted table, then autosaves
   await saveRepairScreenshot('table-context-menu-mobile.png')
   await pressKey('Escape', 27)
   await waitForContextMenuClosed('表格操作')
+  await waitUntil('Escape focus restoration to the editor before resetting mobile scroll', () => connection.evaluate(
+    `document.activeElement === document.querySelector('.ProseMirror')`,
+  ))
+  await connection.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`)
   await connection.evaluate(`(() => { const scroll = document.querySelector('.editor-scroll'); if (scroll) scroll.scrollTop = 0 })()`)
   const offscreenTableMore = await waitUntil('table more button to hide when its selected table leaves the editor viewport', () => connection.evaluate(`(() => {
     const scroll = document.querySelector('.editor-scroll'), button = Array.from(document.querySelectorAll('button')).find(item => item.getAttribute('aria-label') === '更多表格操作');

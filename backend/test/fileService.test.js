@@ -143,8 +143,7 @@ test('write, sync, rename, and link failures preserve the old file and remove on
       if (scenario.existing) {
         assert.equal(await fs.readFile(target, 'utf8'), 'original')
         const history = await listFileHistory(workspace, 'note.md', { root: recovery })
-        assert.equal(history.history.length, 1)
-        assert.equal(history.history[0].revision, revision('original'))
+        assert.deepEqual(history.history, [], 'a failed replacement must not add an unnecessary copy of the still-current file')
         if (process.platform !== 'win32') assert.equal((await fs.stat(target)).mode & 0o777, 0o640)
       } else {
         await assert.rejects(fs.lstat(target), error => error.code === 'ENOENT')
@@ -160,6 +159,190 @@ test('write, sync, rename, and link failures preserve the old file and remove on
       }
     })
   }
+})
+
+test('failed saves at the 50-entry limit keep every recovery point and do not duplicate the current version', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'version-0')
+  let current = await readFile(workspace, 'note.md')
+  for (let version = 1; version <= 51; version += 1) {
+    const saved = await writeFile(workspace, 'note.md', `version-${version}`, current.revision, { root: recovery })
+    current = { revision: saved.revision }
+  }
+
+  const before = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(before.history.length, 50)
+  assert.ok(before.history.some(entry => entry.revision === revision('version-1')))
+  const beforeIds = new Set(before.history.map(entry => entry.id))
+  const injected = Object.assign(new Error('injected temporary sync failure'), { code: 'EIO' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      return {
+        stat: (...rest) => handle.stat(...rest),
+        writeFile: (...rest) => handle.writeFile(...rest),
+        chmod: (...rest) => handle.chmod(...rest),
+        sync: async () => { throw injected },
+        close: () => handle.close(),
+      }
+    },
+    rename: (...args) => fs.rename(...args),
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    writeFile(workspace, 'note.md', 'sync-failed', current.revision, { root: recovery, fileSystem }),
+    error => error === injected,
+  )
+  assert.equal(await fs.readFile(target, 'utf8'), 'version-51')
+  assert.deepEqual(new Set((await listFileHistory(workspace, 'note.md', { root: recovery })).history.map(entry => entry.id)), beforeIds)
+
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    await fs.chmod(workspace, 0o555)
+    try {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await assert.rejects(
+          writeFile(workspace, 'note.md', `permission-failed-${attempt}`, current.revision, { root: recovery }),
+          error => error.code === 'EACCES',
+        )
+      }
+    } finally {
+      await fs.chmod(workspace, 0o755)
+    }
+  } else {
+    t.diagnostic(process.platform === 'win32'
+      ? 'Skipped chmod-based EACCES checks because POSIX directory permission bits do not apply on Windows'
+      : 'Skipped chmod-based EACCES checks because root bypasses POSIX directory permissions')
+  }
+
+  const after = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(after.history.length, 50)
+  assert.deepEqual(new Set(after.history.map(entry => entry.id)), beforeIds)
+  assert.equal(after.history.filter(entry => entry.revision === current.revision).length, 0)
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version-51')
+})
+
+test('failed retries leave prior history intact when the unchanged current bytes appeared earlier', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'version A')
+  const first = await readFile(workspace, 'note.md')
+  const second = await writeFile(workspace, 'note.md', 'version B', first.revision, { root: recovery })
+  const third = await writeFile(workspace, 'note.md', 'version A', second.revision, { root: recovery })
+  const before = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(before.history.filter(entry => entry.revision === first.revision).length, 1)
+  const beforeIds = new Set(before.history.map(entry => entry.id))
+  const injected = Object.assign(new Error('injected temporary sync failure'), { code: 'EIO' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      return {
+        stat: (...rest) => handle.stat(...rest),
+        writeFile: (...rest) => handle.writeFile(...rest),
+        chmod: (...rest) => handle.chmod(...rest),
+        sync: async () => { throw injected },
+        close: () => handle.close(),
+      }
+    },
+    rename: (...args) => fs.rename(...args),
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await assert.rejects(
+      writeFile(workspace, 'note.md', `failed-${attempt}`, third.revision, { root: recovery, fileSystem }),
+      error => error === injected,
+    )
+  }
+  const after = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.deepEqual(new Set(after.history.map(entry => entry.id)), beforeIds)
+  assert.equal(after.history.filter(entry => entry.revision === first.revision).length, 1)
+  assert.equal((await readFile(workspace, 'note.md')).content, 'version A')
+})
+
+test('a failed history cleanup leaves one reusable newest snapshot for subsequent retries', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  const target = path.join(workspace, 'note.md')
+  await fs.writeFile(target, 'original')
+  const opened = await readFile(workspace, 'note.md')
+  const injectedSync = Object.assign(new Error('injected temporary sync failure'), { code: 'EIO' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      return {
+        stat: (...rest) => handle.stat(...rest),
+        writeFile: (...rest) => handle.writeFile(...rest),
+        chmod: (...rest) => handle.chmod(...rest),
+        sync: async () => { throw injectedSync },
+        close: () => handle.close(),
+      }
+    },
+    rename: (...args) => fs.rename(...args),
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  const originalUnlink = fs.unlink.bind(fs)
+  let cleanupFailureInjected = false
+  fs.unlink = async targetPath => {
+    if (!cleanupFailureInjected && /^[0-9a-f-]{36}\.json$/.test(path.basename(String(targetPath)))) {
+      cleanupFailureInjected = true
+      throw Object.assign(new Error('injected recovery record cleanup failure'), { code: 'EACCES' })
+    }
+    return originalUnlink(targetPath)
+  }
+  try {
+    await assert.rejects(
+      writeFile(workspace, 'note.md', 'replacement-0', opened.revision, { root: recovery, fileSystem }),
+      error => error === injectedSync,
+    )
+  } finally {
+    fs.unlink = originalUnlink
+  }
+  assert.equal(cleanupFailureInjected, true)
+  const retained = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.equal(retained.history.length, 1)
+  assert.equal(retained.history[0].revision, opened.revision)
+  const retainedId = retained.history[0].id
+
+  for (let attempt = 1; attempt < 3; attempt += 1) {
+    await assert.rejects(
+      writeFile(workspace, 'note.md', `replacement-${attempt}`, opened.revision, { root: recovery, fileSystem }),
+      error => error === injectedSync,
+    )
+  }
+  const after = await listFileHistory(workspace, 'note.md', { root: recovery })
+  assert.deepEqual(after.history.map(entry => entry.id), [retainedId])
+  assert.equal(await fs.readFile(target, 'utf8'), 'original')
+})
+
+test('a later A-to-C save records a fresh recent A snapshot after A-to-B-to-A', async t => {
+  const workspace = await temporaryWorkspace(t)
+  const recovery = await temporaryRecovery(t)
+  await fs.writeFile(path.join(workspace, 'note.md'), 'version A')
+  const first = await readFile(workspace, 'note.md')
+  const second = await writeFile(workspace, 'note.md', 'version B', first.revision, { root: recovery })
+  const firstA = (await listFileHistory(workspace, 'note.md', { root: recovery })).history[0]
+  assert.equal(firstA.revision, first.revision)
+
+  const third = await writeFile(workspace, 'note.md', 'version A', second.revision, { root: recovery })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  await writeFile(workspace, 'note.md', 'version C', third.revision, { root: recovery })
+
+  const history = (await listFileHistory(workspace, 'note.md', { root: recovery })).history
+  const aSnapshots = history.filter(entry => entry.revision === first.revision)
+  assert.equal(history.length, 3)
+  assert.equal(aSnapshots.length, 2)
+  assert.notEqual(aSnapshots[0].id, aSnapshots[1].id)
+  assert.equal(history[0].revision, first.revision)
+  assert.notEqual(history[0].id, firstA.id)
+  assert.ok(Date.parse(history[0].savedAt) > Date.parse(firstA.savedAt))
 })
 
 test('failed cleanup reports the error and leaves a replacement inode untouched', async t => {

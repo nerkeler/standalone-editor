@@ -667,6 +667,17 @@
   background: var(--color-surface-hover) !important;
 }
 
+.history-button-tooltip-target { display: inline-flex; flex: 0 0 auto; }
+.editor-toolbar .history-toolbar-button.ant-btn:disabled,
+.mobile-toolbar .history-toolbar-button.ant-btn:disabled,
+.editor-toolbar .history-toolbar-button.ant-btn:disabled:hover,
+.mobile-toolbar .history-toolbar-button.ant-btn:disabled:hover {
+  color: var(--color-text-tertiary) !important;
+  background: var(--color-bg-muted) !important;
+  cursor: not-allowed !important;
+  opacity: 0.62;
+}
+
 .editor-toolbar .heading-picker,
 .mobile-toolbar .heading-picker {
   min-width: 92px;

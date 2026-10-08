@@ -754,6 +754,27 @@ async function storeHistory(workspace, base, target, bytes, { root } = {}) {
   await ensurePrivateDirectory(historyRoot)
   await ensurePrivateDirectory(workspaceDir)
   await ensurePrivateDirectory(bucket)
+  if (!await historyBucketIsSafe(recovery, bucket)) {
+    throw makeError('恢复历史目录不可用', 'RECOVERY_STORAGE_ERROR')
+  }
+
+  const revision = contentRevision(bytes)
+  // Recovery stores content snapshots, so reuse an already-validated copy of
+  // the current bytes only when it is the newest valid snapshot. That covers
+  // a prior failed write whose cleanup could not safely remove its entry,
+  // without making an older A snapshot stand in for a newer A -> B -> A save.
+  for (const prior of await listHistoryInBucket(bucket, relative)) {
+    try {
+      const validated = await readHistoryEntry(workspace, base, target, prior.id, { root })
+      if (validated.bytes.equals(bytes) && prior.revision === revision) {
+        return { ...prior, bucket, recovery, relative, created: false }
+      }
+    } catch (error) {
+      if (!['HISTORY_NOT_FOUND', 'HISTORY_CORRUPT', 'DOCUMENT_TOO_LARGE'].includes(error.code)) throw error
+      continue
+    }
+    break
+  }
 
   const savedAt = new Date().toISOString()
   const id = randomUUID()
@@ -761,7 +782,7 @@ async function storeHistory(workspace, base, target, bytes, { root } = {}) {
     version: 1,
     id,
     path: relative,
-    revision: contentRevision(bytes),
+    revision,
     savedAt,
     size: bytes.byteLength,
     contentBase64: bytes.toString('base64'),
@@ -781,19 +802,79 @@ async function storeHistory(workspace, base, target, bytes, { root } = {}) {
     throw makeCausedError(`无法保存文件恢复历史：${error.message}`, 'RECOVERY_STORAGE_ERROR', error)
   }
 
+  return { id, revision: entry.revision, savedAt, size: entry.size, bucket, recovery, relative, created: true }
+}
+
+// Retention is a post-commit operation. The previous file must be captured
+// before replacement, but pruning before replacement can destroy an older
+// recovery point even when opening or syncing the replacement later fails.
+async function pruneHistory(workspace, base, target, { root } = {}, preserveId = null) {
+  const { bucket, recovery } = await historyBucket(base, target, root)
+  if (!await historyBucketIsSafe(recovery, bucket)) return
   const entries = []
   for (const name of (await fs.readdir(bucket)).filter(item => item.endsWith('.json'))) {
     try {
-      const entry = JSON.parse(await fs.readFile(path.join(bucket, name), 'utf-8'))
-      if (typeof entry.savedAt === 'string') entries.push({ name, savedAt: entry.savedAt })
+      const entryPath = path.join(bucket, name)
+      const stat = await fs.lstat(entryPath)
+      if (!stat.isFile() || stat.isSymbolicLink()) continue
+      const bytes = await fs.readFile(entryPath)
+      const entry = JSON.parse(bytes.toString('utf-8'))
+      if (typeof entry.savedAt === 'string') entries.push({ name, savedAt: entry.savedAt, stat, bytes })
     } catch {}
   }
   entries.sort((a, b) => a.savedAt.localeCompare(b.savedAt))
   const excess = entries.length - HISTORY_RETENTION_PER_FILE
   if (excess > 0) {
-    await Promise.all(entries.slice(0, excess).map(entry => fs.unlink(path.join(bucket, entry.name))))
+    const oldest = entries.filter(entry => entry.name !== `${preserveId}.json`)
+    for (const entry of oldest.slice(0, excess)) {
+      if (!await historyBucketIsSafe(recovery, bucket)) return
+      const entryPath = path.join(bucket, entry.name)
+      const currentStat = await fs.lstat(entryPath).catch(error => error.code === 'ENOENT' ? null : Promise.reject(error))
+      if (
+        !currentStat || !currentStat.isFile() || currentStat.isSymbolicLink() ||
+        currentStat.dev !== entry.stat.dev || currentStat.ino !== entry.stat.ino
+      ) continue
+      const currentBytes = await fs.readFile(entryPath)
+      if (!currentBytes.equals(entry.bytes)) continue
+      await fs.unlink(entryPath)
+    }
   }
-  return { id, revision: entry.revision, savedAt, size: entry.size }
+}
+
+async function discardStoredHistory(stored) {
+  if (!stored?.created) return
+  const entryPath = path.join(stored.bucket, `${stored.id}.json`)
+  try {
+    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) return
+    const recordStat = await fs.lstat(entryPath)
+    if (!recordStat.isFile() || recordStat.isSymbolicLink()) return
+    const recordBytes = await fs.readFile(entryPath)
+    const entry = JSON.parse(recordBytes.toString('utf-8'))
+    if (
+      entry?.version !== 1 || entry.id !== stored.id || entry.path !== stored.relative ||
+      entry.revision !== stored.revision || !Number.isSafeInteger(entry.size) ||
+      typeof entry.contentBase64 !== 'string'
+    ) return
+    const bytes = decodeEditableHistoryBytes(entry.contentBase64, entry.size)
+    if (contentRevision(bytes) !== stored.revision) return
+
+    // Mirror deleteFileHistory's fail-closed unlink checks: validate the
+    // complete bucket path again and refuse to unlink if either the entry
+    // inode or its bytes changed while cleanup was preparing.
+    if (!await historyBucketIsSafe(stored.recovery, stored.bucket)) return
+    const currentStat = await fs.lstat(entryPath)
+    if (
+      !currentStat.isFile() || currentStat.isSymbolicLink() ||
+      currentStat.dev !== recordStat.dev || currentStat.ino !== recordStat.ino
+    ) return
+    const currentBytes = await fs.readFile(entryPath)
+    if (!currentBytes.equals(recordBytes)) return
+    await fs.unlink(entryPath)
+    await cleanupEmptyHistoryBucket(stored.recovery, stored.bucket).catch(() => {})
+  } catch {
+    // The replacement failure remains primary. If exact cleanup cannot be
+    // verified, retain the recovery point rather than risking another record.
+  }
 }
 
 async function readHistoryEntry(workspace, base, target, historyId, { root } = {}) {
@@ -1425,7 +1506,9 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
     const name = path.basename(target)
     const relative = relativePath(base, target)
 
-    if (existing) await storeHistory(workspace, base, target, existing.bytes, options)
+    const storedHistory = existing
+      ? await storeHistory(workspace, base, target, existing.bytes, options)
+      : null
 
     const temporary = path.join(parent, `.${name}.${randomUUID()}.tmp`)
     const mode = existing ? existing.mode : 0o600
@@ -1528,7 +1611,32 @@ async function writeBytesVersioned(workspace, reqPath, bytes, expectedRevision, 
         } catch {}
         throw fileConflict(reqPath, expectedRevision, current)
       }
+      if (storedHistory?.created && existing) {
+        // Failed temp creation/write/sync/rename must not add a duplicate of
+        // the still-current version or push an older recovery point out of
+        // retention. Keep the record if the path no longer names the exact
+        // original inode and bytes; that is the conservative choice when an
+        // external edit or an ambiguous post-rename error raced this write.
+        let originalStillPresent = false
+        try {
+          const latestStat = await fs.lstat(target)
+          if (
+            latestStat.isFile() && !latestStat.isSymbolicLink() &&
+            latestStat.dev === location.stat.dev && latestStat.ino === location.stat.ino
+          ) {
+            const latestBytes = await readRegularFile({ base, target, stat: latestStat })
+            originalStillPresent = latestBytes.equals(existing.bytes)
+          }
+        } catch {}
+        if (originalStillPresent) await discardStoredHistory(storedHistory)
+      }
       throw error
+    }
+    if (storedHistory) {
+      // File replacement has committed. Retention cleanup is best effort so a
+      // pruning error cannot make the API report that the already-written
+      // document failed to save.
+      try { await pruneHistory(workspace, base, target, options, storedHistory.id) } catch {}
     }
     return { success: true, path: relative, revision: contentRevision(bytes) }
   } finally {

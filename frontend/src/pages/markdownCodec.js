@@ -23,12 +23,27 @@ function markdownToHtml(markdown, imageIdentity, documentPath) {
       renderedHeadings[index]?.setAttribute('data-markdown-escaped-numbering-dot', 'true')
     }
   })
+  const directTaskCheckbox = item => {
+    // Marked emits a task checkbox directly in the item, or directly in its
+    // first paragraph for a loose item. Do not search through nested lists:
+    // a child task must not turn its ordinary parent item into a task.
+    for (const child of item.children) {
+      if (child.matches('ul, ol')) break
+      if (child.matches('input[type="checkbox"][disabled]')) return child
+      if (child.nodeName === 'P') {
+        const checkbox = Array.from(child.children).find(node => node.matches('input[type="checkbox"][disabled]'))
+        if (checkbox) return checkbox
+      }
+    }
+    return null
+  }
   doc.querySelectorAll('ul').forEach(list => {
     const items = Array.from(list.children).filter(node => node.nodeName === 'LI')
-    if (!items.length || !items.every(item => item.querySelector('input[type="checkbox"]'))) return
+    const taskCheckboxes = items.map(directTaskCheckbox)
+    if (!items.length || !taskCheckboxes.every(Boolean)) return
     list.setAttribute('data-type', 'taskList')
     items.forEach(item => {
-      const checkbox = item.querySelector('input[type="checkbox"]')
+      const checkbox = directTaskCheckbox(item)
       item.setAttribute('data-type', 'taskItem')
       item.setAttribute('data-checked', String(Boolean(checkbox?.checked)))
       checkbox?.remove()

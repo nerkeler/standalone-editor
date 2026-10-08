@@ -14,6 +14,31 @@ test('rich-safe fixture uses only syntax supported by the editor conversion chai
   assert.equal(requiresSourceMode(richSafeFixture), false)
 })
 
+test('mixed and ordered task lists stay in source mode while homogeneous unordered tasks remain rich-safe', () => {
+  const unsupported = [
+    '- ordinary item\n- [x] completed task\n- [ ] pending task\n',
+    '1. [x] completed task\n2. [ ] pending task\n',
+    '> - ordinary item\n> - [x] completed task\n',
+    '> 1. [x] completed task\n> 2. [ ] pending task\n',
+  ]
+  for (const source of unsupported) {
+    const diagnostics = analyzeMarkdownSource(source).filter(item => item.reason === 'taskListCompatibility')
+    assert.equal(diagnostics.length, 1)
+    assert.equal(source.slice(diagnostics[0].from, diagnostics[0].to), source)
+    assert.ok(getMarkdownSourceModeReasons(source).includes('taskListCompatibility'))
+    assert.equal(requiresSourceMode(source), true)
+  }
+
+  const supported = [
+    '- [ ] pending task\n- [x] completed task\n',
+    '- ordinary item\n\nSpacer paragraph.\n\n- [x] completed task\n- [ ] pending task\n',
+  ]
+  for (const source of supported) {
+    assert.ok(!getMarkdownSourceModeReasons(source).includes('taskListCompatibility'), source)
+    assert.equal(requiresSourceMode(source), false)
+  }
+})
+
 test('source-required fixture covers every lossy syntax category', () => {
   const reasons = getMarkdownSourceModeReasons(sourceRequiredFixture)
   for (const reason of [

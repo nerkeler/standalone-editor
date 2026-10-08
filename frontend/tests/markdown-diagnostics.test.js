@@ -13,6 +13,8 @@ const cases = [
   ['escapedSyntax', 'A \\* literal\n'],
   ['tableAlignment', '| A | B |\n| :--- | ---: |\n| a | b |\n'],
   ['nestedLists', '- parent\n  - child\n'],
+  ['taskListCompatibility', '- ordinary item\n- [x] completed task\n'],
+  ['taskListCompatibility', '1. [x] completed task\n2. [ ] pending task\n'],
   ['rawHtml', '<details>text</details>\n'],
   ['codeFenceMetadata', '```js title="a.js"\ncode\n```\n'],
 ]

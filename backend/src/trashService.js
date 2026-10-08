@@ -173,6 +173,7 @@ async function copyAndVerify(source, destination, copyFile = fs.copyFile) {
   if (!snapshotsEqual(before, afterSource) || !snapshotsEqual(before, copied)) {
     throw serviceError('文件在暂存期间发生变化，未移动到回收站', 'FILE_CHANGED')
   }
+  return before
 }
 
 async function writeJsonAtomic(filePath, value) {
@@ -293,6 +294,8 @@ export function createTrashService(workspace, options = {}) {
     const item = await resolveWorkspaceItem(realWorkspace, requestPath)
     if (!item.stat.isDirectory() && !item.stat.isFile()) throw serviceError('回收站不支持特殊文件')
     const sourceGuard = await openWorkspaceParent(realWorkspace, item.fullPath, serviceError)
+    let entryRolledBack = false
+    let preserveExdevEntry = false
     try {
       // Refuse a directory containing a symlink or special file. This operation
       // moves hidden children too; it never follows links outside the workspace.
@@ -323,26 +326,151 @@ export function createTrashService(workspace, options = {}) {
         } catch (error) {
           if (error.code !== 'EXDEV') throw error
           const temporaryPath = path.join(entryDirectory, COPY_NAME)
-          await copyAndVerify(item.fullPath, temporaryPath, copyFile)
-          // Keep the original until a verified copy is durably staged. The
-          // helper only removes the source after that condition holds.
+          const verifiedCopySnapshot = await copyAndVerify(item.fullPath, temporaryPath, copyFile)
+          // Keep the original until a verified copy is durably staged; it is
+          // removed only after a same-volume quarantine and a final comparison.
           const [sourceSnapshot, stagedSnapshot] = await Promise.all([
             assertTreeCopyable(item.fullPath),
             assertTreeCopyable(temporaryPath),
           ])
-          if (!snapshotsEqual(sourceSnapshot, stagedSnapshot)) {
+          if (
+            !snapshotsEqual(verifiedCopySnapshot, sourceSnapshot) ||
+            !snapshotsEqual(verifiedCopySnapshot, stagedSnapshot)
+          ) {
             throw serviceError('文件在暂存期间发生变化，未移动到回收站', 'FILE_CHANGED')
           }
           await fs.rename(temporaryPath, payloadPath)
           await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
-          await sourceGuard.check()
-          await assertSameEntry(item.fullPath, item.stat, serviceError)
-          await fs.rm(item.fullPath, { recursive: true, force: false })
+
+          // A recursive rm at the original pathname can erase edits made
+          // after copy verification. First move the source to a unique sibling
+          // on its own volume, then compare that moved tree with the published
+          // recovery payload. Path-based writers can no longer reach the old
+          // name during this check. If it changed, put it back and roll back
+          // the just-published recovery entry.
+          const quarantinePath = path.join(
+            path.dirname(item.fullPath),
+            `.trash-pending-${id}`,
+          )
+          let sourceQuarantined = false
+          let sourceCleanupFailedWithResidue = false
+          try {
+            await sourceGuard.check()
+            await assertSameEntry(item.fullPath, item.stat, serviceError)
+            const sourceStat = await fs.lstat(item.fullPath, { bigint: true })
+            await moveEntryNoReplace(item.fullPath, quarantinePath, sourceStat, {
+              check: () => sourceGuard.check(),
+              errorFactory: serviceError,
+              conflictFactory: () => serviceError('暂存目录已存在，未移动原文件', 'CONFLICT'),
+              rename,
+              link: linkFile,
+            })
+            sourceQuarantined = true
+            const quarantineStat = await fs.lstat(quarantinePath, { bigint: true })
+            const [quarantinedSnapshot, publishedSnapshot] = await Promise.all([
+              assertTreeCopyable(quarantinePath),
+              assertTreeCopyable(payloadPath),
+            ])
+            if (
+              !snapshotsEqual(verifiedCopySnapshot, quarantinedSnapshot) ||
+              !snapshotsEqual(verifiedCopySnapshot, publishedSnapshot)
+            ) {
+              throw serviceError('文件在暂存期间发生变化，原内容已恢复且未移动到回收站', 'FILE_CHANGED')
+            }
+            await sourceGuard.check()
+            await assertSameEntry(quarantinePath, quarantineStat, serviceError)
+            try {
+              await fs.rm(quarantinePath, { recursive: true, force: false })
+            } catch (error) {
+              // Some filesystems can report a late cleanup error after the
+              // directory has already disappeared. Treat that as committed;
+              // if anything remains, preserve the verified recovery payload
+              // even if the partially removed source can be moved back.
+              let quarantineRemains = true
+              try { quarantineRemains = Boolean(await existsNoFollow(quarantinePath)) } catch {}
+              if (quarantineRemains) {
+                sourceCleanupFailedWithResidue = true
+                throw error
+              }
+            }
+            sourceQuarantined = false
+          } catch (error) {
+            if (sourceQuarantined) {
+              let sourceRestored = false
+              let rollbackError
+              try {
+                const currentQuarantineStat = await fs.lstat(quarantinePath, { bigint: true })
+                await moveEntryNoReplace(quarantinePath, item.fullPath, currentQuarantineStat, {
+                  check: () => sourceGuard.check(),
+                  errorFactory: serviceError,
+                  conflictFactory: () => serviceError('原位置已有项目，隔离的原内容仍保留', 'CONFLICT'),
+                  rename,
+                  link: linkFile,
+                })
+                sourceQuarantined = false
+                sourceRestored = true
+              } catch (rollbackFailure) {
+                rollbackError = rollbackFailure
+                // An injected or filesystem rename can finish and then report
+                // an error. Recognize that only when the quarantine name is
+                // gone and the original path again has the original root inode.
+                try {
+                  if (!await existsNoFollow(quarantinePath)) {
+                    await assertSameEntry(item.fullPath, item.stat, serviceError)
+                    sourceQuarantined = false
+                    sourceRestored = true
+                  }
+                } catch {}
+              }
+              if (!sourceRestored) {
+                // Do not let the outer rollback discard either copy if the
+                // original cannot be put back. Keep the ready recovery entry
+                // and report the sibling path holding the moved source.
+                preserveExdevEntry = true
+                const quarantineRetained = Boolean(await existsNoFollow(quarantinePath).catch(() => null))
+                const failure = serviceError('回收站暂存失败，恢复副本与隔离状态已保留', 'TRASH_ROLLBACK_FAILED')
+                failure.cause = error
+                failure.details = {
+                  trashEntryId: id,
+                  ...(quarantineRetained ? {
+                    sourceQuarantinePath: slashPath(path.relative(realWorkspace, quarantinePath)),
+                  } : {}),
+                  rollbackCode: rollbackError?.code || 'ROLLBACK_FAILED',
+                }
+                throw failure
+              }
+              if (sourceCleanupFailedWithResidue) {
+                // The quarantine may now be incomplete because rm can unlink
+                // children before returning EIO. Keep the fully verified
+                // payload and identify it in the original filesystem error.
+                preserveExdevEntry = true
+                error.details = {
+                  ...(error.details || {}),
+                  trashEntryId: id,
+                  restoredSourcePath: item.relativePath,
+                  recoveryCopyRetained: true,
+                }
+              } else {
+                try {
+                  await fs.rm(entryDirectory, { recursive: true, force: false })
+                  entryRolledBack = true
+                } catch (cleanupError) {
+                  preserveExdevEntry = true
+                  const failure = serviceError('原内容已恢复，但回收站元数据清理失败', 'TRASH_METADATA_CLEANUP_FAILED')
+                  failure.cause = error
+                  failure.details = { trashEntryId: id, cleanupCode: cleanupError.code || 'CLEANUP_FAILED' }
+                  throw failure
+                }
+              }
+            }
+            throw error
+          }
           return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
         }
         await writeJsonAtomic(manifestPath, { ...manifest, state: 'ready' })
         return { id, path: item.relativePath, type: manifest.type, createdAt: manifest.createdAt, expiresAt: manifest.expiresAt }
       } catch (error) {
+        if (entryRolledBack || preserveExdevEntry) throw error
         // If a post-move metadata update fails, put the payload back whenever
         // the original name remains free. A staged payload stays visible through
         // list() if rollback cannot be completed.
