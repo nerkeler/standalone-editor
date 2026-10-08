@@ -28,6 +28,7 @@
 | DELETE | `/api/workspace/trash?id=...` | 永久删除一条回收站项目 |
 | POST | `/api/workspace/trash/purge-expired` | 手动永久清理已过期的回收站项目 |
 | GET | `/api/workspace/recovery/stats` | 查看当前工作区历史版本、回收站和合计的项目数及存储字节数 |
+| POST | `/api/workspace/recovery/reconcile` | 检查当前工作区已记录的回收站中断操作，校验后恢复或保留并报告原因 |
 | POST | `/api/workspace/move` | 移动/重命名 |
 | POST | `/api/workspace/upload` | 上传文件；提交 Markdown 的 `documentPath` 时图片进入该文档同级 `assets/` |
 | POST | `/api/upload/assets` | 兼容接口：上传图片到工作区根目录 `assets/` |
@@ -45,13 +46,17 @@ Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析。�
 
 `GET /api/workspace/download?path=...` 受工作空间身份和路径校验保护，以附件形式流式返回普通文件的原始字节；它不会像 Markdown `/export` 那样将内容解码为文本。即使某个 `.md` 文件因非法 UTF-8 无法编辑，也可以用此接口无损下载。
 
-读取文件会返回按文件内容计算的 SHA-256 `revision`。保存和恢复版本必须提交 `expectedRevision`：缺少时返回 HTTP `428`；磁盘文件或工作空间已变化时返回 HTTP `409`，响应会携带冲突信息，客户端应先处理冲突再保存。对尚不存在的文件，`expectedRevision: null` 表示仅在目标仍不存在时创建。每个文件最多保留最近 50 个被替换的版本；历史版本保存在工作空间之外，默认位于 `~/.standalone-editor/recovery`，可用 `EDITOR_RECOVERY_DIR` 更改。
+读取文件会返回按文件内容计算的 SHA-256 `revision`。保存和恢复版本必须提交 `expectedRevision`：缺少时返回 HTTP `428`；磁盘文件或工作空间已变化时返回 HTTP `409`，响应会携带冲突信息，客户端应先处理冲突再保存。对尚不存在的文件，`expectedRevision: null` 表示仅在目标仍不存在时创建。历史保留以最近 50 个被替换的版本为目标，在文档成功替换后执行清理；清理失败不改变保存成功结果，会保留额外记录并返回 `recoveryCleanupWarning`，后续内容发生变化的保存会重试。历史版本保存在工作空间之外，默认位于 `~/.standalone-editor/recovery`，可用 `EDITOR_RECOVERY_DIR` 更改。
 
 删除会把项目移到工作空间之外的回收站，目录内的内容一并保存；可在编辑器中列出并恢复。恢复时若原路径已有同名项目，会报告冲突，不会覆盖它。回收站项目默认保留 30 天并记录到期时间，但不会自动清理。只有用户在编辑器中主动选择并确认“清理过期项目”后，系统才会永久删除已过期项目；每条历史版本和回收站项目也可单独永久删除。以上永久删除操作都需要明确确认，删除后无法在编辑器中恢复；删除历史版本不会改动当前文档。
 
 文件移入回收站后，其版本历史会从当前路径移到独立的孤儿历史管理入口；永久删除回收站副本不会自动删除这些历史。新建、移动、上传或 ZIP 导入的同名 Markdown 文件也不会继承旧文件的历史。恢复孤儿版本到现有文件时必须确认覆盖并提交当前 `revision`，若目标随后变化则返回冲突。恢复空间统计包含孤儿历史。外部程序在编辑器观察到变化前直接删除并重建同一路径时，由于文件没有持久身份标识，仍可能无法区分两代文件。
 
 `GET /api/workspace/recovery/stats` 返回当前工作区的 `history`、`trash` 和 `total`，每项包含 `items`、`bytes`，并带有 `generatedAt`。字节数按该工作区恢复存储中当前文件的实际字节长度统计，包含历史记录、回收站内容及其元数据；它表示恢复数据当前落盘占用，不是工作区原文件的总大小。
+
+统计响应还包含 `maintenance.historyCleanupWarnings` 和 `maintenance.trash`，供界面展示历史清理提示及中断恢复结果。历史清理提示汇总保存在当前服务实例内存中，重启后不保留；错误同时写服务日志，恢复记录仍在磁盘。
+
+跨卷移入回收站会在同卷隔离移动前持久化中断 journal。启动、重新选择工作区或调用 `POST /api/workspace/recovery/reconcile` 时，只检查可信记录中的路径；原路径空闲且身份、源内容与完整回收站副本一致时恢复原项目，回收站副本继续保留。路径占用、内容变化或校验失败时报告原因和保留位置，不覆盖已有内容。带 `pendingRecovery` 的回收站项目暂不可恢复、永久删除或过期清理，对应请求返回 `409/TRASH_OPERATION_PENDING`。同进程锁不提供跨进程文件锁保证；缺少 journal 的旧 `.trash-pending-*` 不会通过扫描猜测处理。
 
 未保存的编辑会定期保存在当前浏览器配置的本地存储中，重新打开工作空间时可以恢复。其他标签页遗留的草稿会作为独立恢复选项显示，不会自动覆盖当前草稿。浏览器草稿保留 7 天；浏览器清理站点数据、禁用本地存储或存储空间不足时，草稿恢复可能不可用，界面会显示本地恢复受影响的提示。工作区缓存只用于启动上下文；后端校验失败仍按真实服务端错误显示，本地缓存读写失败不会阻止服务端自动保存。
 
@@ -77,7 +82,7 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ## 测试
 
-CI 在每次 push 和 pull request 时于 Ubuntu、Windows 运行后端测试，并于 Ubuntu 运行前端单元测试、构建和浏览器回归测试。CI 固定使用 Node.js 22.22.3；项目支持 Node.js 22.x 的 22.17.0 或更高版本。浏览器任务运行在 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
+CI 在每次 push 和 pull request 时于 Ubuntu、Windows 和 macOS 运行后端测试，并于 Ubuntu 运行前端单元测试、构建、生产 smoke 和浏览器回归测试。CI 固定使用 Node.js 22.22.3；项目支持 Node.js 22.x 的 22.17.0 或更高版本。浏览器任务运行在 `ubuntu-24.04` runner，通过 `command -v google-chrome` 检测 Chrome 并显式设置 `CHROME_PATH`；runner 未提供 Chrome 时会直接报告错误。可在本地复现：
 
 ```bash
 cd backend
