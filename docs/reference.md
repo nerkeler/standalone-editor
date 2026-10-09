@@ -44,6 +44,8 @@
 
 Markdown 中的 `![图片](../images/a.png)` 相对当前文档目录解析。编辑器通过 `/api/workspace/upload` 上传图片时会提交 `documentPath`，图片保存在当前文档同级的 `assets/`，Markdown 保存相对路径。旧客户端可继续使用 `/api/upload/assets` 将图片上传到工作区根目录 `assets/`；旧版 `/api/workspace/assets/...` 图片引用仍可读取，并会在富文本编辑保存后转换为相对路径。外部图片 URL 保持原样；媒体接口只读取工作区内支持的图片类型，并拒绝符号链接路径。
 
+上传先在同目录暂存完整内容，校验、同步并关闭后，再通过硬链接排他发布最终文件。同名目标不会被覆盖；写入或同步失败不会留下半截最终文件，可以使用相同文件名重试。若无法安全清理暂存文件，会保留隐藏残余并在响应中返回诊断信息；最终文件已完整发布时，暂存清理失败以 `temporaryCleanupWarning` 返回。该流程要求文件系统支持硬链接，不支持时返回 `UNSUPPORTED_UPLOAD_FILESYSTEM`，不会退回直接写入最终路径。存储空间不足（`ENOSPC` / `EDQUOT`）返回 HTTP 507，I/O 故障（`EIO`）返回 HTTP 500。
+
 `GET /api/workspace/download?path=...` 受工作空间身份和路径校验保护，以附件形式流式返回普通文件的原始字节；它不会像 Markdown `/export` 那样将内容解码为文本。即使某个 `.md` 文件因非法 UTF-8 无法编辑，也可以用此接口无损下载。
 
 读取文件会返回按文件内容计算的 SHA-256 `revision`。保存和恢复版本必须提交 `expectedRevision`：缺少时返回 HTTP `428`；磁盘文件或工作空间已变化时返回 HTTP `409`，响应会携带冲突信息，客户端应先处理冲突再保存。对尚不存在的文件，`expectedRevision: null` 表示仅在目标仍不存在时创建。历史保留以最近 50 个被替换的版本为目标，在文档成功替换后执行清理；清理失败不改变保存成功结果，会保留额外记录并返回 `recoveryCleanupWarning`，后续内容发生变化的保存会重试。历史版本保存在工作空间之外，默认位于 `~/.standalone-editor/recovery`，可用 `EDITOR_RECOVERY_DIR` 更改。

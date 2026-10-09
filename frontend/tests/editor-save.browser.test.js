@@ -1334,6 +1334,271 @@ test('source undo and redo preserve exact bytes and loaded source has no history
   assert.equal(await readFile(path.join(workspace, secondFile), 'utf8'), secondSeed)
 })
 
+test('CRLF source edit preserves original separators through autosave, manual save, reopen, undo, and redo', async () => {
+  const fileName = firstFile
+  const original = '---\r\nkind: source-crlf-fidelity\r\n---\r\n\r\n正文保留原有换行。\r\n'
+  const autoMarker = 'AUTO'
+  const manualMarker = '-MANUAL'
+  const filePath = path.join(workspace, fileName)
+  await writeFile(filePath, original)
+  await openFile(fileName, 'source-crlf-fidelity')
+  if (!await cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`)) {
+    await clickExactAriaButton('切换到源码编辑')
+  }
+  await waitUntil('CRLF source fixture to load without changing its logical text', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(original.replaceAll('\r\n', '\n'))}`,
+  ))
+
+  const typeAtEnd = async text => {
+    assert.equal(await cdp.evaluate(`(() => {
+      const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+      if (!view) return false;
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+      view.focus();
+      return true;
+    })()`), true)
+    await cdp.send('Input.insertText', { text })
+  }
+  const autoEditAt = Date.now()
+  await typeAtEnd(autoMarker)
+  await waitUntil('CRLF source edit to remain in the CodeMirror document', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().endsWith(${JSON.stringify(autoMarker)})`,
+  ))
+  const autoSaved = await waitUntil('CRLF autosave to write its edited bytes', async () => {
+    const content = await readFile(filePath, 'utf8')
+    return content.endsWith(autoMarker) ? content : null
+  }, 10000)
+  assert.ok(Date.now() - autoEditAt >= 2700, 'CRLF autosave should follow the normal three-second debounce')
+  assert.equal(autoSaved, `${original}${autoMarker}`)
+
+  await typeAtEnd(manualMarker)
+  await clickAriaButton('保存当前文件')
+  const manuallySaved = `${original}${autoMarker}${manualMarker}`
+  await waitUntil('manual CRLF save to write the exact bytes', async () => (await readFile(filePath, 'utf8')) === manuallySaved)
+  await pressHistoryShortcut('z')
+  await waitUntil('source undo to restore the prior CRLF text', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(`${original.replaceAll('\r\n', '\n')}${autoMarker}`)}`,
+  ))
+  await waitUntil('undo after manual CRLF save to autosave exact prior bytes', async () => (await readFile(filePath, 'utf8')) === `${original}${autoMarker}`)
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('source redo to restore the manual CRLF edit', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().endsWith(${JSON.stringify(manualMarker)})`,
+  ))
+  await waitUntil('redo after manual CRLF save to autosave exact edited bytes', async () => (await readFile(filePath, 'utf8')) === manuallySaved)
+
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('editor to reload before reopening the CRLF file', () => pageIsReady())
+  await openFile(fileName, 'source-crlf-fidelity')
+  await waitUntil('reopened CRLF source to retain exact logical content', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(manuallySaved.replaceAll('\r\n', '\n'))}`,
+  ))
+  assert.equal(await readFile(filePath, 'utf8'), manuallySaved)
+})
+
+test('LF source edit remains byte-exact through autosave, manual save, reopen, undo, and redo', async () => {
+  const original = '---\nkind: source-lf-fidelity\n---\n\n正文保留原有换行。\n'
+  const autoMarker = 'AUTO'
+  const manualMarker = '-MANUAL'
+  const filePath = path.join(workspace, firstFile)
+  await writeFile(filePath, original)
+  await openFile(firstFile, 'source-lf-fidelity')
+  if (!await cdp.evaluate(`Boolean(document.querySelector('.source-editor .cm-content'))`)) {
+    await clickExactAriaButton('切换到源码编辑')
+  }
+
+  const typeAtEnd = async text => {
+    assert.equal(await cdp.evaluate(`(() => {
+      const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+      if (!view) return false;
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+      view.focus();
+      return true;
+    })()`), true)
+    await cdp.send('Input.insertText', { text })
+  }
+  const changed = `${original}${autoMarker}`
+  const autoEditAt = Date.now()
+  await typeAtEnd(autoMarker)
+  const autoSaved = await waitUntil('LF autosave to write the edited bytes', async () => {
+    const content = await readFile(filePath, 'utf8')
+    return content.endsWith(autoMarker) ? content : null
+  }, 10000)
+  assert.ok(Date.now() - autoEditAt >= 2700, 'LF autosave should follow the normal three-second debounce')
+  assert.equal(autoSaved, changed)
+
+  const manuallySaved = `${changed}${manualMarker}`
+  await typeAtEnd(manualMarker)
+  await clickAriaButton('保存当前文件')
+  await waitUntil('manual LF save to write exact bytes', async () => (await readFile(filePath, 'utf8')) === manuallySaved)
+  await pressHistoryShortcut('z')
+  await waitUntil('LF undo to restore the earlier source text', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(changed)}`,
+  ))
+  await waitUntil('LF undo to autosave the exact prior bytes', async () => (await readFile(filePath, 'utf8')) === changed)
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('LF redo to restore the manual source edit', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString() === ${JSON.stringify(manuallySaved)}`,
+  ))
+  await waitUntil('LF redo to autosave exact edited bytes', async () => (await readFile(filePath, 'utf8')) === manuallySaved)
+
+  await cdp.send('Page.reload', { ignoreCache: true })
+  await waitUntil('editor to reload before reopening the LF file', () => pageIsReady())
+  await openFile(firstFile, 'source-lf-fidelity')
+  assert.equal(await cdp.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), manuallySaved)
+  assert.equal(await readFile(filePath, 'utf8'), manuallySaved)
+})
+
+test('CRLF source outline offsets and image cursor insertion stay aligned with CodeMirror', async () => {
+  const filePath = path.join(workspace, firstFile)
+  const sourceSeed = '---\r\nkind: source-image-outline\r\n---\r\n\r\n# First heading\r\n\r\n## 中文偏移目标\r\n\r\nCursor: '
+  const imageName = 'source CRLF image.png'
+  const imagePath = path.join(workspace, 'assets', imageName)
+  const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')
+  const imageMarkdown = '![](assets/source%20CRLF%20image.png)'
+  const insertedSource = `${sourceSeed}${imageMarkdown}`
+  await writeFile(filePath, sourceSeed)
+  await openFile(firstFile, 'source-image-outline')
+
+  await cdp.evaluate(`document.querySelector('.editor-toolbar [aria-label="显示右侧大纲"]')?.click()`)
+  await waitUntil('CRLF source outline to render its headings', () => cdp.evaluate(
+    `Array.from(document.querySelectorAll('.outline-panel .outline-item')).some(item => item.innerText.includes('中文偏移目标'))`,
+  ))
+  await cdp.evaluate(`Array.from(document.querySelectorAll('.outline-panel .outline-item')).find(item => item.innerText.includes('中文偏移目标'))?.click()`)
+  assert.equal(await cdp.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    return view?.state.selection.main.head === view.state.doc.toString().indexOf('## 中文偏移目标');
+  })()`), true, 'outline raw-string positions must map to internal CodeMirror offsets')
+
+  const cursorSet = await cdp.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    if (!view) return false;
+    const cursor = view.state.doc.toString().indexOf('Cursor: ') + 'Cursor: '.length;
+    view.dispatch({ selection: { anchor: cursor } });
+    view.focus();
+    return true;
+  })()`)
+  assert.equal(cursorSet, true)
+  await cdp.evaluate(`document.querySelector('.editor-toolbar [aria-label="上传图片"]')?.click()`)
+  const imageSelected = await cdp.evaluate(`(() => {
+    const input = document.querySelector('#img-up');
+    if (!input) return false;
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array(${JSON.stringify([...imageBytes])})], ${JSON.stringify(imageName)}, { type: 'image/png' }));
+    Object.defineProperty(input, 'files', { configurable: true, value: transfer.files });
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  })()`)
+  assert.equal(imageSelected, true)
+  await waitUntil('CRLF image Markdown to insert at the internal cursor', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString().includes(${JSON.stringify(`Cursor: ${imageMarkdown}`)})`,
+  ))
+  await waitUntil('CRLF image insertion to autosave without normalizing the source', async () => (await readFile(filePath, 'utf8')) === insertedSource)
+  assert.deepEqual(await readFile(imagePath), imageBytes)
+})
+
+test('CRLF source keeps real Enter, pasted LF lines, inputText lines, and history aligned', async () => {
+  const filePath = path.join(workspace, firstFile)
+  const original = '---\r\nkind: multiline-input\r\n---\r\n\r\nStart'
+  const pastedText = 'pasted one\n粘贴二\npasted three'
+  const insertedText = '\ninserted one\n输入二'
+  const afterEnter = `${original}\r\n`
+  const afterPaste = `${afterEnter}${pastedText.replaceAll('\n', '\r\n')}`
+  const expected = `${afterPaste}${insertedText.replaceAll('\n', '\r\n')}`
+  await writeFile(filePath, original)
+  await openFile(firstFile, 'multiline-input')
+
+  const placeCursorAtEnd = () => cdp.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    if (!view) return false;
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.focus();
+    return true;
+  })()`)
+  assert.equal(await placeCursorAtEnd(), true)
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 })
+  await waitUntil('a real Enter key to add one CodeMirror line', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.sliceString(0, document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.length, '\\r\\n') === ${JSON.stringify(afterEnter)}`,
+  ))
+
+  const pasteState = await cdp.evaluate(`(() => {
+    const content = document.querySelector('.source-editor .cm-content');
+    const transfer = new DataTransfer();
+    transfer.setData('text/plain', ${JSON.stringify(pastedText)});
+    const event = new ClipboardEvent('paste', { clipboardData: transfer, bubbles: true, cancelable: true });
+    content?.dispatchEvent(event);
+    return { defaultPrevented: event.defaultPrevented, documentLines: content?.cmTile?.root?.view?.state.doc.lines };
+  })()`)
+  assert.equal(pasteState.defaultPrevented, true, 'the browser paste handler should accept the multi-line clipboard text')
+  await waitUntil('pasted LF text to become CRLF document lines', () => cdp.evaluate(
+    `document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.sliceString(0, document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.length, '\\r\\n') === ${JSON.stringify(afterPaste)}`,
+  ))
+
+  assert.equal(await placeCursorAtEnd(), true)
+  await cdp.send('Input.insertText', { text: insertedText })
+  await waitUntil('multi-line Input.insertText to create real source lines', () => cdp.evaluate(
+    `(() => {
+      const doc = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc;
+      return doc?.sliceString(0, doc.length, '\\r\\n') === ${JSON.stringify(expected)};
+    })()`
+  ))
+  await clickAriaButton('保存当前文件')
+  await waitUntil('manual save to preserve CRLF for every inserted line', async () => (await readFile(filePath, 'utf8')) === expected)
+
+  await pressHistoryShortcut('z')
+  await waitUntil('undo to remove only the multi-line inserted text', () => cdp.evaluate(
+    `(() => {
+      const doc = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc;
+      return doc?.sliceString(0, doc.length, '\\r\\n') === ${JSON.stringify(afterPaste)};
+    })()`
+  ))
+  await waitUntil('undo save to preserve all prior CRLF lines', async () => (await readFile(filePath, 'utf8')) === afterPaste)
+  await pressHistoryShortcut('z', { shift: true })
+  await waitUntil('redo to restore all inserted CRLF lines', () => cdp.evaluate(
+    `(() => {
+      const doc = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc;
+      return doc?.sliceString(0, doc.length, '\\r\\n') === ${JSON.stringify(expected)};
+    })()`
+  ))
+  await waitUntil('redo save to preserve every CRLF line', async () => (await readFile(filePath, 'utf8')) === expected)
+})
+
+test('an exactly 5 MiB Chinese CRLF source accepts a same-size edit without oversize rejection', async () => {
+  const maxBytes = 5 * 1024 * 1024
+  const prefix = '---\r\nkind: chinese-boundary\r\n---\r\n\r\n'
+  const bytesPerLine = Buffer.byteLength(`${'中'.repeat(1200)}\r\n`)
+  const remainingBytes = maxBytes - Buffer.byteLength(prefix)
+  const fullLineCount = Math.floor((remainingBytes - 1) / bytesPerLine)
+  const trailingBytes = remainingBytes - (fullLineCount * bytesPerLine)
+  const trailingChineseCount = Math.floor((trailingBytes - 1) / 3)
+  const trailingAsciiCount = trailingBytes - (trailingChineseCount * 3)
+  const original = `${prefix}${`${'中'.repeat(1200)}\r\n`.repeat(fullLineCount)}${'中'.repeat(trailingChineseCount)}${'x'.repeat(trailingAsciiCount)}`
+  assert.equal(Buffer.byteLength(original), maxBytes)
+  const filePath = path.join(workspace, firstFile)
+  await writeFile(filePath, original)
+  await openFile(firstFile, 'chinese-boundary')
+  await waitUntil('exact-size source to load in editable CodeMirror', () => cdp.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.length)`
+  ))
+
+  const changed = `${original.slice(0, -1)}y`
+  const editAt = Date.now()
+  const edited = await cdp.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    if (!view) return false;
+    const position = view.state.doc.length - 1;
+    view.dispatch({ changes: { from: position, to: position + 1, insert: 'y' }, selection: { anchor: position + 1 } });
+    return view.state.doc.sliceString(view.state.doc.length - 1) === 'y';
+  })()`)
+  assert.equal(edited, true, 'the same-size edit must stay in source mode at the inclusive byte limit')
+  const saved = await waitUntil('exactly 5 MiB CRLF source to autosave without byte changes elsewhere', async () => {
+    const content = await readFile(filePath, 'utf8')
+    return content === changed ? content : null
+  }, 15000)
+  assert.ok(Date.now() - editAt >= 2700, 'the exact-size edit should use the normal autosave debounce')
+  assert.equal(Buffer.byteLength(saved), maxBytes)
+})
+
 test('source conflict overwrite keeps undo and redo while disk reload starts a new history', async () => {
   const original = '---\nkind: source-conflict-history\n---\n\nOriginal source.  \n'
   const saved = `${original}FIRST`

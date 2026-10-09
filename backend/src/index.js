@@ -108,7 +108,15 @@ export function createBackend(options = {}) {
       error?.code === 'RECOVERY_STORAGE_ERROR' || error?.code === 'HISTORY_CORRUPT' ||
       error?.code === 'HISTORY_ROLLBACK_FAILED' || error?.code === 'HISTORY_ARCHIVE_ROLLBACK_FAILED' ||
       error?.code === 'MOVE_ROLLBACK_FAILED' || error?.code === 'TRASH_ROLLBACK_FAILED' ||
-      error?.code === 'WORKSPACE_CONFIG_SAVE_FAILED'
+      error?.code === 'WORKSPACE_CONFIG_SAVE_FAILED' ||
+      error?.code === 'UNSUPPORTED_UPLOAD_FILESYSTEM' || error?.code === 'UPLOAD_INCOMPLETE' ||
+      error?.code === 'UPLOAD_VERIFY_FAILED' || error?.code === 'TEMPORARY_IDENTITY_UNAVAILABLE'
+    ) return 500
+    if (error?.code === 'ENOSPC' || error?.code === 'EDQUOT') return 507
+    if (
+      error?.code === 'EIO' || error?.code === 'EFBIG' ||
+      error?.code === 'EMFILE' || error?.code === 'ENFILE' || error?.code === 'ENXIO' ||
+      error?.code === 'ENODEV'
     ) return 500
     return 400
   }

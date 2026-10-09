@@ -37,6 +37,16 @@ async function temporaryWorkspace(t) {
   return workspace
 }
 
+async function temporaryUploadWorkspace(t, name) {
+  const root = process.env.N03_UPLOAD_TEST_ROOT || os.tmpdir()
+  await fs.mkdir(root, { recursive: true })
+  const container = await fs.mkdtemp(path.join(root, `${name}-`))
+  const workspace = path.join(container, 'workspace')
+  await fs.mkdir(workspace)
+  t.after(() => fs.rm(container, { recursive: true, force: true }))
+  return workspace
+}
+
 function revision(content) {
   return createHash('sha256').update(content).digest('hex')
 }
@@ -639,6 +649,260 @@ test('uploads keep binary bytes and refuse replacement', async t => {
     error => error.code === 'CONFLICT',
   )
   assert.deepEqual(await fs.readFile(path.join(workspace, 'asset.bin')), bytes)
+})
+
+test('failed uploads keep partial bytes hidden, preserve the error, and allow same-name retries', async t => {
+  for (const operation of ['write', 'sync', 'close', 'link', 'commit']) {
+    await t.test(operation, async t => {
+      const workspace = await temporaryUploadWorkspace(t, `failure-${operation}`)
+      const injected = Object.assign(new Error(`injected ${operation} failure`), { code: 'EIO' })
+      const fileSystem = {
+        open: async (...args) => {
+          const handle = await fs.open(...args)
+          if (!String(args[0]).endsWith('.upload.tmp')) return handle
+          return {
+            stat: (...statArgs) => handle.stat(...statArgs),
+            read: (...readArgs) => handle.read(...readArgs),
+            writeFile: async bytes => {
+              if (operation === 'write') {
+                await handle.write(Buffer.from(bytes).subarray(0, 3))
+                throw injected
+              }
+              return handle.writeFile(bytes)
+            },
+            sync: () => operation === 'sync' ? Promise.reject(injected) : handle.sync(),
+            close: async () => {
+              await handle.close()
+              if (operation === 'close') throw injected
+            },
+          }
+        },
+        link: async (...args) => {
+          if (operation === 'link') throw injected
+          await fs.link(...args)
+          if (operation === 'commit') throw injected
+        },
+        unlink: (...args) => fs.unlink(...args),
+      }
+
+      await assert.rejects(
+        uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('0123456789') }, { fileSystem }),
+        error => error === injected,
+      )
+      await assert.rejects(fs.lstat(path.join(workspace, 'attachment.bin')), error => error.code === 'ENOENT')
+      assert.deepEqual((await fs.readdir(workspace)).filter(name => name.endsWith('.upload.tmp')), [])
+
+      await uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('0123456789') })
+      assert.equal(await fs.readFile(path.join(workspace, 'attachment.bin'), 'utf8'), '0123456789')
+    })
+  }
+})
+
+test('failed upload cleanup leaves only a hidden residual and reports its error', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'cleanup-failure')
+  const writeError = Object.assign(new Error('injected partial upload write failure'), { code: 'EIO' })
+  const cleanupError = Object.assign(new Error('injected temporary cleanup failure'), { code: 'EACCES' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      if (!String(args[0]).endsWith('.upload.tmp')) return handle
+      return {
+        stat: (...statArgs) => handle.stat(...statArgs),
+        read: (...readArgs) => handle.read(...readArgs),
+        writeFile: async bytes => {
+          await handle.write(Buffer.from(bytes).subarray(0, 3))
+          throw writeError
+        },
+        sync: (...syncArgs) => handle.sync(...syncArgs),
+        close: (...closeArgs) => handle.close(...closeArgs),
+      }
+    },
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => String(args[0]).endsWith('.upload.tmp')
+      ? Promise.reject(cleanupError)
+      : fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('0123456789') }, { fileSystem }),
+    error => error === writeError && error.details?.temporaryCleanupError?.code === 'EACCES',
+  )
+  await assert.rejects(fs.lstat(path.join(workspace, 'attachment.bin')), error => error.code === 'ENOENT')
+  const residuals = (await fs.readdir(workspace)).filter(name => name.endsWith('.upload.tmp'))
+  assert.equal(residuals.length, 1)
+  assert.equal((await fs.readFile(path.join(workspace, residuals[0]), 'utf8')), '012')
+})
+
+test('upload cleanup leaves a replaced temporary pathname untouched', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'replaced-temporary')
+  const writeError = Object.assign(new Error('injected partial upload write failure'), { code: 'EIO' })
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      if (!String(args[0]).endsWith('.upload.tmp')) return handle
+      return {
+        stat: (...statArgs) => handle.stat(...statArgs),
+        read: (...readArgs) => handle.read(...readArgs),
+        writeFile: async bytes => {
+          await handle.write(Buffer.from(bytes).subarray(0, 3))
+          const temporary = String(args[0])
+          await fs.rename(temporary, `${temporary}.moved-by-actor`)
+          await fs.writeFile(temporary, 'foreign temporary replacement', { flag: 'wx' })
+          throw writeError
+        },
+        sync: (...syncArgs) => handle.sync(...syncArgs),
+        close: (...closeArgs) => handle.close(...closeArgs),
+      }
+    },
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('0123456789') }, { fileSystem }),
+    error => error === writeError && error.details?.temporaryCleanupError?.code === 'INVALID_PATH',
+  )
+  await assert.rejects(fs.lstat(path.join(workspace, 'attachment.bin')), error => error.code === 'ENOENT')
+  const residual = (await fs.readdir(workspace)).find(name => name.endsWith('.upload.tmp'))
+  assert.ok(residual)
+  assert.equal(await fs.readFile(path.join(workspace, residual), 'utf8'), 'foreign temporary replacement')
+})
+
+test('a concurrent upload winner is preserved when exclusive publication conflicts', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'concurrent-winner')
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    link: async (temporary, destination) => {
+      await fs.writeFile(destination, 'concurrent winner', { flag: 'wx' })
+      return fs.link(temporary, destination)
+    },
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('upload') }, { fileSystem }),
+    error => error.code === 'CONFLICT',
+  )
+  assert.equal(await fs.readFile(path.join(workspace, 'attachment.bin'), 'utf8'), 'concurrent winner')
+  assert.deepEqual((await fs.readdir(workspace)).filter(name => name.endsWith('.upload.tmp')), [])
+})
+
+test('a successful link followed by an external rewrite cannot report upload success', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'published-external-rewrite')
+  const uploaded = Buffer.from('0123456789')
+  const external = Buffer.from('ABCDEFGHIJ')
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    link: async (temporary, destination) => {
+      await fs.link(temporary, destination)
+      await fs.writeFile(destination, external)
+    },
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: uploaded }, { fileSystem }),
+    error => error.code === 'UPLOAD_VERIFY_FAILED' && Boolean(error.details?.publishedFileCleanupError),
+  )
+  assert.deepEqual(await fs.readFile(path.join(workspace, 'attachment.bin')), external)
+})
+
+test('an ambiguous link error preserves a same-length external rewrite', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'same-length-rewrite')
+  const injected = Object.assign(new Error('injected post-link commit error'), { code: 'EIO' })
+  const uploaded = Buffer.from('0123456789')
+  const external = Buffer.from('ABCDEFGHIJ')
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    link: async (temporary, destination) => {
+      await fs.link(temporary, destination)
+      await fs.writeFile(destination, external)
+      throw injected
+    },
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: uploaded }, { fileSystem }),
+    error => error === injected &&
+      error.details?.publishedFileCleanupError?.code === 'UPLOAD_VERIFY_FAILED' &&
+      error.details?.temporaryCleanupError?.code === 'UPLOAD_VERIFY_FAILED',
+  )
+  assert.deepEqual(await fs.readFile(path.join(workspace, 'attachment.bin')), external)
+  const residual = (await fs.readdir(workspace)).find(name => name.endsWith('.upload.tmp'))
+  assert.ok(residual)
+  assert.deepEqual(await fs.readFile(path.join(workspace, residual)), external)
+})
+
+test('a concurrent symlink target survives exclusive publication conflict', async t => {
+  if (process.platform === 'win32') return t.skip('requires symlink creation permission')
+  const workspace = await temporaryUploadWorkspace(t, 'concurrent-symlink')
+  const outside = path.join(path.dirname(workspace), 'outside.bin')
+  await fs.writeFile(outside, 'outside original')
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    link: async (temporary, destination) => {
+      await fs.symlink(outside, destination)
+      return fs.link(temporary, destination)
+    },
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('upload') }, { fileSystem }),
+    error => error.code === 'CONFLICT',
+  )
+  assert.equal((await fs.lstat(path.join(workspace, 'attachment.bin'))).isSymbolicLink(), true)
+  assert.equal(await fs.readFile(outside, 'utf8'), 'outside original')
+  assert.deepEqual((await fs.readdir(workspace)).filter(name => name.endsWith('.upload.tmp')), [])
+})
+
+test('a replaced destination parent stops publication and leaves only the displaced hidden temporary', async t => {
+  const root = process.env.N03_UPLOAD_TEST_ROOT || os.tmpdir()
+  await fs.mkdir(root, { recursive: true })
+  const container = await fs.mkdtemp(path.join(root, 'replaced-parent-'))
+  const workspace = path.join(container, 'workspace')
+  const displaced = path.join(container, 'workspace-displaced')
+  await fs.mkdir(workspace)
+  t.after(() => fs.rm(container, { recursive: true, force: true }))
+  let parentReplaced = false
+  const fileSystem = {
+    open: async (...args) => {
+      const handle = await fs.open(...args)
+      if (!parentReplaced && String(args[0]).endsWith('.upload.tmp')) {
+        parentReplaced = true
+        await fs.rename(workspace, displaced)
+        await fs.mkdir(workspace)
+      }
+      return handle
+    },
+    link: (...args) => fs.link(...args),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('upload') }, { fileSystem }),
+    error => error.code === 'INVALID_PATH' && Boolean(error.details?.temporaryCleanupError),
+  )
+  assert.deepEqual(await fs.readdir(workspace), [])
+  assert.equal((await fs.readdir(displaced)).filter(name => name.endsWith('.upload.tmp')).length, 1)
+})
+
+test('uploads fail clearly when hard-link publication is unsupported', async t => {
+  const workspace = await temporaryUploadWorkspace(t, 'unsupported-link')
+  const unsupported = Object.assign(new Error('hard links are unavailable'), { code: 'EOPNOTSUPP' })
+  const fileSystem = {
+    open: (...args) => fs.open(...args),
+    link: () => Promise.reject(unsupported),
+    unlink: (...args) => fs.unlink(...args),
+  }
+
+  await assert.rejects(
+    uploadFile(workspace, '', { originalname: 'attachment.bin', buffer: Buffer.from('upload') }, { fileSystem }),
+    error => error.code === 'UNSUPPORTED_UPLOAD_FILESYSTEM' && error.details?.causeCode === 'EOPNOTSUPP' && error.cause === unsupported,
+  )
+  await assert.rejects(fs.lstat(path.join(workspace, 'attachment.bin')), error => error.code === 'ENOENT')
+  assert.deepEqual((await fs.readdir(workspace)).filter(name => name.endsWith('.upload.tmp')), [])
 })
 
 test('Markdown uploads detach stale path history before creating the new file', async t => {

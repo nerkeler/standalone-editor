@@ -1425,6 +1425,142 @@ test('a titled Markdown link stays in source mode so editing cannot discard its 
   assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
 })
 
+test('unsupported link destinations stay source-protected and survive autosave byte-for-byte', async () => {
+  const fileName = 'unsupported-link-fidelity.md'
+  const fileLink = '[Jump](file:///private/tmp/synthetic-note.md)'
+  const vaultLink = '[Vault](obsidian://open?vault=Demo&file=Note)'
+  const unknownLink = '[Unknown](unknown-note://open/target)'
+  const javascriptLink = '[Run](javascript:window.__n01Executed=true)'
+  const source = [
+    fileLink,
+    '',
+    vaultLink,
+    '',
+    `- ${fileLink}`,
+    `- ${fileLink}`,
+    '',
+    `> ${vaultLink}`,
+    '',
+    '| Location | Link |',
+    '| --- | --- |',
+    `| table | ${fileLink} |`,
+    '',
+    unknownLink,
+    '',
+    javascriptLink,
+    '',
+    'Adjacent paragraph.',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Adjacent paragraph.')
+  await waitUntil('unsupported Markdown link destinations to enter source mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning'))`,
+  ))
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.ProseMirror'))`), false)
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+
+  await waitUntil('all unsupported link tokens to receive exact source diagnostics', () => connection.evaluate(
+    `document.querySelectorAll('.cm-protected-range').length === 8`,
+  ))
+  const protectedTokens = await connection.evaluate(`Array.from(document.querySelectorAll('.cm-protected-range')).map(node => node.textContent)`)
+  assert.deepEqual(protectedTokens, [fileLink, vaultLink, fileLink, fileLink, vaultLink, fileLink, unknownLink, javascriptLink])
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-editor a[href^="javascript:"]'))`), false,
+    'source-protected JavaScript destinations must never become executable anchors')
+  await dispatchRealInput(`Array.from(document.querySelectorAll('.cm-protected-range')).find(node => node.textContent === ${JSON.stringify(javascriptLink)})`)
+  assert.equal(await connection.evaluate(`window.__n01Executed === true`), false, 'interacting with protected JavaScript Markdown must not execute it')
+
+  const initialPuts = workspacePutCount()
+  const editedSource = source.replace('Adjacent paragraph.', 'Adjacent paragraph. edited')
+  await connection.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    const marker = 'Adjacent paragraph.';
+    const from = view?.state.doc.toString().indexOf(marker);
+    if (!view || from < 0) return false;
+    const cursor = from + marker.length;
+    view.dispatch({ changes: { from: cursor, to: cursor, insert: ' edited' } });
+    return view.state.doc.toString() === ${JSON.stringify(editedSource)};
+  })()`)
+  const saved = await waitForDiskMarker(fileName, 'Adjacent paragraph. edited')
+  await waitUntil('protected Markdown autosave to report success', () => connection.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('已保存')`,
+  ))
+  assert.ok(workspacePutCount() > initialPuts, 'editing protected Markdown must reach disk through autosave')
+  assert.equal(saved, editedSource, 'the saved Markdown must retain every original link target and container')
+})
+
+test('CRLF unsupported links in blockquotes, lists, and tables stay protected through autosave', async () => {
+  const fileName = 'crlf-unsupported-links.md'
+  const quoteLink = '[Vault](obsidian://open?vault=Demo&file=Note)'
+  const listLink = '[Jump](file:///private/tmp/synthetic-note.md)'
+  const source = [
+    `> Quote heading\r\n> ${quoteLink}\r\n`,
+    '\r\n',
+    `- List heading\r\n  ${listLink}\r\n`,
+    '\r\n',
+    '| Location | Link |\r\n| --- | --- |\r\n| table | [Vault](obsidian://open?vault=Demo&file=Note) |\r\n',
+    '\r\n',
+    'Adjacent paragraph.\r\n',
+  ].join('')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Adjacent paragraph.')
+  assert.equal(await connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning'))`,
+  ), true, 'CRLF link containers must enter source mode')
+  const normalizeLineEndings = value => value.replace(/\r\n?/g, '\n')
+  const editorSource = await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`)
+  assert.equal(normalizeLineEndings(editorSource), normalizeLineEndings(source))
+
+  await waitUntil('CRLF rejected links to receive their source diagnostics', () => connection.evaluate(
+    `document.querySelectorAll('.cm-protected-range').length === 3`,
+  ))
+  const protectedTokens = await connection.evaluate(`Array.from(document.querySelectorAll('.cm-protected-range')).map(node => node.textContent)`)
+  assert.deepEqual(protectedTokens, [quoteLink, listLink, quoteLink])
+
+  const initialPuts = workspacePutCount()
+  const editedSource = source.replace('Adjacent paragraph.', 'Adjacent paragraph. edited')
+  const editorEditedSource = await connection.evaluate(`(() => {
+    const view = document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view;
+    const marker = 'Adjacent paragraph.';
+    const from = view?.state.doc.toString().indexOf(marker);
+    if (!view || from < 0) return null;
+    const cursor = from + marker.length;
+    view.dispatch({ changes: { from: cursor, to: cursor, insert: ' edited' } });
+    return view.state.doc.toString();
+  })()`)
+  assert.equal(normalizeLineEndings(editorEditedSource), normalizeLineEndings(editedSource))
+  const saved = await waitForDiskMarker(fileName, 'Adjacent paragraph. edited')
+  await waitUntil('CRLF Markdown autosave to report success', () => connection.evaluate(
+    `document.querySelector('.save-status')?.innerText.includes('已保存')`,
+  ))
+  assert.ok(workspacePutCount() > initialPuts)
+  assert.equal(saved, editedSource, 'autosave must preserve original CRLFs and every unsupported link target')
+})
+
+test('https, relative, and mailto links remain editable in rich mode', async () => {
+  const fileName = 'supported-link-fidelity.md'
+  const source = [
+    '[Web](https://example.com/docs)',
+    '[Relative](../notes/linked-note.md)',
+    '[Email](mailto:person@example.com)',
+    '',
+  ].join('\n')
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Relative')
+  await waitUntil('supported links to load in rich mode', () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror a') && !document.querySelector('.source-fidelity-warning'))`,
+  ))
+  const hrefs = await connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror a')).map(link => link.getAttribute('href'))`)
+  assert.deepEqual(hrefs, [
+    'https://example.com/docs',
+    '../notes/linked-note.md',
+    'mailto:person@example.com',
+  ])
+})
+
 test('opening and canceling a repair proposal never writes or schedules an autosave', async () => {
   const fileName = 'safe-normalize-cancel.md'
   const original = '[guide][docs]\n\n[docs]: https://example.com\n'

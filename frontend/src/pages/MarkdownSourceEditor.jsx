@@ -8,6 +8,12 @@ import { HighlightStyle, syntaxHighlighting } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { linter, lintKeymap, nextDiagnostic } from '@codemirror/lint'
 import { analyzeMarkdownSource } from './markdownDiagnostics'
+import {
+  getUniformLineSeparator,
+  normalizeLineEndings,
+  serializeSourceDocument,
+  sourceOffsetToDocumentOffset,
+} from './markdownSourceLineEndings'
 
 const externalValueSync = Annotation.define()
 const platformDescription = typeof navigator === 'undefined' ? '' : `${navigator.platform || ''} ${navigator.userAgent || ''}`
@@ -47,10 +53,14 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
   const editableRef = useRef(editable)
   const editableCompartment = useRef(new Compartment())
   const revertingRef = useRef(false)
+  const lineSeparatorRef = useRef(getUniformLineSeparator(value))
+  const sourceValueRef = useRef(value)
+  const lineSeparator = lineSeparatorRef.current
   onChangeRef.current = onChange
   onHistoryChangeRef.current = onHistoryChange
   onCompositionChangeRef.current = onCompositionChange
   editableRef.current = editable
+  sourceValueRef.current = value
 
   const reportHistoryDepths = view => onHistoryChangeRef.current?.({
     undo: undoDepth(view.state),
@@ -77,7 +87,8 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
     goToPosition(position) {
       const view = viewRef.current
       if (!view || !Number.isInteger(position)) return false
-      view.dispatch({ selection: { anchor: Math.max(0, Math.min(position, view.state.doc.length)) }, scrollIntoView: true })
+      const documentPosition = sourceOffsetToDocumentOffset(sourceValueRef.current, position)
+      view.dispatch({ selection: { anchor: Math.max(0, Math.min(documentPosition, view.state.doc.length)) }, scrollIntoView: true })
       view.focus()
       return true
     },
@@ -86,10 +97,10 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
       if (!view || !markdownSrc) return false
       const { from, to } = view.state.selection.main
       const image = `![](${markdownSrc})`
-      const original = view.state.doc.toString()
-      const expected = original.slice(0, from) + image + original.slice(to)
+      const original = view.state.doc
+      const expected = original.sliceString(0, from, lineSeparator) + image + original.sliceString(to, original.length, lineSeparator)
       view.dispatch({ changes: { from, to, insert: image }, selection: { anchor: from + image.length }, scrollIntoView: true })
-      if (view.state.doc.toString() !== expected) return false
+      if (serializeSourceDocument(view.state.doc, lineSeparator) !== expected) return false
       view.focus()
       return true
     },
@@ -103,6 +114,8 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
         doc: value,
         extensions: [
           basicSetup,
+          ...(lineSeparator ? [EditorState.lineSeparator.of(lineSeparator)] : []),
+          ...(lineSeparator ? [EditorView.clipboardInputFilter.of(text => normalizeLineEndings(text, lineSeparator))] : []),
           editableCompartment.current.of([
             EditorState.readOnly.of(!editableRef.current),
             EditorView.editable.of(editableRef.current),
@@ -144,10 +157,11 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
               const externalChange = update.transactions.every(transaction => (
                 !transaction.docChanged || transaction.annotation(externalValueSync)
               ))
-              if (!externalChange && onChangeRef.current?.(update.state.doc.toString()) === false) {
+              const changedSource = serializeSourceDocument(update.state.doc, lineSeparator)
+              if (!externalChange && onChangeRef.current?.(changedSource) === false) {
                 revertingRef.current = true
                 update.view.dispatch({
-                  changes: { from: 0, to: update.state.doc.length, insert: update.startState.doc.toString() },
+                  changes: { from: 0, to: update.state.doc.length, insert: serializeSourceDocument(update.startState.doc, lineSeparator) },
                   annotations: [externalValueSync.of(true), Transaction.addToHistory.of(false)],
                 })
                 revertingRef.current = false
@@ -180,7 +194,10 @@ const MarkdownSourceEditor = forwardRef(function MarkdownSourceEditor({
 
   useEffect(() => {
     const view = viewRef.current
-    if (!view || view.state.doc.toString() === value) return
+    if (!view) return
+    const documentValue = serializeSourceDocument(view.state.doc, lineSeparator)
+    const matchesCurrentValue = documentValue === value || (!lineSeparator && documentValue === normalizeLineEndings(value))
+    if (matchesCurrentValue) return
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: value },
       annotations: [externalValueSync.of(true), Transaction.addToHistory.of(false)],

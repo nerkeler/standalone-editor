@@ -1,4 +1,5 @@
 import { marked } from 'marked'
+import { isAllowedUri } from '@tiptap/extension-link'
 
 const MESSAGES = {
   frontMatter: 'YAML 元数据不能无损进入富文本；请在源码模式编辑。',
@@ -8,6 +9,7 @@ const MESSAGES = {
   referenceLinks: '引用式链接会改变源文件写法；请保留源码。',
   autolinks: '自动链接写法可能被富文本改写；支持的地址可确认修复。',
   inlineLinkTitle: '链接标题属性不会由富文本完整保留；请保留源码。',
+  unsupportedLinkUri: '链接目标不受富文本安全规则支持；请保留源码。',
   escapedSyntax: '转义符可能丢失；请保留源码。',
   tableAlignment: '表格列对齐信息可能丢失；请保留源码。',
   nestedLists: '嵌套列表的缩进可能改变；请保留源码。',
@@ -174,6 +176,101 @@ function collectTitledLinkRanges(tokens, source, scopeStart, scopeEnd, output) {
   for (const token of tokens || []) visit(token)
 }
 
+function collectUnsupportedLinkRanges(tokens, source, scopeStart, scopeEnd, output) {
+  let cursor = scopeStart
+  for (const token of tokens || []) {
+    const raw = String(token.raw || '')
+    let from = raw ? source.indexOf(raw, cursor) : -1
+    if (from < scopeStart || from + raw.length > scopeEnd) from = raw ? source.indexOf(raw, scopeStart) : -1
+    const found = from >= scopeStart && from + raw.length <= scopeEnd
+    if (token.type === 'link' && found && !isAllowedUri(token.href)) {
+      output.push([from, from + raw.length])
+    }
+    if (found) cursor = Math.max(cursor, from + raw.length)
+
+    if (token.tokens?.length) {
+      cursor = Math.max(cursor, collectUnsupportedLinkRanges(
+        token.tokens,
+        source,
+        found ? from : scopeStart,
+        found ? from + raw.length : scopeEnd,
+        output,
+      ))
+    }
+    if (token.type === 'table') {
+      const cellTokens = [...(token.header || []), ...(token.rows || []).flat()]
+        .flatMap(cell => cell.tokens || [])
+      if (cellTokens.length) {
+        cursor = Math.max(cursor, collectUnsupportedLinkRanges(
+          cellTokens,
+          source,
+          found ? from : scopeStart,
+          found ? from + raw.length : scopeEnd,
+          output,
+        ))
+      }
+    }
+
+    let itemCursor = found ? from : scopeStart
+    for (const item of token.items || []) {
+      const itemRaw = String(item.raw || '')
+      const itemFrom = itemRaw ? source.indexOf(itemRaw, itemCursor) : -1
+      const itemFound = itemFrom >= scopeStart && itemFrom + itemRaw.length <= scopeEnd
+      if (itemFound) itemCursor = itemFrom + itemRaw.length
+      if (!item.tokens?.length) continue
+      cursor = Math.max(cursor, collectUnsupportedLinkRanges(
+        item.tokens,
+        source,
+        itemFound ? itemFrom : scopeStart,
+        itemFound ? itemFrom + itemRaw.length : scopeEnd,
+        output,
+      ))
+    }
+  }
+  return cursor
+}
+
+function hasUnsupportedLink(tokens) {
+  for (const token of tokens || []) {
+    if (token.type === 'link' && !isAllowedUri(token.href)) return true
+    if (token.tokens?.length && hasUnsupportedLink(token.tokens)) return true
+    if (token.type === 'table') {
+      for (const cell of token.header || []) {
+        if (cell.tokens?.length && hasUnsupportedLink(cell.tokens)) return true
+      }
+      for (const row of token.rows || []) {
+        for (const cell of row) {
+          if (cell.tokens?.length && hasUnsupportedLink(cell.tokens)) return true
+        }
+      }
+    }
+    for (const item of token.items || []) {
+      if (item.tokens?.length && hasUnsupportedLink(item.tokens)) return true
+    }
+  }
+  return false
+}
+
+function createLineEndingOffsetMap(source) {
+  let normalized = ''
+  const originalOffsets = []
+  for (let index = 0; index < source.length;) {
+    originalOffsets.push(index)
+    if (source[index] === '\r') {
+      normalized += '\n'
+      index += source[index + 1] === '\n' ? 2 : 1
+    } else {
+      normalized += source[index]
+      index += 1
+    }
+  }
+  originalOffsets.push(source.length)
+  return {
+    text: normalized,
+    toOriginalOffset: offset => originalOffsets[Math.max(0, Math.min(offset, normalized.length))],
+  }
+}
+
 function isMultilineReferenceLink(token, links) {
   if (token.type !== 'link' || !/[\r\n]/.test(token.raw || '')) return false
   const raw = String(token.raw || '')
@@ -261,6 +358,32 @@ export function analyzeMarkdownSource(markdown) {
     return items
   }
   const linkDefinitions = tokens.links || Object.create(null)
+  if (hasUnsupportedLink(tokens)) {
+    const linkSource = createLineEndingOffsetMap(source)
+    let unsupportedLinkOffset = 0
+    for (const token of tokens) {
+      const raw = String(token.raw || '')
+      const from = raw ? linkSource.text.indexOf(raw, unsupportedLinkOffset) : -1
+      const ranges = []
+      if (from >= 0) {
+        const to = Math.min(linkSource.text.length, from + raw.length)
+        collectUnsupportedLinkRanges([token], linkSource.text, from, to, ranges)
+        unsupportedLinkOffset = to
+      } else {
+        // A block token can lose quote prefixes or normalize its line endings.
+        // Search the remaining source for its exact inline link tokens so one
+        // unmatched container cannot silently hide a destination or widen the
+        // diagnostic to the whole document.
+        unsupportedLinkOffset = Math.max(
+          unsupportedLinkOffset,
+          collectUnsupportedLinkRanges([token], linkSource.text, unsupportedLinkOffset, linkSource.text.length, ranges),
+        )
+      }
+      for (const [start, end] of ranges) {
+        add('unsupportedLinkUri', linkSource.toOriginalOffset(start), linkSource.toOriginalOffset(end))
+      }
+    }
+  }
   // The rich editor represents homogeneous unordered task lists. It cannot
   // represent ordinary items mixed into that list or tasks under an ordered
   // marker, so protect those complete source list blocks before opening it.

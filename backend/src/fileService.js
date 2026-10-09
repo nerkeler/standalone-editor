@@ -1895,12 +1895,19 @@ export async function uploadFile(workspace, reqPath, file, options = {}) {
   if (!file?.originalname) throw makeError('缺少文件')
   const cleanName = assertName(path.basename(file.originalname))
   if (cleanName !== file.originalname) throw makeError('文件名格式无效')
+  const bytes = Buffer.isBuffer(file.buffer) ? file.buffer : Buffer.from(file.buffer || [])
   const { base, full: targetDir } = await existingPath(workspace, reqPath || '')
   const dirStat = await fs.lstat(targetDir)
   if (!dirStat.isDirectory()) throw makeError('目标目录无效')
   const destPath = path.join(targetDir, cleanName)
   assertInside(base, destPath)
   const guard = await openWorkspaceParent(base, destPath, makeError)
+  const io = options.fileSystem || fs
+  const temporary = path.join(path.dirname(destPath), `.${cleanName}.${randomUUID()}.upload.tmp`)
+  let handle = null
+  let temporaryCreated = false
+  let temporaryStat = null
+  let publicationAttempted = false
   try {
     await ensureDestinationDoesNotExist(destPath)
     if (isMarkdownPath(cleanName)) {
@@ -1908,15 +1915,248 @@ export async function uploadFile(workspace, reqPath, file, options = {}) {
     }
     await guard.check()
     await assertSameEntry(targetDir, dirStat, makeError)
-    const handle = await fs.open(destPath, 'wx')
+
+    // Write into a private same-directory path. The final name is installed
+    // only after the complete bytes have been checked and synced.
+    handle = await io.open(temporary, 'wx+')
+    temporaryCreated = true
     try {
-      await handle.writeFile(file.buffer)
-    } finally {
-      await handle.close()
+      temporaryStat = await handle.stat({ bigint: true })
+      if (!isUploadIdentity(temporaryStat)) {
+        throw makeError('无法确认上传临时文件身份', 'TEMPORARY_IDENTITY_UNAVAILABLE')
+      }
+      await handle.writeFile(bytes)
+      temporaryStat = await handle.stat({ bigint: true })
+      if (!isUploadIdentity(temporaryStat) || temporaryStat.size !== BigInt(bytes.byteLength)) {
+        throw makeError('上传临时文件内容不完整', 'UPLOAD_INCOMPLETE')
+      }
+      await verifyUploadBytes(handle, bytes)
+      await handle.sync()
+      temporaryStat = await handle.stat({ bigint: true })
+      if (!isUploadIdentity(temporaryStat) || temporaryStat.size !== BigInt(bytes.byteLength)) {
+        throw makeError('上传临时文件同步后内容不完整', 'UPLOAD_INCOMPLETE')
+      }
+    } catch (error) {
+      // A write can fail after storing only part of the multipart buffer. Get
+      // the current descriptor identity before cleanup so we never use a
+      // stale, numeric inode snapshot to decide which path to unlink.
+      try {
+        const current = await handle.stat({ bigint: true })
+        if (sameUploadIdentity(current, temporaryStat)) temporaryStat = current
+      } catch {}
+      throw error
     }
-    return { filename: cleanName, path: relativePath(base, destPath) }
+
+    // A close error is a failed upload too, so detect it before publishing the
+    // final name. The identity snapshot remains BigInt for guarded cleanup.
+    await handle.close()
+    handle = null
+
+    await guard.check()
+    await assertUploadPath(temporary, temporaryStat, bytes.byteLength)
+    try {
+      // link is an atomic create-if-absent operation. Do not fall back to a
+      // copy into the final name: that would expose a partial upload again.
+      publicationAttempted = true
+      await io.link(temporary, destPath)
+    } catch (error) {
+      if (error.code === 'EEXIST') throw makeError('目标已存在', 'CONFLICT')
+      if (['ENOTSUP', 'EOPNOTSUPP', 'ENOSYS'].includes(error.code)) {
+        const unsupported = makeError('当前工作空间文件系统不支持安全的上传发布', 'UNSUPPORTED_UPLOAD_FILESYSTEM')
+        unsupported.cause = error
+        unsupported.details = { causeCode: error.code }
+        throw unsupported
+      }
+      throw error
+    }
+
+    // Verify publication separately from best-effort temporary cleanup. A
+    // changed parent or final file must not be reported as upload success.
+    await guard.check()
+    const publishedStat = await verifyUploadPathBytes(destPath, temporaryStat, bytes)
+    await guard.check()
+    const linkedTemporaryStat = await verifyUploadPathBytes(temporary, temporaryStat, bytes)
+    if (!sameUploadSnapshot(publishedStat, linkedTemporaryStat)) {
+      throw makeError('发布目标与已校验的上传临时文件不一致', 'FILE_CHANGED')
+    }
+    temporaryStat = linkedTemporaryStat
+    await guard.check()
+    await assertUploadPath(destPath, publishedStat, bytes.byteLength)
+
+    let cleanupWarning
+    try {
+      await guard.check()
+      await assertUploadPath(temporary, temporaryStat, bytes.byteLength)
+      await io.unlink(temporary)
+      temporaryCreated = false
+    } catch (error) {
+      // Publication already succeeded and the final file is complete. Keep a
+      // hidden residual if its cleanup cannot be proven safe, and make that
+      // condition visible to the caller.
+      cleanupWarning = {
+        code: error.code || 'UPLOAD_TEMPORARY_CLEANUP_FAILED',
+        message: error.message || '上传成功，但隐藏临时文件清理失败',
+      }
+    }
+    return {
+      filename: cleanName,
+      path: relativePath(base, destPath),
+      ...(cleanupWarning ? { temporaryCleanupWarning: cleanupWarning } : {}),
+    }
+  } catch (error) {
+    const cleanupErrors = {}
+    if (publicationAttempted && !['CONFLICT', 'UNSUPPORTED_UPLOAD_FILESYSTEM'].includes(error?.code)) {
+      try {
+        await guard.check()
+        const destinationIdentity = await fs.lstat(destPath, { bigint: true })
+        if (!sameUploadIdentity(destinationIdentity, temporaryStat)) {
+          throw makeError('发布目标已被其他文件替换，已保留该文件', 'FILE_CHANGED')
+        }
+        // The temporary path must still resolve to our original inode and the
+        // final path must still contain every uploaded byte before rollback.
+        // This avoids deleting a same-length external rewrite through the
+        // hard link's shared inode.
+        const currentTemporary = await verifyUploadPathBytes(temporary, temporaryStat, bytes)
+        const currentDestination = await verifyUploadPathBytes(destPath, temporaryStat, bytes)
+        if (sameUploadSnapshot(currentTemporary, currentDestination)) {
+          await guard.check()
+          await assertUploadPath(destPath, currentDestination, bytes.byteLength)
+          await io.unlink(destPath)
+        }
+      } catch (cleanupError) {
+        if (cleanupError.code !== 'ENOENT') {
+          cleanupErrors.publishedFileCleanupError = {
+            code: cleanupError.code || 'UPLOAD_PUBLISHED_FILE_CLEANUP_FAILED',
+            message: cleanupError.message || '上传失败后无法安全撤回最终文件',
+          }
+        }
+      }
+    }
+    if (temporaryCreated) {
+      try {
+        if (handle) {
+          try {
+            const current = await handle.stat({ bigint: true })
+            if (sameUploadIdentity(current, temporaryStat)) temporaryStat = current
+          } catch {
+            // A close error may already have released the descriptor. The
+            // last verified BigInt snapshot still permits conservative path
+            // cleanup if it remains unchanged.
+          }
+        } else {
+          if (publicationAttempted) {
+            temporaryStat = await verifyUploadPathBytes(temporary, temporaryStat, bytes)
+          } else {
+            const current = await fs.lstat(temporary, { bigint: true })
+            if (sameUploadIdentity(current, temporaryStat)) temporaryStat = current
+          }
+        }
+        if (!temporaryStat || typeof temporaryStat.dev !== 'bigint' || typeof temporaryStat.ino !== 'bigint') {
+          throw makeError('无法确认上传临时文件身份，为避免删除其他文件，已保留隐藏路径', 'TEMPORARY_IDENTITY_UNAVAILABLE')
+        }
+        await guard.check()
+        await assertUploadPath(temporary, temporaryStat, Number(temporaryStat.size))
+        await io.unlink(temporary)
+        temporaryCreated = false
+      } catch (cleanupError) {
+        cleanupErrors.temporaryCleanupError = {
+          code: cleanupError.code || 'UPLOAD_TEMPORARY_CLEANUP_FAILED',
+          message: cleanupError.message || '上传失败后无法安全清理隐藏临时文件',
+        }
+      }
+    }
+    if (handle) {
+      try {
+        await handle.close()
+      } catch (closeError) {
+        cleanupErrors.temporaryCloseError = {
+          code: closeError.code || 'UPLOAD_TEMPORARY_CLOSE_FAILED',
+          message: closeError.message || '上传临时文件句柄关闭失败',
+        }
+      }
+    }
+    if (Object.keys(cleanupErrors).length) {
+      try {
+        if (error && typeof error === 'object') {
+          error.details = { ...(error.details || {}), ...cleanupErrors }
+        }
+      } catch {
+        // Cleanup diagnostics must never replace the original storage error.
+      }
+    }
+    throw error
   } finally {
     await guard.close()
+  }
+}
+
+function sameUploadIdentity(left, right) {
+  return isUploadIdentity(left) && isUploadIdentity(right) &&
+    left.dev === right.dev && left.ino === right.ino &&
+    left.birthtimeNs === right.birthtimeNs
+}
+
+function isUploadIdentity(stat) {
+  return Boolean(stat?.isFile() && !stat.isSymbolicLink() &&
+    typeof stat.dev === 'bigint' && typeof stat.ino === 'bigint' &&
+    typeof stat.birthtimeNs === 'bigint')
+}
+
+function sameUploadSnapshot(left, right) {
+  return sameUploadIdentity(left, right) && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs &&
+    left.mode === right.mode
+}
+
+async function assertUploadPath(target, expected, expectedSize) {
+  await assertSameEntry(target, expected, makeError)
+  const current = await fs.lstat(target, { bigint: true })
+  if (!sameUploadSnapshot(current, expected) || current.size !== BigInt(expectedSize)) {
+    throw makeError('上传临时文件在操作期间发生变化', 'FILE_CHANGED')
+  }
+}
+
+async function verifyUploadPathBytes(target, expected, bytes) {
+  let handle
+  try {
+    const beforePath = await fs.lstat(target, { bigint: true })
+    if (!sameUploadIdentity(beforePath, expected) || beforePath.size !== BigInt(bytes.byteLength)) {
+      throw makeError('上传路径已不再指向已校验的文件', 'FILE_CHANGED')
+    }
+    await assertSameEntry(target, beforePath, () => makeError('上传路径在校验期间发生变化', 'FILE_CHANGED'))
+    handle = await fs.open(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0))
+    const opened = await handle.stat({ bigint: true })
+    if (!sameUploadSnapshot(opened, beforePath) || opened.size !== BigInt(bytes.byteLength)) {
+      throw makeError('上传文件身份在打开时发生变化', 'FILE_CHANGED')
+    }
+    await verifyUploadBytes(handle, bytes)
+    const afterHandle = await handle.stat({ bigint: true })
+    const afterPath = await fs.lstat(target, { bigint: true })
+    if (!sameUploadSnapshot(opened, afterHandle) || !sameUploadSnapshot(afterHandle, afterPath)) {
+      throw makeError('上传文件在内容校验期间发生变化', 'FILE_CHANGED')
+    }
+    await assertSameEntry(target, afterPath, () => makeError('上传路径在校验期间发生变化', 'FILE_CHANGED'))
+    return afterHandle
+  } catch (error) {
+    if (['ENOENT', 'ENOTDIR', 'ELOOP'].includes(error?.code)) {
+      throw makeError('上传路径在发布期间发生变化', 'FILE_CHANGED')
+    }
+    throw error
+  } finally {
+    await handle?.close().catch(() => {})
+  }
+}
+
+async function verifyUploadBytes(handle, bytes) {
+  const scratch = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, bytes.byteLength)))
+  let position = 0
+  while (position < bytes.byteLength) {
+    const length = Math.min(scratch.byteLength, bytes.byteLength - position)
+    const { bytesRead } = await handle.read(scratch, 0, length, position)
+    if (!bytesRead || !scratch.subarray(0, bytesRead).equals(bytes.subarray(position, position + bytesRead))) {
+      throw makeError('上传临时文件内容校验失败', 'UPLOAD_VERIFY_FAILED')
+    }
+    position += bytesRead
   }
 }
 

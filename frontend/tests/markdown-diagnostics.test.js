@@ -130,6 +130,78 @@ test('ordinary links with angle destinations and titles are not confused with au
   assert.equal(proposeSafeMarkdownRepair(source), null)
 })
 
+test('links rejected by the rich editor URI policy point to each exact Markdown token', () => {
+  const tokens = [
+    '[Jump](file:///private/tmp/synthetic-note.md)',
+    '[Vault](obsidian://open?vault=Demo&file=Note)',
+    '[Custom](unknown-note://open/target)',
+    '[Run](javascript:window.__n01Executed=true)',
+  ]
+  const source = [
+    tokens[0],
+    '',
+    `- ${tokens[1]}`,
+    `- ${tokens[1]}`,
+    '',
+    `> ${tokens[2]}`,
+    '',
+    '| location | link |',
+    '| --- | --- |',
+    `| table | ${tokens[0]} |`,
+    '',
+    tokens[3],
+  ].join('\n')
+  const diagnostics = analyzeMarkdownSource(source).filter(item => item.reason === 'unsupportedLinkUri')
+  const expectedTokens = [tokens[0], tokens[1], tokens[1], tokens[2], tokens[0], tokens[3]]
+  assert.equal(diagnostics.length, expectedTokens.length)
+  const actual = diagnostics.map(item => [item.from, source.slice(item.from, item.to)])
+  assert.deepEqual(actual.map(([, token]) => token), expectedTokens)
+  for (const diagnostic of diagnostics) {
+    assert.ok(diagnostic.message.includes('源码'))
+    assert.equal(source.slice(diagnostic.from, diagnostic.to).startsWith('['), true)
+  }
+  assert.deepEqual(actual.map(([from, token]) => from), [
+    source.indexOf(tokens[0]),
+    source.indexOf(tokens[1]),
+    source.indexOf(tokens[1], source.indexOf(tokens[1]) + 1),
+    source.indexOf(tokens[2]),
+    source.indexOf(tokens[0], source.indexOf('| table |')),
+    source.indexOf(tokens[3]),
+  ])
+})
+
+test('CRLF and mixed line endings retain exact rejected-link offsets in blockquotes, lists, and tables', () => {
+  const cases = [
+    [
+      '> First line\r\n> [Jump](obsidian://open)\r\n',
+      ['[Jump](obsidian://open)'],
+    ],
+    [
+      '- First line\r\n  [Jump](file:///private/tmp/synthetic-note.md)\r\n- Second item\n',
+      ['[Jump](file:///private/tmp/synthetic-note.md)'],
+    ],
+    [
+      '| first |\r\n| --- |\r\n| [Jump](obsidian://open) |\r\n',
+      ['[Jump](obsidian://open)'],
+    ],
+    [
+      '> First line\r\n> [Jump](obsidian://open)\n> Middle line\r\n> [Jump](obsidian://open)\r\n',
+      ['[Jump](obsidian://open)', '[Jump](obsidian://open)'],
+    ],
+  ]
+  for (const [source, expectedTokens] of cases) {
+    const diagnostics = analyzeMarkdownSource(source).filter(item => item.reason === 'unsupportedLinkUri')
+    assert.equal(diagnostics.length, expectedTokens.length, source)
+    assert.deepEqual(diagnostics.map(item => source.slice(item.from, item.to)), expectedTokens)
+    let cursor = 0
+    for (let index = 0; index < expectedTokens.length; index += 1) {
+      const expectedOffset = source.indexOf(expectedTokens[index], cursor)
+      assert.equal(diagnostics[index].from, expectedOffset, source)
+      cursor = expectedOffset + expectedTokens[index].length
+    }
+  }
+})
+
 test('escaped decimal dots in ATX heading numbers stay rich-safe without hiding HTML warnings', () => {
   const source = '### 1\\. 第一阶段\n\n### 2\\. 第二阶段\n'
   assert.equal(marked.parse(source), marked.parse(source.replaceAll('\\.', '.')))

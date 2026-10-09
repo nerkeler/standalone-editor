@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 import { marked } from 'marked'
+import { isAllowedUri } from '@tiptap/extension-link'
 import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
 import { getMarkdownSourceModeReasons, requiresSourceMode } from '../src/pages/markdownSourcePolicy.js'
 
@@ -12,6 +13,33 @@ const sourceRequiredFixture = await readFile(new URL('markdown-source-required.m
 test('rich-safe fixture uses only syntax supported by the editor conversion chain', () => {
   assert.deepEqual(getMarkdownSourceModeReasons(richSafeFixture), [])
   assert.equal(requiresSourceMode(richSafeFixture), false)
+})
+
+test('the installed TipTap URI policy keeps supported destinations rich-safe and protects rejected schemes', () => {
+  const supported = [
+    'https://example.com/docs',
+    '../notes/linked-note.md',
+    'mailto:person@example.com',
+  ]
+  for (const href of supported) {
+    assert.ok(isAllowedUri(href), `TipTap should allow ${href}`)
+    assert.deepEqual(analyzeMarkdownSource(`[link](${href})\n`), [])
+    assert.equal(requiresSourceMode(`[link](${href})\n`), false)
+  }
+
+  for (const href of [
+    'file:///private/tmp/synthetic-note.md',
+    'obsidian://open?vault=Demo&file=Note',
+    'unknown-note://open/target',
+    'javascript:window.__n01Executed=true',
+  ]) {
+    assert.equal(Boolean(isAllowedUri(href)), false, `TipTap should reject ${href}`)
+    const markdown = `[link](${href})\n`
+    assert.equal(requiresSourceMode(markdown), true, `${href} must remain in source mode`)
+    const diagnostic = analyzeMarkdownSource(markdown).find(item => item.reason === 'unsupportedLinkUri')
+    assert.ok(diagnostic, href)
+    assert.equal(markdown.slice(diagnostic.from, diagnostic.to), markdown.trimEnd())
+  }
 })
 
 test('mixed and ordered task lists stay in source mode while homogeneous unordered tasks remain rich-safe', () => {
