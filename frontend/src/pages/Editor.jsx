@@ -1578,7 +1578,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
     if (requiresSourceMode(content)) {
       Modal.confirm({
         title: '此文档包含源码模式保护内容',
-        content: '富文本编辑器无法完整保留 YAML、WikiLinks、嵌套列表、混合或有序任务列表、引用链接、脚注、转义语法、表格对齐、原始 HTML 或代码围栏附加信息。继续使用源码模式可以原样保存；仍切换后，下一次富文本编辑可能改写这些内容。',
+        content: '富文本编辑器无法完整保留 YAML、WikiLinks、不受支持的链接目标、嵌套列表、混合或有序任务列表、引用链接、脚注、转义语法、表格对齐、原始 HTML 或代码围栏附加信息。继续使用源码模式可以原样保存；仍切换后，下一次富文本编辑可能改写这些内容。',
         okText: '仍切换到富文本',
         cancelText: '继续源码模式',
         onOk: enterRichMode,

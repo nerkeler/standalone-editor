@@ -308,17 +308,26 @@ test('preserves and diagnoses unanchored files when a later commit fails', async
 test('staging cleanup preserves unknown concurrent content instead of recursing into it', async t => {
   const workspace = await temporaryDirectory(t, 'standalone-editor-zip-rollback-staging-unknown-')
   const archive = createZip([{ name: 'one.md', data: 'one' }])
+  let stagingDirectory
   let unexpectedPath
 
   await assert.rejects(importZip(workspace, archive, {
     async beforeCommitFile() {
       const stagingName = (await fs.readdir(workspace)).find(item => item.endsWith('.staging'))
+      stagingDirectory = path.join(workspace, stagingName)
       unexpectedPath = path.join(workspace, stagingName, 'concurrent.txt')
       await fs.writeFile(unexpectedPath, 'keep concurrent staging content')
     },
-  }), /导入目录在操作期间发生变化/)
+  }), error => {
+    assert.equal(error.code, 'INVALID_ARCHIVE')
+    const retainedPaths = error.rollbackWarnings.map(item => item.split(/[\\/]/).join('/')).sort()
+    const stagingName = path.basename(stagingDirectory)
+    assert.deepEqual(retainedPaths, [`${stagingName}/one.md`, stagingName].sort())
+    return true
+  })
 
   assert.equal(await fs.readFile(unexpectedPath, 'utf8'), 'keep concurrent staging content')
+  assert.equal(await fs.readFile(path.join(stagingDirectory, 'one.md'), 'utf8'), 'one')
   await assert.rejects(fs.lstat(path.join(workspace, 'one.md')), error => error.code === 'ENOENT')
 })
 

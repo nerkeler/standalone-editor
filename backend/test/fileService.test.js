@@ -870,9 +870,29 @@ test('a replaced destination parent stops publication and leaves only the displa
     open: async (...args) => {
       const handle = await fs.open(...args)
       if (!parentReplaced && String(args[0]).endsWith('.upload.tmp')) {
-        parentReplaced = true
-        await fs.rename(workspace, displaced)
-        await fs.mkdir(workspace)
+        return {
+          stat: (...statArgs) => handle.stat(...statArgs),
+          read: (...readArgs) => handle.read(...readArgs),
+          writeFile: (...writeArgs) => handle.writeFile(...writeArgs),
+          sync: (...syncArgs) => handle.sync(...syncArgs),
+          close: async (...closeArgs) => {
+            let closeError
+            try {
+              await handle.close(...closeArgs)
+            } catch (error) {
+              closeError = error
+              await handle.close(...closeArgs).catch(() => {})
+            }
+            if (closeError) throw closeError
+            parentReplaced = true
+            try {
+              await fs.rename(workspace, displaced)
+              await fs.mkdir(workspace)
+            } finally {
+              await handle.close(...closeArgs).catch(() => {})
+            }
+          },
+        }
       }
       return handle
     },

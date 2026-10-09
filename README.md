@@ -175,6 +175,7 @@ flowchart LR
 | [运行指南](docs/release-runtime.md) | 正式构建、服务监督、更新、回退与数据保全。 |
 | [技术参考](docs/reference.md) | API、目录策略、恢复规则、ZIP 限制与环境变量。 |
 | [编辑历史验收](docs/reviews/2026-10-08-editor-history.md) | 撤销与重做的实现、会话边界和验证记录。 |
+| [N01–N03 保真修复验收](docs/reviews/2026-10-09-release-fidelity-fixes.md) | 链接保真、源码换行与安全上传修复及本地验收记录。 |
 | [依赖维护](docs/dependency-maintenance.md) | 支持的 Node.js 版本、依赖升级、审计和离线约束。 |
 | [维护 TODO](docs/maintenance-todo.md) | 登录认证与后续维护事项。 |
 | [产品方向](PRODUCT.md) · [设计原则](DESIGN.md) | 产品范围、交互与视觉约定。 |

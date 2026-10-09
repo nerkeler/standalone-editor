@@ -1490,6 +1490,34 @@ test('unsupported link destinations stay source-protected and survive autosave b
   assert.equal(saved, editedSource, 'the saved Markdown must retain every original link target and container')
 })
 
+test('rich conversion warning names unsupported link destinations and cancel preserves source', async () => {
+  const fileName = 'unsupported-link-rich-cancel.md'
+  const source = '[Jump](obsidian://open?vault=Demo&file=Note)\n\nAdjacent paragraph.\n'
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  await openFile(fileName, 'Jump')
+  await waitUntil('unsupported link to enter source mode before conversion', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && document.querySelector('.source-fidelity-warning'))`,
+  ))
+
+  const initialPuts = workspacePutCount()
+  await connection.evaluate(`document.querySelector('[aria-label="切换到富文本编辑"]')?.click()`)
+  await waitUntil('rich conversion warning for an unsupported link', () => connection.evaluate(
+    `Boolean(document.querySelector('.ant-modal-confirm')?.innerText.includes('此文档包含源码模式保护内容'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.ant-modal-confirm')?.innerText.includes('不受支持的链接目标')`), true,
+    'the confirmation must tell users that unsupported link destinations may be rewritten')
+
+  await connection.evaluate(`Array.from(document.querySelectorAll('.ant-modal-confirm button')).find(button => button.innerText.trim() === '继续源码模式')?.click()`)
+  await waitUntil('source mode to remain active after canceling rich conversion', () => connection.evaluate(
+    `Boolean(document.querySelector('.source-editor .cm-content') && !document.querySelector('.ProseMirror') && !document.querySelector('.ant-modal-confirm'))`,
+  ))
+  assert.equal(await connection.evaluate(`document.querySelector('.source-editor .cm-content')?.cmTile?.root?.view?.state.doc.toString()`), source)
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'canceling rich conversion must not trigger an autosave')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source, 'canceling must leave the original link target on disk')
+})
+
 test('CRLF unsupported links in blockquotes, lists, and tables stay protected through autosave', async () => {
   const fileName = 'crlf-unsupported-links.md'
   const quoteLink = '[Vault](obsidian://open?vault=Demo&file=Note)'
