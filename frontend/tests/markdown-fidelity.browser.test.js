@@ -1208,6 +1208,167 @@ test('ordinary nested model bullets open in rich mode and keep their hierarchy a
   await saveRepairScreenshot('nested-list-rich.png')
 })
 
+async function readOrderedNestingSemantics(markdown = null) {
+  const html = markdown === null ? null : marked.parse(markdown)
+  return connection.evaluate(`(() => {
+    const root = ${html === null ? "document.querySelector('.ProseMirror')" : `new DOMParser().parseFromString(${JSON.stringify(html)}, 'text/html').body`};
+    const isList = node => node.nodeName === 'UL' || node.nodeName === 'OL';
+    const describeList = list => ({
+      type: list.nodeName.toLowerCase(),
+      start: list.nodeName === 'OL' ? Number(list.getAttribute('start') || 1) : null,
+      items: Array.from(list.children).filter(node => node.nodeName === 'LI').map(item => {
+        const ownContent = item.cloneNode(true);
+        ownContent.querySelectorAll('ul,ol').forEach(node => node.remove());
+        ownContent.querySelectorAll('.ProseMirror-trailingBreak').forEach(node => node.remove());
+        return {
+          text: Array.from(ownContent.children).filter(node => node.nodeName === 'P')
+            .map(node => node.textContent.replace(/\\s+/g, ' ').trim()),
+          strong: Array.from(ownContent.querySelectorAll('strong')).map(node => node.textContent),
+          paragraphs: Array.from(ownContent.children).filter(node => node.nodeName === 'P').length,
+          breaks: ownContent.querySelectorAll('br').length,
+          nested: Array.from(item.children).filter(isList).map(describeList),
+        };
+      }),
+    });
+    return Array.from(root?.children || []).filter(isList).map(describeList);
+  })()`)
+}
+
+async function verifyOrderedNestingRichRoundTrip(fileName, source, fixtureHeading, { start = 1, childCounts = [2, 2] } = {}) {
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await openFile(fileName, fixtureHeading)
+  await waitUntil(`${fileName} ordered parents and loose bullet children to open directly in rich mode`, () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror ol > li > ul') && !document.querySelector('.source-editor')
+      && !document.querySelector('.source-fidelity-warning') && !document.querySelector('.markdown-repair-banner')
+      && !Array.from(document.querySelectorAll('.ant-modal')).some(modal => modal.getClientRects().length))`,
+  ))
+  const expected = await readOrderedNestingSemantics(source)
+  assert.equal(expected.length, 1, 'the fixture must have one top-level ordered list')
+  assert.equal(expected[0].type, 'ol')
+  assert.equal(expected[0].start, start, 'the parsed fixture must preserve its declared ordered start')
+  assert.equal(expected[0].items.length, 2, 'the fixture must cover two independent numbered parents')
+  assert.ok(expected[0].items.every(item => item.nested.length === 1),
+    'each parent must own a separate bullet list')
+  assert.deepEqual(expected[0].items.map(item => item.nested[0].items.length), childCounts,
+    'each numbered parent must own the exact intended number of bullet children')
+  assert.deepEqual(await readOrderedNestingSemantics(), expected,
+    'rich rendering must retain the ordered start, each parent text and bold spans, and all nested child ownership')
+  await saveRepairScreenshot(fileName.replace(/\.md$/, '-rich.png'))
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'opening supported ordered nesting must not send an automatic repair PUT')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs,
+    'opening a valid ordered list must leave its original file unchanged')
+  const selected = await connection.evaluate(`(() => {
+    const editor = document.querySelector('.ProseMirror');
+    const paragraph = Array.from(editor?.querySelectorAll('p') || []).find(node => node.innerText === 'Edit outside the ordered list.');
+    if (!editor || !paragraph) return false;
+    editor.focus();
+    const range = document.createRange(); range.selectNodeContents(paragraph); range.collapse(false);
+    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    return true;
+  })()`)
+  assert.equal(selected, true, 'the real input must edit a paragraph outside every list')
+  await connection.send('Input.insertText', { text: ' ORDERED-NESTING-AUTOSAVED' })
+  const saved = await waitForDiskMarker(fileName, 'Edit outside the ordered list. ORDERED-NESTING-AUTOSAVED')
+  assert.ok(workspacePutCount() > initialPuts, 'ordinary three-second autosave must persist the adjacent edit')
+  assert.deepEqual(await readOrderedNestingSemantics(saved), expected,
+    'saving another paragraph must preserve ordered start and the complete list tree, including bold parent and child text')
+  await setupPage()
+  const putsBeforeReopen = workspacePutCount()
+  await openFile(fileName, 'ORDERED-NESTING-AUTOSAVED')
+  await waitUntil(`${fileName} saved ordered nesting to reopen without source protection`, () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror ol > li > ul') && !document.querySelector('.source-editor')
+      && !document.querySelector('.source-fidelity-warning') && !document.querySelector('.markdown-repair-banner'))`,
+  ))
+  assert.deepEqual(await readOrderedNestingSemantics(), expected,
+    'the saved list must reopen with every parent, child, grandchild, and start number still attached correctly')
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), putsBeforeReopen, 'reopening supported ordered nesting must not schedule a repair save')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), saved)
+}
+
+test('ordered nesting screenshot with loose bullet children opens directly in rich mode and survives autosave', async () => {
+  const heading = 'Ordered nesting screenshot fixture'
+  const source = [
+    `# ${heading}`, '',
+    '1.  **第一步。** 重点确认：', '    ',
+    '    -   子项甲；', '        ',
+    '    -   **子项乙。**', '        ',
+    '2.  **第二步。** 检查：', '    ',
+    '    -   子项丙；', '        ',
+    '    -   **子项丁。**', '        ', '',
+    'Edit outside the ordered list.', '',
+  ].join('\n')
+  await verifyOrderedNestingRichRoundTrip('ordered-nesting-screenshot.md', source, heading)
+})
+
+test('ordered nesting with different marker widths preserves a nondefault start and both parents', async () => {
+  const heading = 'Ordered nesting marker widths fixture'
+  const source = [
+    `# ${heading}`, '',
+    '9.  **第九步。** 重点确认：', '    ',
+    '    -   九甲；', '        ',
+    '    -   **九乙。**', '        ',
+    '10. **第十步。** 检查：', '    ',
+    '    -   十甲；', '        ',
+    '    -   **十乙。**', '        ', '',
+    'Edit outside the ordered list.', '',
+  ].join('\n')
+  await verifyOrderedNestingRichRoundTrip('ordered-nesting-marker-widths.md', source, heading, { start: 9 })
+})
+
+test('ordered nesting with multilevel loose bullet descendants preserves all owners and ordered start', async () => {
+  const heading = 'Ordered nesting multilevel fixture'
+  const source = [
+    `# ${heading}`, '',
+    '3.  **第三步。** 重点确认：', '    ',
+    '    -   **三甲。**', '        ',
+    '        -   三甲一；', '            ',
+    '        -   **三甲二。**', '            ',
+    '    -   三乙。', '        ',
+    '4.  **第四步。** 检查：', '    ',
+    '    -   四甲。', '        ',
+    '    -   **四乙。**', '        ',
+    '        -   四乙一；', '            ',
+    '        -   **四乙二。**', '            ', '',
+    'Edit outside the ordered list.', '',
+  ].join('\n')
+  await verifyOrderedNestingRichRoundTrip('ordered-nesting-multilevel.md', source, heading, { start: 3 })
+})
+
+test('ordered nesting with one loose multiparagraph child stays rich without detaching it from its parent', async () => {
+  const heading = 'Ordered nesting singleton fixture'
+  const source = [
+    `# ${heading}`, '',
+    '1.  **第一步。** 重点确认：', '    ',
+    '    -   子项甲；', '        ',
+    '    -   **子项乙。**', '        ',
+    '2.  **第二步。** 检查：', '    ',
+    '    -   唯一子项丙；', '        ',
+    '        子项丙的第二段。', '        ', '',
+    'Edit outside the ordered list.', '',
+  ].join('\n')
+  await verifyOrderedNestingRichRoundTrip('ordered-nesting-singleton.md', source, heading, { childCounts: [2, 1] })
+})
+
+test('ordered nesting with a heading-first child remains source-protected without an opening write', async () => {
+  const fileName = 'ordered-heading-child.md'
+  const heading = 'Ordered heading child protection'
+  const source = `# ${heading}\n\n1. Parent\n\n    - ## Child heading\n\n    - ordinary sibling\n`
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  await openFile(fileName, heading)
+  assert.equal(await connection.evaluate(`Boolean(document.querySelector('.source-editor') && document.querySelector('.source-fidelity-warning'))`), true)
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts)
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source)
+})
+
 test('numbered Markdown heading dots survive rich editing and save without an open-time write', async () => {
   const fileName = 'numbered-headings.md'
   const source = '### 1\\. 第一部分\n\n### 2\\. 第二部分\n\n### 3. 普通标题\n'

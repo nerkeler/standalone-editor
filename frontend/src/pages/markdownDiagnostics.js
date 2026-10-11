@@ -316,10 +316,16 @@ function isMultilineReferenceLink(token, links) {
   return Boolean(shortcut && Object.hasOwn(links, normalizeReferenceLabel(shortcut[1])))
 }
 
+function listItemStartsWithParagraph(item) {
+  const first = item.tokens?.find(token => token.type !== 'space')
+  return first?.type === 'text' || first?.type === 'paragraph'
+}
+
 function collectListItemMarkers(tokens, output = [], parentItem = null, insideBlockquote = false, simpleBulletPath = true) {
   for (const token of tokens || []) {
     if (token.type === 'list') {
       const simpleBulletList = token.ordered === false
+      const ordinaryOrderedRoot = parentItem === null && token.ordered === true && !insideBlockquote
       for (const item of token.items || []) {
         const firstLine = String(item.raw || '').split(/\r?\n/, 1)[0].trimStart().trimEnd()
         output.push({
@@ -329,6 +335,8 @@ function collectListItemMarkers(tokens, output = [], parentItem = null, insideBl
             !insideBlockquote &&
             simpleBulletPath &&
             simpleBulletList &&
+            listItemStartsWithParagraph(parentItem) &&
+            listItemStartsWithParagraph(item) &&
             parentItem.loose === true &&
             token.loose === true &&
             !parentItem.task &&
@@ -341,7 +349,7 @@ function collectListItemMarkers(tokens, output = [], parentItem = null, insideBl
           output,
           item,
           insideBlockquote,
-          simpleBulletPath && simpleBulletList && !item.task,
+          simpleBulletPath && (simpleBulletList || ordinaryOrderedRoot) && !item.task,
         )
       }
       continue
@@ -575,10 +583,10 @@ export function analyzeMarkdownSource(markdown) {
   if (fence) fencedRanges.push([fenceStart, source.length])
   const inFence = index => fencedRanges.some(([start, end]) => index >= start && index < end)
 
-  // The editor preserves ordinary unordered sublists when both the parent
-  // item and child-list items are already paragraphs. Tight items gain or lose
-  // paragraph spacing when serialized; ordered/task and quote nesting remain
-  // protected until their round-trip behavior is verified separately.
+  // Ordinary loose bullet descendants preserve their paragraph structure under
+  // a bullet or ordered root, including the root's start number. Tight items
+  // change paragraph spacing when serialized; nested ordered lists, tasks and
+  // quote nesting still require source protection.
   const safeLooseNestedBulletOffsets = new Set()
   let listTokenOffset = 0
   let markerLineCursor = 0

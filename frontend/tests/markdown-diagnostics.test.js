@@ -2,6 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { marked } from 'marked'
 import Turndown from 'turndown'
+import domino from '@mixmark-io/domino'
+import { getSchema } from '@tiptap/core'
+import StarterKit from '@tiptap/starter-kit'
+import { DOMParser as ProseMirrorDOMParser, DOMSerializer } from '@tiptap/pm/model'
 import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
 import { proposeSafeMarkdownRepair } from '../src/pages/safeMarkdownNormalization.js'
 import { createMarkdownCodec } from '../src/pages/markdownCodec.js'
@@ -89,6 +93,93 @@ test('loose-list markers are matched inside their own top-level token after inde
     '  - sibling',
   ].join('\n')
   assert.deepEqual(analyzeMarkdownSource(source), [])
+})
+
+function throughInstalledListSchema(markdown) {
+  const schema = getSchema([StarterKit])
+  const document = domino.createDocument(marked.parse(markdown))
+  const model = ProseMirrorDOMParser.fromSchema(schema).parse(document.body)
+  const container = document.createElement('div')
+  container.appendChild(DOMSerializer.fromSchema(schema).serializeFragment(model.content, { document }))
+  return { model, html: container.innerHTML }
+}
+
+test('loose ordered parents with ordinary bullet children open rich and preserve their installed list model', () => {
+  for (const start of [0, 1, 9, 42]) {
+    const firstIndent = ' '.repeat(String(start).length + 3)
+    const secondIndent = ' '.repeat(String(start + 1).length + 3)
+    const source = [
+      `${start}.  **第一步。**<br>重点确认：`,
+      firstIndent,
+      `${firstIndent}-   子项甲；`,
+      `${firstIndent}    `,
+      `${firstIndent}-   子项乙。`,
+      `${firstIndent}    `,
+      `${start + 1}.  **第二步。** 检查：`,
+      secondIndent,
+      `${secondIndent}-   单独子项丙；`,
+      '',
+      `${secondIndent}    子项丙的第二段。`,
+      '',
+    ].join('\n')
+    assert.deepEqual(analyzeMarkdownSource(source), [], source)
+    assert.equal(proposeSafeMarkdownRepair(source), null)
+    const { model, html } = throughInstalledListSchema(source)
+    const saved = createMarkdownCodec().fromEditorHtml(html)
+    const { model: reopened } = throughInstalledListSchema(saved)
+    assert.deepEqual(reopened.toJSON(), model.toJSON(), saved)
+    assert.deepEqual(analyzeMarkdownSource(saved), [], saved)
+    const ordered = model.toJSON().content[0]
+    assert.equal(ordered.type, 'orderedList')
+    assert.equal(ordered.attrs.start, start)
+    assert.equal(ordered.content.length, 2)
+    assert.equal(ordered.content[0].content[1].type, 'bulletList')
+    assert.equal(ordered.content[0].content[1].content.length, 2)
+    assert.equal(ordered.content[1].content[1].type, 'bulletList')
+    assert.equal(ordered.content[1].content[1].content.length, 1)
+    assert.equal(ordered.content[0].content[0].content[0].marks[0].type, 'bold')
+    assert.equal(ordered.content[0].content[0].content[1].type, 'hardBreak')
+  }
+})
+
+test('loosely spaced ordinary bullet descendants retain ownership under an ordered root', () => {
+  const source = [
+    '3.  **Parent**', '',
+    '    -   **Child A**', '',
+    '        -   Grandchild one', '',
+    '        -   Grandchild two', '',
+    '    -   Child B', '',
+    '4.  Next parent', '',
+    '    -   Next child one', '',
+    '    -   Next child two', '',
+  ].join('\n')
+  assert.deepEqual(analyzeMarkdownSource(source), [])
+  const { model, html } = throughInstalledListSchema(source)
+  const saved = createMarkdownCodec().fromEditorHtml(html)
+  assert.deepEqual(throughInstalledListSchema(saved).model.toJSON(), model.toJSON())
+  assert.deepEqual(analyzeMarkdownSource(saved), [])
+})
+
+test('ordered-parent support keeps tight quote task ordered-child and code-indented nesting protected', () => {
+  for (const source of [
+    '1. parent\n   - child\n   - sibling\n',
+    '1. parent\n\n   - child\n   - sibling\n',
+    '1. parent\n\n   - only tight child\n',
+    '> 1. parent\n>\n>    - child\n>\n>    - sibling\n',
+    '1. parent\n\n   - [ ] child\n\n   - [x] sibling\n',
+    '1. parent\n\n   - ordinary\n\n   - [x] task\n',
+    '1. parent\n\n   1. child\n\n   2. sibling\n',
+    '1. [ ] task parent\n\n   - child\n\n   - sibling\n',
+    '1. parent\n\n        - code-indented example\n',
+  ]) assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'nestedLists'), source)
+})
+
+test('loose nested items beginning with a block heading remain protected', () => {
+  for (const marker of ['1.', '-']) {
+    const source = `${marker} Parent\n\n    - ## Child heading\n\n    - ordinary sibling\n`
+    assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'nestedLists' &&
+      source.slice(item.from, item.to).startsWith('- ## Child heading')), source)
+  }
 })
 
 test('ordinary table alignments stay rich-safe while unsupported nested layouts point at their delimiter', () => {
