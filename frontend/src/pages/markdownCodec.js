@@ -1,7 +1,7 @@
 import { marked } from 'marked'
 import Turndown from 'turndown'
-import { parseImagePresentationComment, formatImagePresentationComment } from './imagePresentation'
-import { isExternalImageReference, resolveMarkdownImageReference } from '../markdownImagePaths'
+import { parseImagePresentationComment, formatImagePresentationComment } from './imagePresentation.js'
+import { isExternalImageReference, resolveMarkdownImageReference } from '../markdownImagePaths.js'
 
 function markdownToHtml(markdown, imageIdentity, documentPath) {
   const html = marked.parse(markdown || '')
@@ -95,6 +95,15 @@ function createMarkdownSerializer() {
   td.addRule('editorStrike', {
     filter: ['del', 's'],
     replacement: content => `~~${content}~~`,
+  })
+  // Keep each explicit line break as a Markdown-compatible HTML break. The
+  // default Turndown rule turns breaks into whitespace; later cleanup can
+  // turn paragraph breaks into separate paragraphs or trim cell boundaries.
+  // TipTap represents these as individual hardBreak nodes, so serialize every
+  // node individually instead of losing intentional blank lines in a cell.
+  td.addRule('editorHardBreak', {
+    filter: 'br',
+    replacement: () => '<br>',
   })
   td.addRule('editorImagePath', {
     filter: node => node.nodeName === 'IMG' && node.hasAttribute('data-markdown-src'),

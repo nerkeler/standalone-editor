@@ -4,6 +4,7 @@ import { marked } from 'marked'
 import Turndown from 'turndown'
 import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
 import { proposeSafeMarkdownRepair } from '../src/pages/safeMarkdownNormalization.js'
+import { createMarkdownCodec } from '../src/pages/markdownCodec.js'
 
 const cases = [
   ['frontMatter', '---\ntitle: A\n---\n'],
@@ -11,7 +12,7 @@ const cases = [
   ['footnotes', 'Text[^a]\n\n[^a]: Footnote\n'],
   ['referenceLinks', '[guide][docs]\n\n[docs]: https://example.com\n'],
   ['escapedSyntax', 'A \\* literal\n'],
-  ['tableAlignment', '| A | B |\n| :--- | ---: |\n| a | b |\n'],
+  ['tableAlignment', '> | A | B |\n> | :--- | ---: |\n> | a | b |\n'],
   ['nestedLists', '- parent\n  - child\n'],
   ['taskListCompatibility', '- ordinary item\n- [x] completed task\n'],
   ['taskListCompatibility', '1. [x] completed task\n2. [ ] pending task\n'],
@@ -90,9 +91,8 @@ test('loose-list markers are matched inside their own top-level token after inde
   assert.deepEqual(analyzeMarkdownSource(source), [])
 })
 
-test('aligned tables underline their actual delimiter rows, while paragraph lookalikes stay clear', () => {
+test('ordinary table alignments stay rich-safe while unsupported nested layouts point at their delimiter', () => {
   for (const [source, expected] of [
-    ['| Left | Right |\n| :-- | --: |\n| a | b |\n', '| :-- | --: |'],
     ['> | Left | Right |\n> | :-- | --: |\n> | a | b |\n', '> | :-- | --: |'],
   ]) {
     const diagnostic = analyzeMarkdownSource(source).find(item => item.reason === 'tableAlignment')
@@ -108,7 +108,66 @@ test('aligned tables underline their actual delimiter rows, while paragraph look
   const quotedLeftAligned = '> | API | 路径 | 说明 |\n> |:---|:---|:---|\n> | A | /a | alpha |\n'
   assert.ok(analyzeMarkdownSource(quotedLeftAligned).some(item => item.reason === 'tableAlignment'))
   const mixedAlignment = '| API | 路径 | 说明 |\n|:---|:---:|---:|\n| A | /a | alpha |\n'
-  assert.ok(analyzeMarkdownSource(mixedAlignment).some(item => item.reason === 'tableAlignment'))
+  assert.deepEqual(analyzeMarkdownSource(mixedAlignment), [])
+  assert.equal(proposeSafeMarkdownRepair(mixedAlignment), null)
+})
+
+test('the actual serializer preserves every ordinary table column alignment', () => {
+  const source = '| Plain | Left | Center | Right |\n| --- | :--- | :---: | ---: |\n| A | B | C | D |\n'
+  const codec = createMarkdownCodec()
+  // Marked and the real serializer run in Node here; the browser regression
+  // additionally places this HTML through the installed TipTap schema.
+  const saved = codec.fromEditorHtml(marked.parse(source))
+  assert.deepEqual(marked.lexer(saved).find(token => token.type === 'table').align, [null, 'left', 'center', 'right'])
+  assert.deepEqual(analyzeMarkdownSource(saved), [])
+})
+
+test('plain hard breaks retain their exact count through the actual serializer, including cell boundaries', () => {
+  const codec = createMarkdownCodec()
+  for (const [html, expected] of [
+    ['<p>one<br><br>two</p>', 'one<br><br>two'],
+    ['<p><br>one<br><br></p>', '<br>one<br><br>'],
+    ['<p><br><br></p>', '<br><br>'],
+    ['<br><br>', '<br><br>'],
+  ]) assert.equal(codec.fromEditorHtml(html), expected)
+
+  const source = '| Name | Detail |\n| --- | --- |\n| First | <br>one<br/><br />two<br><br> |\n'
+  assert.deepEqual(analyzeMarkdownSource(source), [])
+  const saved = codec.fromEditorHtml(marked.parse(source))
+  assert.equal((saved.match(/<br>/g) || []).length, 5)
+  assert.equal(marked.lexer(saved).find(token => token.type === 'table').rows[0][1].text, '<br>one<br><br>two<br><br>')
+  assert.deepEqual(analyzeMarkdownSource(saved), [])
+  assert.equal(proposeSafeMarkdownRepair(source), null)
+})
+
+test('attribute-free hard breaks stay supported without allowing other raw HTML', () => {
+  for (const source of ['one<br><br>two\n', 'one<BR/>two\n', '<br /><br>\n']) {
+    assert.deepEqual(analyzeMarkdownSource(source), [], source)
+  }
+  for (const source of [
+    'one<br class="custom">two\n',
+    'one<br style="color:red">two\n',
+    'one<br onclick="run()">two\n',
+    'one<br\n data-custom="keep">two\n',
+    'one</br>two\n',
+    '<div><br><br></div>\n',
+  ]) assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'rawHtml'), source)
+})
+
+test('serializer-generated literal plus after hard breaks reopens without protection', () => {
+  const source = '| Item | Detail |\n| --- | --- |\n| A | **15 units**<br><br>  <br><br>+ **200 units** |\n'
+  const saved = createMarkdownCodec().fromEditorHtml(marked.parse(source))
+  assert.match(saved, /<br><br><br><br>\\\+ \*\*200 units\*\*/)
+  assert.deepEqual(analyzeMarkdownSource(saved), [])
+  assert.equal(marked.parse(saved), marked.parse(saved.replaceAll('\\+', '+')))
+  assert.equal(proposeSafeMarkdownRepair(saved), null)
+
+  for (const protectedSource of [
+    '\\+ actual list marker\n',
+    '> \\+ actual quoted list marker\n',
+    '![\\+](assets/x.png)\n',
+    '[target](notes/\\+.md)\n',
+  ]) assert.ok(analyzeMarkdownSource(protectedSource).some(item => item.reason === 'escapedSyntax'), protectedSource)
 })
 
 test('angle URL and email autolinks are reported as fixable Markdown, not raw HTML', () => {
@@ -228,6 +287,54 @@ test('intraword escaped underscores stay rich-safe in paragraphs, quotes, tables
   ].join('\n')
   assert.deepEqual(analyzeMarkdownSource(source), [])
   assert.equal(marked.parse(source), marked.parse(source.replaceAll('\\_', '_').replaceAll('\\.', '.')))
+})
+
+test('numeric minus and proven intraword star escapes stay rich-safe and retain literal meaning', () => {
+  const source = [
+    '| Item | Range | Note |',
+    '| --- | --- | --- |',
+    '| A | \\-30 ~ -50 | **HLA-B\\*5801** |',
+    '| B | **\\-80 ~ -130** | **学习\\*5801** |',
+    '',
+    '> HLA-B\\*5801 and \\-20.',
+  ].join('\n')
+  assert.deepEqual(analyzeMarkdownSource(source), [])
+  assert.equal(proposeSafeMarkdownRepair(source), null)
+  const td = new Turndown({ strongDelimiter: '**' })
+  assert.equal(td.escape('HLA-B*5801'), 'HLA-B\\*5801')
+  assert.equal(td.escape('-30 ~ -50'), '\\-30 ~ -50')
+  const saved = createMarkdownCodec().fromEditorHtml(marked.parse(source))
+  assert.match(saved, /HLA-B\\\*5801/)
+  assert.match(saved, /\\-30 ~ -50/)
+  assert.match(saved, /\*\*\\-80 ~ -130\*\*/)
+  assert.deepEqual(analyzeMarkdownSource(saved), [])
+  // Markdown-equivalent source spelling is allowed; visible characters and
+  // formatting remain the same, and opening does not need a repair proposal.
+  assert.equal(marked.parse(source.replace(/\\([*-])/g, '$1')), marked.parse(source))
+})
+
+test('intraword star checks include other lines and keep unsafe escapes or image tokens protected', () => {
+  for (const source of [
+    'HLA-B\\*5801 and word*end\n',
+    'HLA-B\\*5801\nother*end\n',
+    '**HLA-B\\*5801 and word*end**\n',
+    '![HLA-B\\*5801](assets/x.png)\n',
+    '![\\-30](assets/x.png)\n',
+    '[target](notes/HLA-B\\*5801.md)\n',
+    '[target](notes/\\-30.md)\n',
+    'word\\\\-30\n',
+    'word\\\\\\-30\n',
+  ]) assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'escapedSyntax'), source)
+})
+
+test('overlapping fallback ranges keep multiline link target escapes protected after preceding links', () => {
+  for (const escape of ['\\*', '\\+', '\\-']) {
+    const target = escape === '\\-' ? 'notes/\\-30.md' : `notes/HLA-B${escape}5801.md`
+    const source = `> [one](x.md) and [two](y.md)\n> [target](\n> ${target})\n`
+    const diagnostics = analyzeMarkdownSource(source).filter(item => item.reason === 'escapedSyntax')
+    assert.equal(diagnostics.length, 1, source)
+    assert.equal(source.slice(diagnostics[0].from, diagnostics[0].to), escape)
+  }
 })
 
 test('escaped delimiters and boundary underscores remain protected when their meaning can change', () => {

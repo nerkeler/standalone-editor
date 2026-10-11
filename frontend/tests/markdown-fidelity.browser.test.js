@@ -2391,6 +2391,153 @@ test('explicit left alignment survives rich table editing, save, and reopen', as
   await saveRepairScreenshot('explicit-left-table-rich.png')
 })
 
+async function readScreenshotTableSemantics(markdown = null) {
+  const html = markdown === null ? null : marked.parse(markdown)
+  return connection.evaluate(`(() => {
+    const root = ${html === null ? "document.querySelector('.ProseMirror')" : `new DOMParser().parseFromString(${JSON.stringify(html)}, 'text/html').body`};
+    const textWithBreaks = element => {
+      const clone = element.cloneNode(true);
+      clone.querySelectorAll('br.ProseMirror-trailingBreak').forEach(node => node.remove());
+      clone.querySelectorAll('br').forEach(node => node.replaceWith(document.createTextNode('\\n')));
+      return clone.textContent.split('\\n').map(line => line.replace(/\\s+/g, ' ').trim()).join('\\n');
+    };
+    const tables = Array.from(root?.querySelectorAll('table') || []).map(table =>
+      Array.from(table.rows).map(row => Array.from(row.cells).map(cell => ({
+        text: textWithBreaks(cell),
+        align: cell.getAttribute('align'),
+        breaks: cell.querySelectorAll('br:not(.ProseMirror-trailingBreak)').length,
+        strong: Array.from(cell.querySelectorAll('strong')).map(node => node.textContent),
+      }))));
+    const paragraphBreaks = Array.from(root?.querySelectorAll('p') || [])
+      .filter(paragraph => paragraph.textContent.includes('Inline breaks:'))
+      .map(paragraph => ({ text: textWithBreaks(paragraph), breaks: paragraph.querySelectorAll('br:not(.ProseMirror-trailingBreak)').length }));
+    return { tables, paragraphBreaks };
+  })()`)
+}
+
+async function verifyScreenshotSyntaxRichRoundTrip(fileName, source, screenshotName) {
+  const fixtureHeading = `Screenshot compatibility fixture ${fileName.replace(/\.md$/, '').replaceAll('-', ' ')}`
+  source = source.replace('Screenshot compatibility fixture', fixtureHeading)
+  await writeFile(path.join(workspace, fileName), source)
+  await setupPage()
+  const initialPuts = workspacePutCount()
+  const before = await stat(path.join(workspace, fileName))
+  await openFile(fileName, fixtureHeading)
+  await waitUntil(`${fileName} rich editor without repair or source warnings`, () => connection.evaluate(
+    `Boolean(document.querySelector('.ProseMirror table') && !document.querySelector('.source-editor')
+      && !document.querySelector('.source-fidelity-warning') && !document.querySelector('.markdown-repair-banner')
+      && !Array.from(document.querySelectorAll('.ant-modal')).some(modal => modal.getClientRects().length))`,
+  ))
+  const originalSemantics = await readScreenshotTableSemantics(source)
+  assert.deepEqual(await readScreenshotTableSemantics(), originalSemantics,
+    'rich rendering must preserve every table cell text, bold span, explicit column alignment, and hard line break')
+  const renderedAlignments = await connection.evaluate(`Array.from(document.querySelectorAll('.ProseMirror table')).map(table =>
+    Array.from(table.rows).map(row => Array.from(row.cells).map(cell => ({
+      declared: cell.getAttribute('align'), displayed: getComputedStyle(cell).textAlign,
+    }))))`)
+  for (const table of renderedAlignments) for (const row of table) for (const cell of row) {
+    if (cell.declared) assert.equal(cell.displayed, cell.declared,
+      'explicit alignment must affect the visible header and body cell, not just stored metadata')
+  }
+  await saveRepairScreenshot(screenshotName)
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), initialPuts, 'opening supported screenshot syntax must not write or schedule a repair save')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), source,
+    'opening supported screenshot syntax must preserve original disk bytes')
+  assert.equal((await stat(path.join(workspace, fileName))).mtimeMs, before.mtimeMs,
+    'opening supported screenshot syntax must not replace the original file')
+
+  const selected = await connection.evaluate(`(() => {
+    const editor = document.querySelector('.ProseMirror');
+    const paragraph = Array.from(editor?.querySelectorAll('p') || []).find(node => node.innerText === 'Edit adjacent paragraph.');
+    if (!editor || !paragraph) return false;
+    editor.focus();
+    const range = document.createRange(); range.selectNodeContents(paragraph); range.collapse(false);
+    const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range);
+    return true;
+  })()`)
+  assert.equal(selected, true, 'the edit must target a paragraph outside the tables')
+  await connection.send('Input.insertText', { text: ' AUTOSAVED-SCREENSHOT' })
+  const saved = await waitForDiskMarker(fileName, 'Edit adjacent paragraph. AUTOSAVED-SCREENSHOT')
+  assert.ok(workspacePutCount() > initialPuts, 'a real rich input must reach disk through the ordinary three-second autosave')
+  assert.deepEqual(await readScreenshotTableSemantics(saved), originalSemantics,
+    'editing another paragraph must not change table text, bold spans, alignment, or any consecutive hard breaks')
+  assert.deepEqual(marked.lexer(saved).filter(token => token.type === 'table').map(token => token.align),
+    marked.lexer(source).filter(token => token.type === 'table').map(token => token.align),
+    'serialized Markdown must retain explicit and unspecified column alignment separately')
+
+  await setupPage()
+  const putsBeforeReopen = workspacePutCount()
+  await openFile(fileName, 'AUTOSAVED-SCREENSHOT')
+  try {
+    await waitUntil(`${fileName} saved syntax to reopen without protection`, () => connection.evaluate(
+      `Boolean(document.querySelector('.ProseMirror table') && !document.querySelector('.source-fidelity-warning')
+        && !document.querySelector('.markdown-repair-banner'))`,
+    ))
+  } catch (error) {
+    const state = await connection.evaluate(`({
+      sourceWarning: document.querySelector('.source-fidelity-warning')?.innerText,
+      repairWarning: document.querySelector('.markdown-repair-banner')?.innerText,
+      protectedRanges: Array.from(document.querySelectorAll('.cm-protected-range')).map(node => ({ text: node.textContent, title: node.getAttribute('title') })),
+    })`)
+    throw new Error(`${error.message}\nReopened state: ${JSON.stringify(state)}\nSaved synthetic Markdown:\n${saved}`)
+  }
+  assert.deepEqual(await readScreenshotTableSemantics(), originalSemantics,
+    'saved Markdown must reopen with the same complete table semantics')
+  await new Promise(resolve => setTimeout(resolve, 3300))
+  assert.equal(workspacePutCount(), putsBeforeReopen, 'reopening a saved supported document must not cause an automatic repair write')
+  assert.equal(await readFile(path.join(workspace, fileName), 'utf8'), saved)
+}
+
+test('rich-safe screenshot table retains mixed left center right and default column alignment', async () => {
+  const source = [
+    '# Screenshot compatibility fixture', '',
+    '| Left | Center | Right | Default |',
+    '| :--- | :---: | ---: | --- |',
+    '| L1 | C1 | R1 | D1 |',
+    '| L2 | C2 | R2 | D2 |', '',
+    'Edit adjacent paragraph.', '',
+  ].join('\n')
+  await verifyScreenshotSyntaxRichRoundTrip('screenshot-mixed-table-align.md', source, 'screenshot-mixed-table-align-rich.png')
+})
+
+test('rich-safe screenshot table retains escaped negative numbers and a literal star inside bold text', async () => {
+  const source = [
+    '# Screenshot compatibility fixture', '',
+    '| Subject | Detail |', '| --- | --- |',
+    '| one | \\-30 ~ -50 |',
+    '| two | \\-20 ~ -40 |',
+    '| total | **\\-80 ~ -130** |',
+    '| identifier | **Check HLA-B\\*5801 identifier** |', '',
+    'Edit adjacent paragraph.', '',
+  ].join('\n')
+  await verifyScreenshotSyntaxRichRoundTrip('screenshot-table-literal-escapes.md', source, 'screenshot-table-literal-escapes-rich.png')
+})
+
+test('rich-safe screenshot table retains every repeated bare br line break', async () => {
+  const source = [
+    '# Screenshot compatibility fixture', '',
+    '| Item | Detail |', '| --- | --- |',
+    '| Label<br><br>  <br><br>(English) | **15 units**<br><br>  <br><br>+ **200 units** |',
+    '| Tail<br> | <br>Head |', '',
+    'Edit adjacent paragraph.', '',
+  ].join('\n')
+  await verifyScreenshotSyntaxRichRoundTrip('screenshot-table-hard-breaks.md', source, 'screenshot-table-hard-breaks-rich.png')
+})
+
+test('rich-safe screenshot syntax works together without open-time rewriting or conversion confirmation', async () => {
+  const source = [
+    '# Screenshot compatibility fixture', '',
+    '| Left | Center | Right | Default |', '| :--- | :---: | ---: | --- |',
+    '| **HLA-B\\*5801** | \\-30 ~ -50 | 437.5 | **15 units**<br><br>  <br><br>+ **200 units** |',
+    '| stock\\_report | **\\-80 ~ -130** | 12.26 | Label<br><br>(English) |', '',
+    'Inline breaks: a<br><br>b<br>', '',
+    '## 1\\. Numbered heading', '',
+    'Edit adjacent paragraph.', '',
+  ].join('\n')
+  await verifyScreenshotSyntaxRichRoundTrip('screenshot-combined-rich-safe.md', source, 'screenshot-combined-rich-safe.png')
+})
+
 test('legacy zoom stays attached to the correct image even when paths repeat', async () => {
   const fileName = 'legacy-zoom.md'
   const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a3ioAAAAASUVORK5CYII=', 'base64')

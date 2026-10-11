@@ -67,7 +67,7 @@ test('mixed and ordered task lists stay in source mode while homogeneous unorder
   }
 })
 
-test('source-required fixture covers every lossy syntax category', () => {
+test('source-required fixture protects its represented lossy syntax categories', () => {
   const reasons = getMarkdownSourceModeReasons(sourceRequiredFixture)
   for (const reason of [
     'frontMatter',
@@ -75,7 +75,6 @@ test('source-required fixture covers every lossy syntax category', () => {
     'escapedSyntax',
     'referenceLinks',
     'footnotes',
-    'tableAlignment',
     'nestedLists',
     'rawHtml',
     'codeFenceMetadata',

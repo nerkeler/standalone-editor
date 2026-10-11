@@ -40,6 +40,31 @@ function isSafeIntrawordEscapedUnderscore(text, match) {
   return /[\p{L}\p{N}]$/u.test(before) && /^[\p{L}\p{N}]/u.test(after)
 }
 
+function isIntrawordEscapedStar(text, match) {
+  if (match[0] !== '\\*') return false
+  const before = text.slice(Math.max(0, match.index - 2), match.index)
+  const after = text.slice(match.index + 2, match.index + 4)
+  return /[\p{L}\p{N}]$/u.test(before) && /^[\p{L}\p{N}]/u.test(after)
+}
+
+function hasEquivalentUnescapedText(source, offsets) {
+  if (!offsets.length) return false
+  const segments = []
+  let cursor = 0
+  for (const offset of [...offsets].sort((left, right) => left - right)) {
+    segments.push(source.slice(cursor, offset))
+    cursor = offset + 1
+  }
+  segments.push(source.slice(cursor))
+  const candidate = segments.join('')
+  // Unlike underscores, a star between letters can still interact with a
+  // later emphasis delimiter, including one on another line. A plus can also
+  // become a list marker at a line boundary, but remains text after <br>.
+  // Validate the complete Markdown meaning once for the batch, rather than guessing from
+  // nearby characters or reparsing the whole document for every escape.
+  return marked.parse(candidate) === marked.parse(source)
+}
+
 function isWithinRanges(ranges, position) {
   let low = 0
   let high = ranges.length - 1
@@ -51,6 +76,16 @@ function isWithinRanges(ranges, position) {
     else return true
   }
   return false
+}
+
+function mergeInlineRanges(ranges) {
+  const merged = []
+  for (const range of ranges.sort((left, right) => left[0] - right[0])) {
+    const previous = merged.at(-1)
+    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1])
+    else merged.push([...range])
+  }
+  return merged
 }
 
 function normalizeReferenceLabel(label) {
@@ -83,18 +118,17 @@ function hasMultilineHtmlTag(value) {
   return false
 }
 
-function collectImageRanges(tokens, source, scopeStart, scopeEnd, output) {
+function collectInlineEscapeRanges(tokens, source, scopeStart, scopeEnd, output, tokenType) {
   let cursor = scopeStart
   for (const token of tokens || []) {
     const raw = String(token.raw || '')
     let from = raw ? source.indexOf(raw, cursor) : -1
     if (from < scopeStart || from + raw.length > scopeEnd) from = raw ? source.indexOf(raw, scopeStart) : -1
     const found = from >= scopeStart && from + raw.length <= scopeEnd
-    // Keep all escapes in image Markdown protected. The codec handles alt text
-    // through a separate serializer path, so text-node underscore guarantees
-    // do not apply there.
-    if (token.type === 'image') {
-      // Container token raw text may omit quote/list prefixes. If an image's
+    // Image alt text and link destinations use separate serializer paths.
+    // Plain text-node escape guarantees do not automatically apply there.
+    if (token.type === tokenType) {
+      // Container token raw text may omit quote/list prefixes. If a token's
       // exact raw span cannot be found, conservatively protect its nearest
       // located source container instead of assuming its escapes are plain text.
       const start = found ? from : scopeStart
@@ -104,26 +138,28 @@ function collectImageRanges(tokens, source, scopeStart, scopeEnd, output) {
     if (found) cursor = Math.max(cursor, from + raw.length)
 
     if (token.tokens?.length) {
-      collectImageRanges(
+      collectInlineEscapeRanges(
         token.tokens,
         source,
         found ? from : scopeStart,
         found ? from + raw.length : scopeEnd,
         output,
+        tokenType,
       )
     }
     if (token.type === 'table') {
       const cellTokens = [...(token.header || []), ...(token.rows || []).flat()]
         .flatMap(cell => cell.tokens || [])
       if (cellTokens.length) {
-        // Flatten all cells into one scan so repeated identical image Markdown
+        // Flatten all cells into one scan so repeated identical inline Markdown
         // advances through the table source instead of resolving to cell one.
-        collectImageRanges(
+        collectInlineEscapeRanges(
           cellTokens,
           source,
           found ? from : scopeStart,
           found ? from + raw.length : scopeEnd,
           output,
+          tokenType,
         )
       }
     }
@@ -134,12 +170,13 @@ function collectImageRanges(tokens, source, scopeStart, scopeEnd, output) {
       const itemFound = itemFrom >= scopeStart && itemFrom + itemRaw.length <= scopeEnd
       if (itemFound) itemCursor = itemFrom + itemRaw.length
       if (!item.tokens?.length) continue
-      collectImageRanges(
+      collectInlineEscapeRanges(
         item.tokens,
         source,
         itemFound ? itemFrom : scopeStart,
         itemFound ? itemFrom + itemRaw.length : scopeEnd,
         output,
+        tokenType,
       )
     }
   }
@@ -338,13 +375,16 @@ function hasUnsupportedTaskList(token) {
 }
 
 function hasUnsupportedTableAlignment(token, nested = false) {
-  return token.type === 'table' && token.align?.some(Boolean) &&
-    (nested || !token.align.every(value => value === 'left'))
+  // Ordinary tables carry align through the TipTap cell/header attributes and
+  // the Markdown serializer. Nested container layout remains protected until
+  // its complete conversion chain is covered independently.
+  return token.type === 'table' && token.align?.some(Boolean) && nested
 }
 
 export function analyzeMarkdownSource(markdown) {
   const source = String(markdown || '')
   const items = []
+  const deterministicTextEscapeOffsets = []
   const add = (reason, from, to) => {
     if (to > from && !items.some(item => item.reason === reason && item.from === from)) {
       items.push({ reason, from, to, message: MESSAGES[reason] })
@@ -398,15 +438,11 @@ export function analyzeMarkdownSource(markdown) {
     }
   }
   let imageRanges = []
-  collectImageRanges(tokens, source, 0, source.length, imageRanges)
-  imageRanges.sort((left, right) => left[0] - right[0])
-  const mergedImageRanges = []
-  for (const range of imageRanges) {
-    const previous = mergedImageRanges.at(-1)
-    if (previous && range[0] <= previous[1]) previous[1] = Math.max(previous[1], range[1])
-    else mergedImageRanges.push([...range])
-  }
-  imageRanges = mergedImageRanges
+  collectInlineEscapeRanges(tokens, source, 0, source.length, imageRanges, 'image')
+  imageRanges = mergeInlineRanges(imageRanges)
+  let linkRanges = []
+  collectInlineEscapeRanges(tokens, source, 0, source.length, linkRanges, 'link')
+  linkRanges = mergeInlineRanges(linkRanges)
   let offset = 0
   let fence = null
   let fenceStart = -1
@@ -487,6 +523,15 @@ export function analyzeMarkdownSource(markdown) {
         const trailingLinkTitle = /^[\t ]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^\)\r\n]*\))[\t ]*\)/
         const closesInlineLink = /^[\t ]*\)/
         const inImage = reason === 'escapedSyntax' && isWithinRanges(imageRanges, logicalStart + match.index)
+        const inLink = reason === 'escapedSyntax' && isWithinRanges(linkRanges, logicalStart + match.index)
+        const safeNumericMinus = reason === 'escapedSyntax' && !inImage && !inLink &&
+          match[0] === '\\-' && /^\d/.test(logical.slice(match.index + 2))
+        const candidateIntrawordStar = reason === 'escapedSyntax' && !inImage && !inLink &&
+          isIntrawordEscapedStar(logical, match)
+        // Turndown escapes a plus at the start of a new text node after a hard
+        // break. Let the full Markdown comparison distinguish those harmless
+        // inline escapes from an escaped list marker at a real line boundary.
+        const candidateLiteralPlus = reason === 'escapedSyntax' && !inImage && !inLink && match[0] === '\\+'
         const insideLinkDestination = reason === 'autolinks' &&
           /\]\([\t ]*$/.test(logical.slice(0, match.index)) &&
           (closesInlineLink.test(logical.slice(match.index + match[0].length)) ||
@@ -496,10 +541,15 @@ export function analyzeMarkdownSource(markdown) {
             !(reason === 'escapedSyntax' && (
               escapedLiteralFootnotes.some(([start, end]) => match.index >= start && match.index < end) ||
               (!inImage && isSafeIntrawordEscapedUnderscore(logical, match)) ||
+              safeNumericMinus ||
               (safeNumberedHeadingDot && match.index >= safeNumberedHeadingDot[0] && match.index < safeNumberedHeadingDot[1])
             )) &&
-            !(reason === 'rawHtml' && /^(?:<https?:\/\/|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@)/i.test(match[0]))) {
+            !(reason === 'rawHtml' && (
+              /^<br[\t ]*\/?>$/i.test(match[0]) ||
+              /^(?:<https?:\/\/|<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@)/i.test(match[0])
+            ))) {
           add(reason, logicalStart + match.index, logicalStart + match.index + match[0].length)
+          if (candidateIntrawordStar || candidateLiteralPlus) deterministicTextEscapeOffsets.push(logicalStart + match.index)
         }
       }
     }
@@ -591,8 +641,8 @@ export function analyzeMarkdownSource(markdown) {
   }
 
   // Marked's token tree tells us whether a delimiter-looking row is actually
-  // part of a table. The rich editor preserves explicit all-left delimiters
-  // for ordinary tables; nested containers and other alignments stay protected.
+  // part of a table. The rich editor preserves every column alignment for
+  // ordinary tables; nested containers retain the conservative boundary.
   const alignedTableTokens = (token, nested = false) => {
     const found = []
     if (hasUnsupportedTableAlignment(token, nested)) found.push(token)
@@ -696,7 +746,11 @@ export function analyzeMarkdownSource(markdown) {
     if (/^<!--[ \t]*se-image:width=(?:2[5-9]|[3-9]\d|100);align=(?:left|center)[ \t]*-->$/.test(match[0])) continue
     add('rawHtml', match.index, match.index + match[0].length)
   }
+  const safeTextEscapeOffsets = hasEquivalentUnescapedText(source, deterministicTextEscapeOffsets)
+    ? new Set(deterministicTextEscapeOffsets)
+    : new Set()
   return items
     .filter(item => !(item.reason === 'nestedLists' && safeLooseNestedBulletOffsets.has(item.from)))
+    .filter(item => !(item.reason === 'escapedSyntax' && safeTextEscapeOffsets.has(item.from)))
     .sort((a, b) => a.from - b.from || a.to - b.to)
 }
