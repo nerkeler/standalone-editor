@@ -2,10 +2,10 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { makeError } from './errors.js'
 
 function serviceError(message, code, details = {}) {
-  const error = new Error(message)
-  error.code = code
+  const error = makeError(message, code)
   error.details = details
   return error
 }

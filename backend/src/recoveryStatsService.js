@@ -1,20 +1,20 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { createHash } from 'node:crypto'
+import { sha256 } from './hashing.js'
+import { makeError } from './errors.js'
 
 const DEFAULT_RECOVERY_DIRECTORY = path.join(os.homedir(), '.standalone-editor', 'recovery')
 const UUID_PATTERN = /^[0-9a-f-]{36}$/i
 const HASH_PATTERN = /^[0-9a-f]{64}$/i
 
+// Service-specific default code differs from the shared factory default.
 function serviceError(message, code = 'RECOVERY_STORAGE_ERROR') {
-  const error = new Error(message)
-  error.code = code
-  return error
+  return makeError(message, code)
 }
 
 function hash(value) {
-  return createHash('sha256').update(value).digest('hex')
+  return sha256(value)
 }
 
 function isWithin(base, target) {

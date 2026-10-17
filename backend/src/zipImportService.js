@@ -2,7 +2,9 @@ import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
 import { openWorkspaceParent } from './workspacePathGuard.js'
-import { createHash, randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
+import { sha256 } from './hashing.js'
+import { makeError } from './errors.js'
 import { inflateRaw } from 'node:zlib'
 import { promisify } from 'node:util'
 import {
@@ -39,9 +41,7 @@ for (let index = 0; index < CRC_TABLE.length; index += 1) {
 }
 
 function zipError(message, code = 'INVALID_ARCHIVE') {
-  const error = new Error(message)
-  error.code = code
-  return error
+  return makeError(message, code)
 }
 
 function assertRange(buffer, offset, length, message = '压缩包结构无效') {
@@ -317,10 +317,6 @@ async function validateExistingParents(base, targetDirectory) {
 }
 
 const READ_FILE_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0)
-
-function sha256(buffer) {
-  return createHash('sha256').update(buffer).digest('hex')
-}
 
 function rememberDirectory(directoryPath, stat, directoryMap, directoryList) {
   const record = {

@@ -3,7 +3,9 @@ import { constants as fsConstants } from 'node:fs'
 import path from 'path'
 import os from 'os'
 import { Readable } from 'node:stream'
-import { createHash, randomUUID } from 'crypto'
+import { randomUUID } from 'crypto'
+import { sha256 } from './hashing.js'
+import { makeError, makeCausedError } from './errors.js'
 import { extractMarkdownReferences, resolveWorkspaceReference } from './markdownMoveImpact.js'
 import { assertSameEntry, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
 
@@ -43,18 +45,6 @@ function decodeEditableHistoryBytes(contentBase64, recordedSize) {
   const bytes = Buffer.from(contentBase64, 'base64')
   if (bytes.byteLength > MAX_EDITABLE_MARKDOWN_BYTES) throw markdownTooLarge(bytes.byteLength)
   return bytes
-}
-
-function makeError(message, code = 'INVALID_PATH') {
-  const error = new Error(message)
-  error.code = code
-  return error
-}
-
-function makeCausedError(message, code, cause) {
-  const error = makeError(message, code)
-  error.details = { causeCode: cause?.code }
-  return error
 }
 
 function reportRecoveryCleanupWarning(options, reqPath, error, { saveCommitted = true } = {}) {
@@ -100,7 +90,7 @@ function fileConflict(reqPath, expectedRevision, currentBytes) {
 }
 
 function contentRevision(content) {
-  return createHash('sha256').update(content).digest('hex')
+  return sha256(content)
 }
 
 function isMarkdownPath(filePath) {
@@ -674,10 +664,6 @@ const HISTORY_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]
 
 function recoveryRoot(override) {
   return path.resolve(override || process.env.EDITOR_RECOVERY_DIR || path.join(os.homedir(), '.standalone-editor', 'recovery'))
-}
-
-function sha256(value) {
-  return createHash('sha256').update(value).digest('hex')
 }
 
 async function canonicalProjectedPath(target) {
