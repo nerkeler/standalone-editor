@@ -711,7 +711,8 @@ export async function readOrphanFileHistory(workspace, orphanId, historyId, opti
  * @param {{ root?: string, moveHistoryBucket?: (a: string, b: string) => Promise<unknown> }} [options]
  * @param {(manifest: { trashEntryId?: string | null }) => boolean} [predicate]
  */
-export async function reattachHistoryArchives(base, orphanIds, options = {}, predicate = () => true) {  const recovery = await canonicalProjectedPath(recoveryRoot(options.root))
+export async function reattachHistoryArchives(base, orphanIds, options = {}, predicate = () => true) {
+  const recovery = await canonicalProjectedPath(recoveryRoot(options.root))
   const workspaceKey = sha256(base)
   const orphanRoot = path.join(historyWorkspaceDirectory(recovery, base), 'orphans')
   if (!await historyBucketIsSafe(recovery, orphanRoot)) return { reattached: 0, retained: 0 }
