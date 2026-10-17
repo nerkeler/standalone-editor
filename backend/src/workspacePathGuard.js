@@ -2,6 +2,45 @@ import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
 
+/**
+ * Path containment predicate for canonical absolute bases. The caller must
+ * pass realpath-resolved components.
+ * @param {string} base
+ * @param {string} target
+ */
+export function isWithin(base, target) {
+  const relative = path.relative(base, target)
+  return relative === '' || (
+    !path.isAbsolute(relative) &&
+    relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`)
+  )
+}
+
+/**
+ * Project a path through its existing ancestors onto canonical storage, so
+ * containment checks work for a directory that has not fully materialized yet
+ * (e.g. a recovery root before first use).
+ * @param {string} target
+ * @param {{ fileSystem?: typeof fs }} [options]
+ */
+export async function projectCanonicalPath(target, { fileSystem = fs } = {}) {
+  let current = path.resolve(target)
+  const missingParts = []
+  while (true) {
+    try {
+      const canonical = await fileSystem.realpath(current)
+      return path.resolve(canonical, ...missingParts)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+      const parent = path.dirname(current)
+      if (parent === current) throw error
+      missingParts.unshift(path.basename(current))
+      current = parent
+    }
+  }
+}
+
 // Node does not expose openat/renameat. Keep descriptors for every directory
 // component and compare their identities with the pathname immediately before
 // a mutation. This catches a parent replaced after the initial path check.

@@ -5,7 +5,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { sha256, sha256File } from './hashing.js'
 import { makeError } from './errors.js'
-import { assertSameEntry, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
+import { assertSameEntry, isWithin, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
 
 const MANIFEST_NAME = 'entry.json'
 const PAYLOAD_NAME = 'payload'
@@ -16,11 +16,6 @@ const entryLocks = new Map()
 
 // Service-specific alias keeps the historical default code at call sites.
 const serviceError = makeError
-
-function isWithin(base, target) {
-  const relative = path.relative(base, target)
-  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
-}
 
 function assertNotWithin(base, target) {
   if (isWithin(base, target)) throw serviceError('回收站必须位于工作空间之外', 'INVALID_RECOVERY_ROOT')

@@ -3,20 +3,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { makeError } from './errors.js'
+import { isWithin, projectCanonicalPath } from './workspacePathGuard.js'
 
 function serviceError(message, code, details = {}) {
   const error = makeError(message, code)
   error.details = details
   return error
-}
-
-function isWithin(base, target) {
-  const relative = path.relative(base, target)
-  return relative === '' || (
-    !path.isAbsolute(relative) &&
-    relative !== '..' &&
-    !relative.startsWith(`..${path.sep}`)
-  )
 }
 
 async function canonicalDirectory(input, fileSystem) {
@@ -168,24 +160,10 @@ export async function saveWorkspaceConfig(configFile, workspace, {
 /**
  * Resolve a path through existing symlinked ancestors without creating any
  * missing components. This allows safe containment checks for a recovery
- * directory that has not been created yet.
+ * directory that has not been created yet. Lives in workspacePathGuard; kept
+ * as an explicit re-export for this module's established importers.
  */
-export async function projectCanonicalPath(target, { fileSystem = fs } = {}) {
-  let current = path.resolve(target)
-  const missingParts = []
-  while (true) {
-    try {
-      const canonical = await fileSystem.realpath(current)
-      return path.resolve(canonical, ...missingParts)
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
-      const parent = path.dirname(current)
-      if (parent === current) throw error
-      missingParts.unshift(path.basename(current))
-      current = parent
-    }
-  }
-}
+export { projectCanonicalPath }
 
 /**
  * Refuse either directory being nested inside the other. No recovery path is
