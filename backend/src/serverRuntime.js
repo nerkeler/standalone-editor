@@ -1,3 +1,4 @@
+// @ts-check
 import { createHttpServer } from './httpServer.js'
 
 export function formatBackendUrl(host, port) {
@@ -21,7 +22,8 @@ export async function startBackendServer(backend) {
     const info = backend.currentWorkspaceInfo()
     if (info) console.log(`📁 工作空间：${info.workspace}`)
     else console.error('工作空间不可用：请重试或选择新的工作目录')
-    console.log(`🌐 ${formatBackendUrl(backend.host, server.address()?.port ?? backend.port)}`)
+    const address = /** @type {import('net').AddressInfo} */ (server.address())
+    console.log(`🌐 ${formatBackendUrl(backend.host, address.port ?? backend.port)}`)
   })
 
   function shutdown(signal) {

@@ -1,3 +1,4 @@
+// @ts-check
 function isEscaped(value, index) {
   let slashes = 0
   for (let cursor = index - 1; cursor >= 0 && value[cursor] === '\\'; cursor -= 1) slashes += 1

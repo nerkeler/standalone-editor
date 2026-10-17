@@ -1,3 +1,4 @@
+// @ts-check
 export function isSupportedNodeVersion(version) {
   if (typeof version !== 'string') return false
   const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version)

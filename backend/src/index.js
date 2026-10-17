@@ -1,3 +1,4 @@
+// @ts-check
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -12,6 +13,7 @@ import {
 import { createTrashService } from './trashService.js'
 import { getRecoveryStats } from './recoveryStatsService.js'
 import { isSupportedNodeVersion } from './runtimeVersion.js'
+import { makeError } from './errors.js'
 import { errorStatus } from './serverErrors.js'
 import { registerDocumentRoutes } from './documentRoutes.js'
 import { registerRecoveryRoutes } from './recoveryRoutes.js'
@@ -161,9 +163,7 @@ export function createBackend(options = {}) {
     const real = await fs.realpath(resolved)
     const stat = await fs.stat(real)
     if (!stat.isDirectory()) {
-      const error = new Error('不是有效目录')
-      error.code = 'INVALID_DIRECTORY'
-      throw error
+      throw makeError('不是有效目录', 'INVALID_DIRECTORY')
     }
     return real
   }
@@ -305,19 +305,16 @@ export function createBackend(options = {}) {
     if (isDirectoryPickerSelectionAllowed(realPath, roots, { platform: process.platform })) return
     if (allowFilesystemRoot && isDirectoryNavigable(realPath, roots, { platform: process.platform })) return
     if (!roots.length && allowFilesystemRoot && realPath === path.parse(realPath).root) return
-    const error = new Error('只能选择允许范围内的目录')
-    error.code = 'INVALID_DIRECTORY'
-    throw error
+    throw makeError('只能选择允许范围内的目录', 'INVALID_DIRECTORY')
   }
 
   const cliWorkspace = commandWorkspace()
 
   function asWorkspaceUnavailable(error, configuredPath = workspaceCandidate) {
     const candidate = error?.details?.workspace || configuredPath || null
-    const unavailable = new Error(error?.message || (candidate
+    const unavailable = makeError(error?.message || (candidate
       ? `上次工作空间当前不可访问：${candidate}`
-      : '工作空间尚未就绪，请重试或选择新的工作目录'))
-    unavailable.code = error?.code || 'WORKSPACE_UNAVAILABLE'
+      : '工作空间尚未就绪，请重试或选择新的工作目录'), error?.code || 'WORKSPACE_UNAVAILABLE')
     unavailable.details = {
       ...(error?.details || {}),
       ...(candidate ? { workspace: candidate } : {}),
@@ -337,8 +334,7 @@ export function createBackend(options = {}) {
   }
 
   function wrapConfigSaveError(error) {
-    const failure = new Error(`无法保存工作空间配置：${error?.message || '未知错误'}`)
-    failure.code = 'WORKSPACE_CONFIG_SAVE_FAILED'
+    const failure = makeError(`无法保存工作空间配置：${error?.message || '未知错误'}`, 'WORKSPACE_CONFIG_SAVE_FAILED')
     failure.details = { configFile: CONFIG_FILE, causeCode: error?.code }
     return failure
   }
@@ -427,10 +423,9 @@ export function createBackend(options = {}) {
       const config = await loadWorkspaceConfig(CONFIG_FILE)
       if (config.kind === 'configured') {
         if (workspaceCandidate && config.workspace !== workspaceCandidate) {
-          const error = new Error(
+          const error = makeError(
             `工作空间配置已指向其他目录：${config.workspace}。请显式选择工作目录后继续。`,
-          )
-          error.code = 'WORKSPACE_CONFIG_CHANGED'
+            'WORKSPACE_CONFIG_CHANGED')
           error.details = {
             configFile: CONFIG_FILE,
             workspace: workspaceCandidate,
@@ -443,8 +438,7 @@ export function createBackend(options = {}) {
         return
       }
       if (!configWasMissingAtStartup) {
-        const error = new Error('工作空间配置文件已不存在；为避免切换到其他目录，请选择新的工作目录')
-        error.code = 'WORKSPACE_CONFIG_MISSING'
+        const error = makeError('工作空间配置文件已不存在；为避免切换到其他目录，请选择新的工作目录', 'WORKSPACE_CONFIG_MISSING')
         error.details = { configFile: CONFIG_FILE }
         throw error
       }
@@ -473,8 +467,7 @@ export function createBackend(options = {}) {
   async function ensureCurrentWorkspaceAccessible(previous = workspace) {
     if (!previous) throw workspaceStartupError || asWorkspaceUnavailable(null)
     const changedError = () => {
-      const error = new Error('工作空间已变化，请刷新后重新打开')
-      error.code = 'WORKSPACE_MISMATCH'
+      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
       const info = currentWorkspaceInfo()
       error.details = info ? { ...info } : {}
       return error
@@ -483,17 +476,14 @@ export function createBackend(options = {}) {
     try {
       const resolved = await canonicalDirectory(previous)
       if (resolved !== previous) {
-        const error = new Error('工作空间路径解析已变化')
-        error.code = 'WORKSPACE_PATH_CHANGED'
-        throw error
+        throw makeError('工作空间路径解析已变化', 'WORKSPACE_PATH_CHANGED')
       }
       await fs.readdir(resolved)
     } catch (error) {
       if (workspace !== previous) throw changedError()
       workspaceCandidate = previous
       workspace = null
-      const unavailable = new Error(`上次工作空间当前不可访问：${previous}`)
-      unavailable.code = 'SAVED_WORKSPACE_UNAVAILABLE'
+      const unavailable = makeError(`上次工作空间当前不可访问：${previous}`, 'SAVED_WORKSPACE_UNAVAILABLE')
       unavailable.details = { workspace: previous, causeCode: error?.code }
       workspaceStartupError = asWorkspaceUnavailable(unavailable, previous)
       throw workspaceStartupError
@@ -617,8 +607,7 @@ export function createBackend(options = {}) {
     const current = currentWorkspaceInfo()
     if (!current || current.workspace !== info.workspace || current.workspaceVersion !== info.workspaceVersion) {
       if (current) setWorkspaceHeaders(res, current)
-      const error = new Error('工作空间已变化，请刷新后重新打开')
-      error.code = 'WORKSPACE_MISMATCH'
+      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
       res.status(409).json({ error: error.message, code: error.code, ...(current || {}) })
       return
     }
@@ -634,8 +623,7 @@ export function createBackend(options = {}) {
       ?? (allowQueryIdentity ? req.query.workspaceVersion : null)
     const requestVersion = versionHeader == null || versionHeader === '' ? null : Number(versionHeader)
     if (!requestId || requestId !== info.workspaceId || (requestVersion != null && requestVersion !== info.workspaceVersion)) {
-      const error = new Error('工作空间已变化，请刷新后重新打开')
-      error.code = 'WORKSPACE_MISMATCH'
+      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
       res.status(409).json({ error: error.message, code: error.code, ...info })
       return
     }

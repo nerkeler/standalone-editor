@@ -1,5 +1,7 @@
+// @ts-check
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { makeError } from './errors.js'
 import {
   breadcrumbFor,
   isDirectoryNavigable,
@@ -57,9 +59,7 @@ export function registerWorkspaceSelectionRoutes(app, {
       const result = await withWorkspaceSelection(async () => {
         const newPath = req.body?.path
         if (!newPath || typeof newPath !== 'string') {
-          const error = new Error('缺少 path 参数')
-          error.code = 'INVALID_DIRECTORY'
-          throw error
+          throw makeError('缺少 path 参数', 'INVALID_DIRECTORY')
         }
         return selectWorkspace(newPath)
       })

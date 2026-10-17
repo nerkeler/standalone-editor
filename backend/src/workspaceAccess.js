@@ -61,9 +61,14 @@ export function lexicalPath(base, requestPath = '') {
 // keeps every file operation inside the canonical workspace, even when a
 // user-created symlink points outside it.
 /**
+ * @typedef {import('fs').Stats | import('fs').BigIntStats} PathStat
+ */
+
+/**
  * @param {string} workspace
  * @param {string} requestPath
  * @param {{ allowRoot?: boolean, bigintStat?: boolean }} [options]
+ * @returns {Promise<{ base: string, full: string, stat: PathStat }>}
  */
 export async function existingPath(workspace, requestPath, { allowRoot = true, bigintStat = false } = {}) {
   const base = await workspaceBase(workspace)
@@ -124,7 +129,7 @@ export async function fileLocation(workspace, requestPath, { allowMissing = fals
 /**
  * Open a read-only handle after verifying the file's identity did not change
  * since `stat` was observed. The caller owns the returned handle.
- * @param {{ base: string, target: string, stat: import('fs').Stats }} location
+ * @param {{ base: string, target: string, stat: import('fs').Stats | import('fs').BigIntStats }} location
  */
 export async function openRegularFileHandle({ base, target, stat }) {
   const flags = fsConstants.O_RDONLY |
@@ -150,7 +155,7 @@ export async function openRegularFileHandle({ base, target, stat }) {
 
 /**
  * Read a regular file via an identity-checked handle.
- * @param {{ base: string, target: string, stat: import('fs').Stats }} location
+ * @param {{ base: string, target: string, stat: import('fs').Stats | import('fs').BigIntStats }} location
  */
 export async function readRegularFile(location) {
   const handle = await openRegularFileHandle(location)

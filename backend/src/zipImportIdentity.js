@@ -1,3 +1,4 @@
+// @ts-check
 const FILE_TYPE_MASK = 0o170000n
 
 export function sameFileSnapshot(left, right) {
