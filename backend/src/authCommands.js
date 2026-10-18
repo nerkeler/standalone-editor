@@ -1,11 +1,6 @@
 // @ts-check
-import path from 'path'
-import os from 'os'
+import { resolveAuthFile } from './authService.js'
 import { promptAndPasswordConfirmation, savePassword, clearPassword } from './passwordCli.js'
-
-export function defaultAuthFile() {
-  return path.join(os.homedir(), '.standalone-editor', 'auth.json')
-}
 
 /**
  * Handle `--set-password` / `--clear-password` in the running entry point.
@@ -16,7 +11,7 @@ export function defaultAuthFile() {
  * @returns {Promise<number>} exit code
  */
 export async function handleAuthCommand(command, { env = process.env, write } = {}) {
-  const authFile = env.EDITOR_AUTH_FILE || defaultAuthFile()
+  const authFile = resolveAuthFile({ env })
   try {
     if (command === 'clear') {
       await clearPassword(authFile)

@@ -1,5 +1,7 @@
 // @ts-check
 import crypto from 'crypto'
+import os from 'os'
+import path from 'path'
 
 const SCRYPT_PARAMETERS = { N: 16384, r: 8, p: 1 }
 const SESSION_IDLE_MS = 7 * 24 * 60 * 60 * 1000
@@ -251,3 +253,19 @@ export function serializeSessionCookie(name, value, { maxAgeSeconds, secure = fa
 
 /** A null cookie value expires it unconditionally. */
 export const CLEAR_SESSION_COOKIE = 'editor_session=; Path=/; SameSite=Lax; HttpOnly; Max-Age=0'
+
+/**
+ * Single source of truth for the auth file location, shared by the server and
+ * the `--set-password` command so both always read and write the same file.
+ * It sits beside the workspace config unless EDITOR_AUTH_FILE overrides it.
+ * @param {{ env?: NodeJS.ProcessEnv, configFile?: string }} [options]
+ * @returns {string}
+ */
+export function resolveAuthFile({ env = process.env, configFile } = {}) {
+  if (env.EDITOR_AUTH_FILE) return path.resolve(env.EDITOR_AUTH_FILE)
+  const config = configFile
+    || env.WORKSPACE_CONFIG_FILE
+    || env.EDITOR_CONFIG_FILE
+    || path.join(os.homedir(), '.standalone-editor', 'workspace.json')
+  return path.join(path.dirname(path.resolve(config)), 'auth.json')
+}

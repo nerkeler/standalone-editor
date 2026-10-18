@@ -20,6 +20,7 @@ import { registerRecoveryRoutes } from './recoveryRoutes.js'
 import { registerMediaRoutes } from './mediaRoutes.js'
 import { reattachTrashFileHistory } from './historyService.js'
 import { registerAuthRoutes, loadPasswordRecord } from './authRoutes.js'
+import { resolveAuthFile } from './authService.js'
 import {
   configuredRootValues,
   defaultRootCandidates,
@@ -72,8 +73,7 @@ export function createBackend(options = {}) {
   const historyCleanupWarnings = new Map()
   let workspaceSelectionTail = Promise.resolve()
 
-  const AUTH_FILE = options.authFile || env.EDITOR_AUTH_FILE
-    || path.join(path.dirname(CONFIG_FILE), 'auth.json')
+  const AUTH_FILE = options.authFile || resolveAuthFile({ env, configFile: CONFIG_FILE })
   /** Filled in by initializeBackend before any request is accepted. */
   const authState = { record: null, enabled: false }
 

@@ -65,6 +65,15 @@ $env:EDITOR_RECOVERY_DIR = 'C:\Users\you\AppData\Local\StandaloneEditor\recovery
 node src\index.js
 ```
 
+### 访问密码
+
+服务默认免登录。需要启用访问密码时，任选其一：
+
+- 交互设置：`node src/index.js --set-password`，输入不回显并需两次确认；清除用 `--clear-password`。
+- 环境变量：启动前设置 `EDITOR_PASSWORD`。每次启动都会把它写入认证文件，并优先于文件中的旧密码，适合 supervisor 或容器部署。
+
+认证文件默认位于 `workspace.json` 同目录的 `auth.json`，可用 `EDITOR_AUTH_FILE` 指定。命令和服务端使用同一位置解析规则。修改后需要重启服务。部署在 HTTPS 反向代理之后时，设置 `EDITOR_TRUST_PROXY=1`，使 Cookie 带上 `Secure`。
+
 In production mode the backend serves `/` from `frontend/dist`. `/api/health` reports whether the process can answer HTTP requests; it remains healthy when a saved workspace disk is offline. `/api/workspace/check` reports workspace availability separately so the UI can explain the issue and let the user choose another directory.
 
 ## Data, logs, update and rollback

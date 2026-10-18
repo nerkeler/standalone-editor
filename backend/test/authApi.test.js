@@ -13,6 +13,7 @@ import {
   createSessionStore,
   parseCookieHeader,
   parsePasswordFile,
+  resolveAuthFile,
   serializeSessionCookie,
   verifyPassword,
 } from '../src/authService.js'
@@ -295,4 +296,13 @@ test('a corrupted auth file fails startup instead of running unprotected', async
     authFile,
   })
   await assert.rejects(backend.initialize(), /** @type {(e: unknown) => boolean} */ (error) => /** @type {Error & { code?: string }} */ (error)?.code === 'AUTH_CONFIG_CORRUPT')
+})
+
+test('the server and the password command resolve the same auth file', () => {
+  const beside = resolveAuthFile({ env: { WORKSPACE_CONFIG_FILE: '/srv/cfg/workspace.json' } })
+  assert.equal(beside, path.join('/srv/cfg', 'auth.json'))
+  const explicit = resolveAuthFile({ env: { EDITOR_AUTH_FILE: '/etc/editor/pw.json', WORKSPACE_CONFIG_FILE: '/srv/cfg/workspace.json' } })
+  assert.equal(explicit, path.resolve('/etc/editor/pw.json'))
+  const fromOption = resolveAuthFile({ env: {}, configFile: '/tmp/x/workspace.json' })
+  assert.equal(fromOption, path.join('/tmp/x', 'auth.json'))
 })
