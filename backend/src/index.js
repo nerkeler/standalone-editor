@@ -19,6 +19,7 @@ import { registerDocumentRoutes } from './documentRoutes.js'
 import { registerRecoveryRoutes } from './recoveryRoutes.js'
 import { registerMediaRoutes } from './mediaRoutes.js'
 import { reattachTrashFileHistory } from './historyService.js'
+import { registerAuthRoutes, loadPasswordRecord } from './authRoutes.js'
 import {
   configuredRootValues,
   defaultRootCandidates,
@@ -70,6 +71,11 @@ export function createBackend(options = {}) {
   const recoveryMaintenance = new Map()
   const historyCleanupWarnings = new Map()
   let workspaceSelectionTail = Promise.resolve()
+
+  const AUTH_FILE = options.authFile || env.EDITOR_AUTH_FILE
+    || path.join(path.dirname(CONFIG_FILE), 'auth.json')
+  /** Filled in by initializeBackend before any request is accepted. */
+  const authState = { record: null, enabled: false }
 
   function workspaceTrashService(ws) {
     return createTrashService(ws, { recoveryRoot: RECOVERY_ROOT })
@@ -499,11 +505,22 @@ export function createBackend(options = {}) {
   function initializeBackend() {
     if (!workspaceInitialization) workspaceInitialization = initializeWorkspace().then(async () => {
       if (workspace) await reconcileWorkspaceRecovery(workspace)
+    }).then(async () => {
+      // An explicit EDITOR_PASSWORD always (re)writes the auth file. A missing
+      // file runs without password protection and prints a startup warning; a
+      // corrupted file is a startup error to avoid silently unauthenticated runs.
+      const loaded = await loadPasswordRecord(AUTH_FILE, { password: env.EDITOR_PASSWORD })
+      authState.record = loaded.record
+      authState.enabled = loaded.enabled
     })
     return workspaceInitialization
   }
 
   const app = express()
+  // Honor X-Forwarded-* only when the operator explicitly declares a proxy, so
+  // a Secure cookie is set while the deployment retains full control.
+  if (options.trustProxy || env.EDITOR_TRUST_PROXY === '1') app.set('trust proxy', true)
+
   const configuredOrigins = new Set((env.CORS_ORIGINS || env.EDITOR_CORS_ORIGINS || '')
     .split(',').map(item => item.trim()).filter(Boolean))
   const defaultOrigins = new Set([
@@ -559,6 +576,14 @@ export function createBackend(options = {}) {
       : defaultJsonParser
     parser(req, res, next)
   })
+  // Auth routes self-exempt their own paths; the guard below protects every
+  // later-registered API route and leaves static hosting public.
+  const authInstance = registerAuthRoutes(app, {
+    state: authState,
+    sendError,
+    secure: req => /** @type {import('express').Request} */ (req)?.secure,
+  })
+  app.use(authInstance.authGuard)
 
   // Uploads contain one file and at most the path and documentPath text fields.
   // Keep the 100 MiB file ceiling used by ZIP import, while bounding every
@@ -734,7 +759,17 @@ export function createBackend(options = {}) {
 // Preserve `node src/index.js` as a supported development and production
 // entrypoint while imports used by tests only construct an app on demand.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  if (!isSupportedNodeVersion(process.versions.node)) {
+  const argv = process.argv.slice(2)
+  const authCommand = argv.includes('--set-password')
+    ? 'set'
+    : argv.includes('--clear-password') ? 'clear' : null
+  if (authCommand) {
+    const authCommandModule = await import('./authCommands.js')
+    process.exitCode = await authCommandModule.handleAuthCommand(authCommand, {
+      env: process.env,
+      write: process.stderr.write.bind(process.stderr),
+    })
+  } else if (!isSupportedNodeVersion(process.versions.node)) {
     console.error(`❌ 需要 Node.js 22.17.0 或更新的 22.x 版本（当前：v${process.versions.node}）`)
     process.exitCode = 1
   } else {
