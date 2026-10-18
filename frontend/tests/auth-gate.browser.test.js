@@ -214,9 +214,23 @@ test('access password gates the editor, then unlocks after login and logout re-l
     'Boolean(document.querySelector(\'button[aria-label="退出登录"]\'))',
   ), { timeoutMs: 25_000 })
 
-  // Logging out closes the session and reopens the gate without clearing drafts.
+  // Mark the mounted editor instance; it must survive lock and unlock.
+  assert.equal(await connection.evaluate(
+    "document.querySelector('.editor-statusbar').dataset.instance = 'kept', true",
+  ), true)
+
+  // Logging out locks the UI without unmounting the editor.
   await connection.evaluate(`document.querySelector('button[aria-label="退出登录"]').click()`)
   await waitUntil('gate after logout', () => connection.evaluate(
     'Boolean(document.querySelector(\'input[aria-label="访问密码"]\'))',
+  ), { timeoutMs: 25_000 })
+  assert.equal(await connection.evaluate(
+    "document.querySelector('.editor-statusbar')?.dataset.instance === 'kept' && document.querySelector('.editor-statusbar').closest('[hidden]') !== null",
+  ), true, 'editor should stay mounted behind a hidden wrapper while locked')
+
+  // Signing in again reuses that same editor instance.
+  assert.equal(await connection.evaluate(`${SET_PASSWORD_JS}('gate-password')`), true)
+  await waitUntil('editor visible after re-login', () => connection.evaluate(
+    "document.querySelector('.editor-statusbar')?.dataset.instance === 'kept' && !document.querySelector('.editor-statusbar').closest('[hidden]')",
   ), { timeoutMs: 25_000 })
 })

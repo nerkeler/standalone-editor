@@ -132,6 +132,12 @@ export default function App() {
       return true
     } catch (error) {
       if (!mountedRef.current || requestId !== requestIdRef.current) return false
+      if (error?.response?.data?.code === 'AUTH_REQUIRED') {
+        // Locked, not invalid: keep the mounted editor and its in-memory state
+        // (undo stacks, unsaved text) until the user signs in again.
+        setCheckingWorkspace(false)
+        return false
+      }
       const diagnostic = describeWorkspaceCheckError(error)
       // Keep the rejected path only in the diagnostic so it can be shown as
       // context. Clear it from the active browser context to prevent reuse.
@@ -309,20 +315,14 @@ export default function App() {
   }[pickerOperation] || ''
   const themeToggle = <ThemeToggle theme={theme} onToggle={toggleTheme} />
 
-  const content = authState === 'locked'
-    ? <AuthGate themeToggle={themeToggle} onAuthenticated={handleAuthenticated} />
-    : checkingWorkspace
-      ? <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在校验工作空间…</div>
-      : !workspace
-        ? <Welcome
-            diagnostic={workspaceDiagnostic}
-            onRetry={validateWorkspace}
-            onChooseWorkspace={openWelcomePicker}
-            authSlot={authState === 'ok'
-              ? <Button size="small" type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={handleLogout}>退出</Button>
-              : null}
-          />
-        : <EditorLoadErrorBoundary key={`${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}`}>
+  const locked = authState === 'locked'
+  // The editor stays mounted while locked so its in-memory state survives a
+  // session expiry; the login page is laid over it and the editor is hidden.
+  const content = (
+    <>
+      {workspace && (
+        <div hidden={locked}>
+          <EditorLoadErrorBoundary key={`${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}`}>
             <Suspense fallback={<div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在加载编辑器…</div>}>
               <Editor workspace={workspace} workspaceInfo={workspaceInfo} onRequestWorkspacePicker={openWorkspacePicker}
                 themeToggle={themeToggle}
@@ -331,6 +331,24 @@ export default function App() {
                   : null} />
             </Suspense>
           </EditorLoadErrorBoundary>
+        </div>
+      )}
+      {!workspace && !locked && checkingWorkspace && (
+        <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在校验工作空间…</div>
+      )}
+      {!workspace && !locked && !checkingWorkspace && (
+        <Welcome
+          diagnostic={workspaceDiagnostic}
+          onRetry={validateWorkspace}
+          onChooseWorkspace={openWelcomePicker}
+          authSlot={authState === 'ok'
+            ? <Button size="small" type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={handleLogout}>退出</Button>
+            : null}
+        />
+      )}
+      {locked && <AuthGate themeToggle={themeToggle} onAuthenticated={handleAuthenticated} />}
+    </>
+  )
 
   return (
     <ConfigProvider
