@@ -155,6 +155,10 @@ test('loadPasswordRecord prefers the explicit password and persists it', async t
 
 test('without a password file the service stays open and login reports disabled', async t => {
   const { url, identityHeaders } = await makeBackend(t, { name: 'open' })
+  const probe = await request(url, '/api/auth/session')
+  assert.equal(probe.status, 200)
+  assert.deepEqual(await probe.json(), { success: false, enabled: false })
+
   const login = await request(url, '/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

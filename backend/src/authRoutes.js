@@ -131,10 +131,13 @@ export function registerAuthRoutes(app, deps) {
   })
 
   app.get('/api/auth/session', (req, res) => {
+    // Probing when auth is off answers 200 with enabled=false so the client can
+    // distinguish an unauthenticated window from a service without protection.
+    if (!state?.enabled) return res.json({ success: false, enabled: false })
     const cookies = parseCookieHeader(req.get('cookie'))
     const verified = sessions.verify(cookies[SESSION_COOKIE])
     if (!verified) return res.status(401).json({ error: '需要登录', code: 'AUTH_REQUIRED' })
-    return res.json({ success: true, csrfToken: verified.csrfToken })
+    return res.json({ success: true, enabled: true, csrfToken: verified.csrfToken })
   })
 
   /**

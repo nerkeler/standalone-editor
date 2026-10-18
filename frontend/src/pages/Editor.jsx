@@ -341,7 +341,7 @@ function menuAnchorPosition(event, fallbackElement) {
 
 // ========== 主组件 ==========
 
-export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePicker, themeToggle }) {
+export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePicker, themeToggle, authSlot }) {
   const [tree, setTree] = useState([])
   const [selectedKey, setSelectedKey] = useState('')
   const selectedTreeKeys = useMemo(() => [selectedKey], [selectedKey])
@@ -2873,7 +2873,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
             </div>
           )}
           <div className={`editor-statusbar${isMobile || editorFullscreen ? ' editor-statusbar-theme-slot' : ''}`} aria-label="文档状态栏">
-            <div className="editor-theme-slot">{themeToggle}</div>
+            <div className="editor-theme-slot">{authSlot}{themeToggle}</div>
             <div className="editor-file-location" title={activeFile || '尚未选择文件'}>
               <FileOutlined aria-hidden="true" />
               <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>

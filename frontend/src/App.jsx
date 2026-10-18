@@ -1,7 +1,9 @@
 import React, { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
-import { ConfigProvider, theme as antdTheme } from 'antd'
+import { Button, ConfigProvider, theme as antdTheme } from 'antd'
+import { LogoutOutlined } from '@ant-design/icons'
 import Welcome from './pages/Welcome'
-import { api, setWorkspaceContext } from './api'
+import { api, logoutSession, probeSession, setSessionCsrfToken, setWorkspaceContext, subscribeAuthRequired } from './api'
+import AuthGate from './components/AuthGate'
 import ThemeToggle from './components/ThemeToggle'
 import WorkspacePickerModal from './components/WorkspacePickerModal'
 import EditorLoadErrorBoundary from './components/EditorLoadErrorBoundary'
@@ -62,6 +64,8 @@ function describeSelectionError(error, fallback = '切换工作目录失败') {
 
 export default function App() {
   const [theme, setTheme] = useState(getInitialTheme)
+  // authEnabled=false → password auth off. 'locked' → backend said AUTH_REQUIRED.
+  const [authState, setAuthState] = useState('checking')
   const [workspaceInfo, setWorkspaceInfo] = useState(null)
   const [checkingWorkspace, setCheckingWorkspace] = useState(true)
   const [workspaceDiagnostic, setWorkspaceDiagnostic] = useState(null)
@@ -79,6 +83,36 @@ export default function App() {
     applyTheme(theme)
     writeStorage(THEME_KEY, theme)
   }, [theme])
+
+  useEffect(() => {
+    // Any API call failing with 401 AUTH_REQUIRED (expired session, logout in
+    // another window) returns the UI to the login screen. Local drafts and the
+    // cached workspace context are intentionally untouched so nothing is lost.
+    const unsubscribe = subscribeAuthRequired(() => {
+      setSessionCsrfToken(null)
+      setAuthState('locked')
+    })
+    return unsubscribe
+  }, [])
+
+  const resolveAuthEnabled = useCallback(async () => {
+    try {
+      const session = await probeSession()
+      setAuthState(session.enabled ? (session.authenticated ? 'ok' : 'locked') : 'disabled')
+      return session
+    } catch {
+      // The probe failing for transport reasons must not hide the usual
+      // workspace diagnostics; assume auth is off and continue.
+      setAuthState('disabled')
+      return { enabled: false }
+    }
+  }, [])
+
+  const handleLogout = useCallback(async () => {
+    await logoutSession().catch(() => {})
+    setSessionCsrfToken(null)
+    setAuthState('locked')
+  }, [])
 
   const validateWorkspace = useCallback(async () => {
     const requestId = ++requestIdRef.current
@@ -111,12 +145,24 @@ export default function App() {
 
   useEffect(() => {
     mountedRef.current = true
-    validateWorkspace()
+    resolveAuthEnabled().then(session => {
+      if (session.enabled) {
+        if (session.authenticated) validateWorkspace()
+      } else {
+        validateWorkspace()
+      }
+    })
     return () => {
       mountedRef.current = false
       requestIdRef.current += 1
       selectionRequestIdRef.current += 1
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleAuthenticated = useCallback(() => {
+    setAuthState('ok')
+    validateWorkspace()
   }, [validateWorkspace])
 
   const openWorkspacePicker = useCallback(({ initialPath = '', beforeSelect = null } = {}) => {
@@ -261,21 +307,30 @@ export default function App() {
     checking: '正在验证已设置的工作目录…',
     reconciling: '正在重新验证后端当前工作目录…',
   }[pickerOperation] || ''
+  const themeToggle = <ThemeToggle theme={theme} onToggle={toggleTheme} />
 
-  const content = checkingWorkspace
-    ? <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在校验工作空间…</div>
-    : !workspace
-      ? <Welcome
-          diagnostic={workspaceDiagnostic}
-          onRetry={validateWorkspace}
-          onChooseWorkspace={openWelcomePicker}
-        />
-      : <EditorLoadErrorBoundary key={`${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}`}>
-          <Suspense fallback={<div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在加载编辑器…</div>}>
-            <Editor workspace={workspace} workspaceInfo={workspaceInfo} onRequestWorkspacePicker={openWorkspacePicker}
-              themeToggle={<ThemeToggle theme={theme} onToggle={toggleTheme} />} />
-          </Suspense>
-        </EditorLoadErrorBoundary>
+  const content = authState === 'locked'
+    ? <AuthGate themeToggle={themeToggle} onAuthenticated={handleAuthenticated} />
+    : checkingWorkspace
+      ? <div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在校验工作空间…</div>
+      : !workspace
+        ? <Welcome
+            diagnostic={workspaceDiagnostic}
+            onRetry={validateWorkspace}
+            onChooseWorkspace={openWelcomePicker}
+            authSlot={authState === 'ok'
+              ? <Button size="small" type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={handleLogout}>退出</Button>
+              : null}
+          />
+        : <EditorLoadErrorBoundary key={`${workspaceInfo?.workspaceId || ''}:${workspaceInfo?.workspaceVersion ?? ''}`}>
+            <Suspense fallback={<div style={{ minHeight: '100vh', display: 'grid', placeItems: 'center', color: 'var(--color-text-secondary)' }}>正在加载编辑器…</div>}>
+              <Editor workspace={workspace} workspaceInfo={workspaceInfo} onRequestWorkspacePicker={openWorkspacePicker}
+                themeToggle={themeToggle}
+                authSlot={authState === 'ok'
+                  ? <Button size="small" type="text" icon={<LogoutOutlined />} aria-label="退出登录" onClick={handleLogout}>退出</Button>
+                  : null} />
+            </Suspense>
+          </EditorLoadErrorBoundary>
 
   return (
     <ConfigProvider
