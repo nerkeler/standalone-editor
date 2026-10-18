@@ -64,11 +64,10 @@ export async function loadPasswordRecord(authFile, { password } = {}) {
  *   secure: (req: unknown) => boolean,
  *   sessions?: SessionStore,
  *   rateLimiter?: RateLimiter,
- *   logger?: { warn: (message: string) => void },
  * }} deps
  */
 export function registerAuthRoutes(app, deps) {
-  const { sendError, secure, logger = console } = deps
+  const { sendError, secure } = deps
   /** Populated by the caller once startup config loading resolves. */
   const state = deps.state
   void state
@@ -173,10 +172,8 @@ export function registerAuthRoutes(app, deps) {
     next()
   }
 
-  if (!state?.enabled) {
-    logger.warn('认证未启用：未配置访问密码。仅在 127.0.0.1 或可信网络中运行是安全的；' +
-      '通过 `node src/index.js --set-password` 或环境变量 EDITOR_PASSWORD 开启。')
-  }
+  // Whether auth is active is only known after initializeBackend fills the
+  // state; the caller decides when to print the startup notice.
 
   return { authGuard, sessions, rateLimiter }
 }

@@ -512,6 +512,10 @@ export function createBackend(options = {}) {
       const loaded = await loadPasswordRecord(AUTH_FILE, { password: env.EDITOR_PASSWORD })
       authState.record = loaded.record
       authState.enabled = loaded.enabled
+      if (!loaded.enabled) {
+        console.warn('认证未启用：未配置访问密码。仅在 127.0.0.1 或可信网络中运行是安全的；' +
+          '通过 `node src/index.js --set-password` 或环境变量 EDITOR_PASSWORD 开启。')
+      }
     })
     return workspaceInitialization
   }
