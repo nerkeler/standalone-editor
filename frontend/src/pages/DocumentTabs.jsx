@@ -60,26 +60,37 @@ export default function DocumentTabs({
         const hasSaveError = Boolean(saveErrors[file])
         const hasUnsavedChanges = Boolean(isDirty[file])
         return (
-          <div key={file} className={`document-tab${active ? ' is-active' : ''}`} title={file} onClick={() => onOpenFile(file, name)}
+          <div key={file} className={`document-tab${active ? ' is-active' : ''}`} onClick={() => onOpenFile(file, name)}
             onContextMenu={event => onTabContextMenu(file, event)}
             style={{ cursor: 'pointer', borderRight: '1px solid var(--color-border)' }}>
-            <button type="button" className="document-tab-select" role="tab" aria-selected={active} tabIndex={active ? 0 : -1}
-              aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
-              onKeyDown={event => {
-                let nextIndex = index
-                if (event.key === 'ArrowRight') nextIndex = (index + 1) % files.length
-                else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + files.length) % files.length
-                else if (event.key === 'Home') nextIndex = 0
-                else if (event.key === 'End') nextIndex = files.length - 1
-                else return
-                event.preventDefault()
-                event.currentTarget.closest('.document-tabs')?.querySelectorAll('[role="tab"]')[nextIndex]?.focus()
-                const nextFile = files[nextIndex]
-                onOpenFile(nextFile, nextFile.split('/').pop() || nextFile)
-              }}>
-              <FileOutlined aria-hidden="true" />
-              <span className="document-tab-title">{name}</span>
-            </button>
+            <Tooltip
+              mouseEnterDelay={0.25}
+              destroyTooltipOnHide
+              title={(
+                <div className="document-tab-tooltip">
+                  <span className="document-tab-tooltip-name">{name}</span>
+                  {file !== name && <span className="document-tab-tooltip-path">{file}</span>}
+                </div>
+              )}
+            >
+              <button type="button" className="document-tab-select" role="tab" aria-selected={active} tabIndex={active ? 0 : -1}
+                aria-label={`${name}${hasSaveError ? '，保存失败' : hasUnsavedChanges ? '，修改待保存' : ''}`}
+                onKeyDown={event => {
+                  let nextIndex = index
+                  if (event.key === 'ArrowRight') nextIndex = (index + 1) % files.length
+                  else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + files.length) % files.length
+                  else if (event.key === 'Home') nextIndex = 0
+                  else if (event.key === 'End') nextIndex = files.length - 1
+                  else return
+                  event.preventDefault()
+                  event.currentTarget.closest('.document-tabs')?.querySelectorAll('[role="tab"]')[nextIndex]?.focus()
+                  const nextFile = files[nextIndex]
+                  onOpenFile(nextFile, nextFile.split('/').pop() || nextFile)
+                }}>
+                <FileOutlined aria-hidden="true" />
+                <span className="document-tab-title">{name}</span>
+              </button>
+            </Tooltip>
             {hasSaveError ? (
               <Tooltip title="保存失败">
                 <span className="tab-status-label is-error" aria-label="保存失败">失败</span>

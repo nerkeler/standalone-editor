@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { Tree } from 'antd'
+import { Tooltip, Tree } from 'antd'
 import { FileOutlined, FolderOpenOutlined, MoreOutlined } from '@ant-design/icons'
 
 function createTreeData(nodes, options) {
@@ -62,7 +62,9 @@ function createTreeData(nodes, options) {
         {node.type === 'dir'
           ? <FolderOpenOutlined aria-hidden="true" className="tree-node-icon is-folder" />
           : <FileOutlined aria-hidden="true" className="tree-node-icon is-file" />}
-        <span className="tree-node-name" title={node.name}>{node.name}</span>
+        <Tooltip title={node.name} mouseEnterDelay={0.3} placement="right" destroyTooltipOnHide>
+          <span className="tree-node-name">{node.name}</span>
+        </Tooltip>
         {options.showActions && (
           <button
             type="button"
