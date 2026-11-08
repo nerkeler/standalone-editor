@@ -1483,10 +1483,12 @@ test('intraword escaped underscores in mixed Markdown open cleanly and survive a
   await clickSave()
   const saved = await waitForDiskMarker(fileName, 'Edit elsewhere: keep this line. edited')
   assert.equal(workspacePutCount() - beforeEditPuts, 1, 'one explicit rich edit should save one snapshot')
-  assert.ok(saved.includes('stock\\_report'))
-  assert.ok(saved.includes('学习\\_笔记'))
-  assert.ok(saved.includes('> Quoted stock\\_report and 学习\\_笔记.'))
-  assert.ok(saved.includes('| Report | stock\\_report |'))
+  // Intraword underscores never open emphasis, so the canonical form drops
+  // the redundant backslash while keeping the visible text identical.
+  assert.ok(saved.includes('stock_report'))
+  assert.ok(saved.includes('学习_笔记'))
+  assert.ok(saved.includes('> Quoted stock_report and 学习_笔记.'))
+  assert.ok(saved.includes('| Report | stock_report |'))
   assert.ok(saved.includes('## 1\\. fitness-tracker'))
   assert.equal(
     marked.parse(saved),

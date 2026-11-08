@@ -1,4 +1,4 @@
-import { marked } from 'marked'
+import { marked } from './markedSetup.js'
 import { analyzeMarkdownSource } from './markdownDiagnostics.js'
 
 const MAX_REPAIR_PATCHES = 128
