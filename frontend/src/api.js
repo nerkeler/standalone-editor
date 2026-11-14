@@ -17,29 +17,6 @@ function readContext() {
 
 let context = readContext()
 
-// Per-session CSRF token issued by /api/auth/login. The backend compares it
-// against the session cookie for every mutating request.
-let csrfToken = null
-
-const authRequiredListeners = new Set()
-
-export function subscribeAuthRequired(listener) {
-  authRequiredListeners.add(listener)
-  return () => authRequiredListeners.delete(listener)
-}
-
-export function getSessionCsrfToken() {
-  return csrfToken
-}
-
-export function setSessionCsrfToken(token) {
-  csrfToken = typeof token === 'string' && token ? token : null
-}
-
-export function isSessionAuthenticated() {
-  return Boolean(csrfToken)
-}
-
 export const api = axios.create()
 
 export function getWorkspaceContext() {
@@ -89,14 +66,6 @@ api.interceptors.request.use(config => {
       config.headers['X-Workspace-Version'] = String(context.workspaceVersion)
     }
   }
-  // The session cookie travels with every same-origin request automatically;
-  // mutating calls additionally present the CSRF token issued at login.
-  if (csrfToken && config.method?.toLowerCase() !== 'get' && config.method?.toLowerCase() !== 'head') {
-    config.headers = config.headers || {}
-    if (!hasHeader(config.headers, 'X-CSRF-Token')) {
-      config.headers['X-CSRF-Token'] = csrfToken
-    }
-  }
   return config
 })
 
@@ -107,58 +76,6 @@ api.interceptors.response.use(response => {
     setWorkspaceContext({ ...context, workspaceId, workspaceVersion: Number(version) || context.workspaceVersion })
   }
   return response
-}, error => {
-  const status = error?.response?.status
-  const actionCode = error?.response?.data?.code || error?.code
-  if (status === 401 && actionCode === 'AUTH_REQUIRED') {
-    csrfToken = null
-    for (const listener of authRequiredListeners) {
-      try { listener() } catch {} 
-    }
-  }
-  throw error
 })
-
-// ---------- 认证会话 ----------
-
-/** Returns `{ enabled: true, authenticated: boolean }` or `{ enabled: false }` when auth is off. */
-export async function probeSession(timeout = 10_000) {
-  const response = await api.get('/api/auth/session', { timeout })
-  const body = response.data || {}
-  if (body.enabled === false) return { enabled: false }
-  if (body.success && body.csrfToken) {
-    setSessionCsrfToken(body.csrfToken)
-    return { enabled: true, authenticated: true }
-  }
-  return { enabled: true, authenticated: false }
-}
-
-export async function loginWithPassword(password, timeout = 20_000) {
-  const response = await api.post('/api/auth/login', { password }, { timeout })
-  const body = response.data || {}
-  setSessionCsrfToken(body.csrfToken)
-  return body
-}
-
-export async function logoutSession(timeout = 10_000) {
-  try {
-    await api.post('/api/auth/logout', {}, { timeout })
-  } finally {
-    setSessionCsrfToken(null)
-  }
-}
-
-export function describeAuthError(error) {
-  const payload = error?.response?.data || {}
-  if (payload.code === 'AUTH_NOT_ENABLED') return '当前服务未启用密码登录。请通过后端命令设置访问密码，或重启服务。'
-  if (payload.code === 'RATE_LIMITED') {
-    return `尝试次数过多：请 ${payload.retryAfterSeconds || 60} 秒后再试。`
-  }
-  return payload.error || error?.message || '登录失败'
-}
-
-export function authCooldownSeconds(error) {
-  return error?.response?.data?.retryAfterSeconds || 0
-}
 
 export default api

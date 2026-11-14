@@ -9,36 +9,6 @@ import { DOMParser as ProseMirrorDOMParser, DOMSerializer } from '@tiptap/pm/mod
 import { analyzeMarkdownSource } from '../src/pages/markdownDiagnostics.js'
 import { proposeSafeMarkdownRepair } from '../src/pages/safeMarkdownNormalization.js'
 import { createMarkdownCodec } from '../src/pages/markdownCodec.js'
-import { MarkdownBulletList, MarkdownOrderedList } from '../src/pages/markdownLists.js'
-
-// markdownToHtml annotates list tightness through a DOM; provide one so the
-// installed-schema helper exercises the same chain as the application.
-let collectionsPatched = false
-function wrapDocument(document) {
-  if (!collectionsPatched) {
-    collectionsPatched = true
-    const proto = Object.getPrototypeOf(document.body.children)
-    if (!proto[Symbol.iterator]) {
-      proto[Symbol.iterator] = function* iterator() { for (let i = 0; i < this.length; i += 1) yield this[i] }
-      proto.forEach = function forEach(fn, thisArg) { for (let i = 0; i < this.length; i += 1) fn.call(thisArg, this[i], i, this) }
-    }
-  }
-  return new Proxy(document, {
-    get(target, prop) {
-      if (prop === 'querySelectorAll') return selector => Array.from(target.querySelectorAll(selector))
-      const value = target[prop]
-      return typeof value === 'function' ? value.bind(target) : value
-    },
-  })
-}
-if (typeof globalThis.DOMParser === 'undefined') {
-  globalThis.DOMParser = class DOMParser {
-    parseFromString(html) { return wrapDocument(domino.createDocument(html)) }
-  }
-}
-if (typeof globalThis.NodeFilter === 'undefined') {
-  globalThis.NodeFilter = { SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 1, SHOW_TEXT: 4, SHOW_COMMENT: 128 }
-}
 
 const cases = [
   ['frontMatter', '---\ntitle: A\n---\n'],
@@ -47,7 +17,7 @@ const cases = [
   ['referenceLinks', '[guide][docs]\n\n[docs]: https://example.com\n'],
   ['escapedSyntax', 'A \\* literal\n'],
   ['tableAlignment', '> | A | B |\n> | :--- | ---: |\n> | a | b |\n'],
-  ['nestedLists', '> - parent\n>   - child\n'],
+  ['nestedLists', '- parent\n  - child\n'],
   ['taskListCompatibility', '- ordinary item\n- [x] completed task\n'],
   ['taskListCompatibility', '1. [x] completed task\n2. [ ] pending task\n'],
   ['rawHtml', '<details>text</details>\n'],
@@ -96,17 +66,16 @@ test('loose ordinary unordered sublists stay rich-safe while lossy nesting stays
   assert.deepEqual(analyzeMarkdownSource(screenshotList), [])
   assert.equal(proposeSafeMarkdownRepair(screenshotList), null)
 
-  // Uniformly indented nested lists are reproduced by the serializer, so the
-  // tight and loose variants now open rich.
   const tight = '- parent\n  - child\n'
-  assert.deepEqual(analyzeMarkdownSource(tight), [])
+  assert.ok(analyzeMarkdownSource(tight).some(item => item.reason === 'nestedLists'))
 
   for (const source of [
+    '1. parent\n\n   1. child\n',
     '- [ ] parent\n\n  - [ ] child\n',
+    '- parent\n\n  - child\n  - sibling\n',
     '> - parent\n>   - child\n',
     '- outer\n  > - quoted only\n',
-    '- parent\n    - child\n      - grandchild\n',
-    '- parent\n\t- child\n',
+    '- parent\n\n  - child\n    - grandchild\n',
   ]) {
     assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'nestedLists'), source)
   }
@@ -127,12 +96,8 @@ test('loose-list markers are matched inside their own top-level token after inde
 })
 
 function throughInstalledListSchema(markdown) {
-  const schema = getSchema([
-    StarterKit.configure({ bulletList: false, orderedList: false }),
-    MarkdownBulletList,
-    MarkdownOrderedList,
-  ])
-  const document = domino.createDocument(createMarkdownCodec().toEditorHtml(markdown))
+  const schema = getSchema([StarterKit])
+  const document = domino.createDocument(marked.parse(markdown))
   const model = ProseMirrorDOMParser.fromSchema(schema).parse(document.body)
   const container = document.createElement('div')
   container.appendChild(DOMSerializer.fromSchema(schema).serializeFragment(model.content, { document }))
@@ -195,11 +160,16 @@ test('loosely spaced ordinary bullet descendants retain ownership under an order
   assert.deepEqual(analyzeMarkdownSource(saved), [])
 })
 
-test('ordered-parent support keeps quoted task and code-indented nesting protected', () => {
+test('ordered-parent support keeps tight quote task ordered-child and code-indented nesting protected', () => {
   for (const source of [
+    '1. parent\n   - child\n   - sibling\n',
+    '1. parent\n\n   - child\n   - sibling\n',
+    '1. parent\n\n   - only tight child\n',
     '> 1. parent\n>\n>    - child\n>\n>    - sibling\n',
     '1. parent\n\n   - [ ] child\n\n   - [x] sibling\n',
     '1. parent\n\n   - ordinary\n\n   - [x] task\n',
+    '1. parent\n\n   1. child\n\n   2. sibling\n',
+    '1. [ ] task parent\n\n   - child\n\n   - sibling\n',
     '1. parent\n\n        - code-indented example\n',
   ]) assert.ok(analyzeMarkdownSource(source).some(item => item.reason === 'nestedLists'), source)
 })
@@ -278,11 +248,9 @@ test('attribute-free hard breaks stay supported without allowing other raw HTML'
 test('serializer-generated literal plus after hard breaks reopens without protection', () => {
   const source = '| Item | Detail |\n| --- | --- |\n| A | **15 units**<br><br>  <br><br>+ **200 units** |\n'
   const saved = createMarkdownCodec().fromEditorHtml(marked.parse(source))
-  // A cell is inline content, so the serializer keeps the literal plus instead
-  // of escaping it as a list marker.
-  assert.match(saved, /<br><br><br><br>\+ \*\*200 units\*\*/)
+  assert.match(saved, /<br><br><br><br>\\\+ \*\*200 units\*\*/)
   assert.deepEqual(analyzeMarkdownSource(saved), [])
-  assert.equal(marked.parse(saved), marked.parse(saved))
+  assert.equal(marked.parse(saved), marked.parse(saved.replaceAll('\\+', '+')))
   assert.equal(proposeSafeMarkdownRepair(saved), null)
 
   for (const protectedSource of [
@@ -428,9 +396,8 @@ test('numeric minus and proven intraword star escapes stay rich-safe and retain 
   assert.equal(td.escape('-30 ~ -50'), '\\-30 ~ -50')
   const saved = createMarkdownCodec().fromEditorHtml(marked.parse(source))
   assert.match(saved, /HLA-B\\\*5801/)
-  // Table cells are inline content: the leading minus needs no escape there.
-  assert.match(saved, /\| A \| -30 ~ -50 \|/)
-  assert.match(saved, /\*\*-80 ~ -130\*\*/)
+  assert.match(saved, /\\-30 ~ -50/)
+  assert.match(saved, /\*\*\\-80 ~ -130\*\*/)
   assert.deepEqual(analyzeMarkdownSource(saved), [])
   // Markdown-equivalent source spelling is allowed; visible characters and
   // formatting remain the same, and opening does not need a repair proposal.

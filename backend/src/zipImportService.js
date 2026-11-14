@@ -1,11 +1,8 @@
-// @ts-check
 import fs from 'node:fs/promises'
 import { constants } from 'node:fs'
 import path from 'node:path'
 import { openWorkspaceParent } from './workspacePathGuard.js'
-import { randomUUID, createHash } from 'node:crypto'
-import { sha256 } from './hashing.js'
-import { makeError } from './errors.js'
+import { createHash, randomUUID } from 'node:crypto'
 import { inflateRaw } from 'node:zlib'
 import { promisify } from 'node:util'
 import {
@@ -42,7 +39,9 @@ for (let index = 0; index < CRC_TABLE.length; index += 1) {
 }
 
 function zipError(message, code = 'INVALID_ARCHIVE') {
-  return makeError(message, code)
+  const error = new Error(message)
+  error.code = code
+  return error
 }
 
 function assertRange(buffer, offset, length, message = '压缩包结构无效') {
@@ -318,6 +317,10 @@ async function validateExistingParents(base, targetDirectory) {
 }
 
 const READ_FILE_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0)
+
+function sha256(buffer) {
+  return createHash('sha256').update(buffer).digest('hex')
+}
 
 function rememberDirectory(directoryPath, stat, directoryMap, directoryList) {
   const record = {
@@ -689,9 +692,7 @@ async function pathExists(target) {
 function addRollbackDiagnostics(error, paths, base) {
   const unique = [...new Set(paths)].map(target => path.relative(base, target) || '.')
   if (!unique.length) return error
-  const diagnostic = /** @type {Error & { rollbackWarnings?: string[] }} */ (
-    error instanceof Error ? error : new Error(String(error))
-  )
+  const diagnostic = error instanceof Error ? error : new Error(String(error))
   diagnostic.rollbackWarnings = unique
   diagnostic.message = `${diagnostic.message}；为避免误删，回滚保留了无法确认身份的路径：${unique.join('、')}`
   return diagnostic

@@ -1,4 +1,3 @@
-// @ts-check
 import express from 'express'
 import cors from 'cors'
 import multer from 'multer'
@@ -7,20 +6,35 @@ import os from 'os'
 import crypto from 'crypto'
 import { fileURLToPath } from 'url'
 import fs from 'fs/promises'
+import { pipeline } from 'node:stream/promises'
 import {
+  listDir,
+  listTree,
+  readFile,
+  readFileBase64,
+  openBinaryFile,
+  createItem,
+  moveItem,
+  getMoveReferenceImpacts,
+  writeFile,
+  listFileHistory,
+  restoreFileHistory,
+  deleteFileHistory,
+  archiveFileHistory,
+  listOrphanFileHistory,
+  deleteOrphanFileHistory,
+  readOrphanFileHistory,
+  restoreOrphanFileHistory,
+  reattachTrashFileHistory,
+  uploadFile,
+  ensureAdjacentAssetsDirectory,
   hasWorkspaceFiles,
+  searchWorkspace,
 } from './fileService.js'
 import { createTrashService } from './trashService.js'
 import { getRecoveryStats } from './recoveryStatsService.js'
+import { importZip } from './zipImportService.js'
 import { isSupportedNodeVersion } from './runtimeVersion.js'
-import { makeError } from './errors.js'
-import { errorStatus } from './serverErrors.js'
-import { registerDocumentRoutes } from './documentRoutes.js'
-import { registerRecoveryRoutes } from './recoveryRoutes.js'
-import { registerMediaRoutes } from './mediaRoutes.js'
-import { reattachTrashFileHistory } from './historyService.js'
-import { registerAuthRoutes, loadPasswordRecord } from './authRoutes.js'
-import { resolveAuthFile } from './authService.js'
 import {
   configuredRootValues,
   defaultRootCandidates,
@@ -63,6 +77,8 @@ export function createBackend(options = {}) {
   const DEFAULT_WORKSPACE = options.defaultWorkspace || env.EDITOR_DEFAULT_WORKSPACE
     || path.join(os.homedir(), 'Documents', 'standalone-editor-notes')
   const RECOVERY_ROOT = path.resolve(options.recoveryRoot || defaultRecoveryRoot({ env }))
+  const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'ico', 'tiff', 'tif'])
+
   let workspace
   let workspaceVersion = 1
   let workspaceStartupError = null
@@ -73,9 +89,47 @@ export function createBackend(options = {}) {
   const historyCleanupWarnings = new Map()
   let workspaceSelectionTail = Promise.resolve()
 
-  const AUTH_FILE = options.authFile || resolveAuthFile({ env, configFile: CONFIG_FILE })
-  /** Filled in by initializeBackend before any request is accepted. */
-  const authState = { record: null, enabled: false }
+  function errorStatus(error) {
+    const permissionFailure = permissionErrorResponse(error)
+    if (permissionFailure) return permissionFailure.status
+    if (error instanceof multer.MulterError) {
+      return error.code?.startsWith('LIMIT_') && error.code !== 'LIMIT_UNEXPECTED_FILE' ? 413 : 400
+    }
+    if (
+      error?.code === 'CONFLICT' || error?.code === 'FILE_CONFLICT' ||
+      error?.code === 'HISTORY_CONFLICT' || error?.code === 'WORKSPACE_MISMATCH' ||
+      error?.code === 'TRASH_OPERATION_PENDING'
+    ) return 409
+    if (error?.code === 'REVISION_REQUIRED') return 428
+    if (error?.code === 'ENOENT' || error?.code === 'HISTORY_NOT_FOUND') return 404
+    if (error?.code === 'DOCUMENT_TOO_LARGE' || error?.code === 'ZIP_LIMIT') return 413
+    if (error?.code === 'FILE_CHANGED') return 409
+    if (
+      error?.code === 'RECOVERY_STORAGE_ERROR' || error?.code === 'HISTORY_CORRUPT' ||
+      error?.code === 'HISTORY_ROLLBACK_FAILED' || error?.code === 'HISTORY_ARCHIVE_ROLLBACK_FAILED' ||
+      error?.code === 'MOVE_ROLLBACK_FAILED' || error?.code === 'TRASH_ROLLBACK_FAILED' ||
+      error?.code === 'WORKSPACE_CONFIG_SAVE_FAILED' ||
+      error?.code === 'UNSUPPORTED_UPLOAD_FILESYSTEM' || error?.code === 'UPLOAD_INCOMPLETE' ||
+      error?.code === 'UPLOAD_VERIFY_FAILED' || error?.code === 'TEMPORARY_IDENTITY_UNAVAILABLE'
+    ) return 500
+    if (error?.code === 'ENOSPC' || error?.code === 'EDQUOT') return 507
+    if (
+      error?.code === 'EIO' || error?.code === 'EFBIG' ||
+      error?.code === 'EMFILE' || error?.code === 'ENFILE' || error?.code === 'ENXIO' ||
+      error?.code === 'ENODEV'
+    ) return 500
+    return 400
+  }
+
+  function normalizeMultipartFilename(filename) {
+    if (typeof filename !== 'string' || [...filename].some(char => char.codePointAt(0) > 0xff)) return filename
+    const latin1Bytes = Buffer.from(filename, 'latin1')
+    const utf8 = latin1Bytes.toString('utf8')
+    // Busboy's default multipart parameter charset is Latin-1, while browsers
+    // send UTF-8 filename bytes. Decode only when those bytes form valid UTF-8;
+    // preserve genuine Latin-1 names and filenames already decoded by RFC 5987.
+    return Buffer.from(utf8, 'utf8').equals(latin1Bytes) ? utf8 : filename
+  }
 
   function workspaceTrashService(ws) {
     return createTrashService(ws, { recoveryRoot: RECOVERY_ROOT })
@@ -169,7 +223,9 @@ export function createBackend(options = {}) {
     const real = await fs.realpath(resolved)
     const stat = await fs.stat(real)
     if (!stat.isDirectory()) {
-      throw makeError('不是有效目录', 'INVALID_DIRECTORY')
+      const error = new Error('不是有效目录')
+      error.code = 'INVALID_DIRECTORY'
+      throw error
     }
     return real
   }
@@ -311,16 +367,19 @@ export function createBackend(options = {}) {
     if (isDirectoryPickerSelectionAllowed(realPath, roots, { platform: process.platform })) return
     if (allowFilesystemRoot && isDirectoryNavigable(realPath, roots, { platform: process.platform })) return
     if (!roots.length && allowFilesystemRoot && realPath === path.parse(realPath).root) return
-    throw makeError('只能选择允许范围内的目录', 'INVALID_DIRECTORY')
+    const error = new Error('只能选择允许范围内的目录')
+    error.code = 'INVALID_DIRECTORY'
+    throw error
   }
 
   const cliWorkspace = commandWorkspace()
 
   function asWorkspaceUnavailable(error, configuredPath = workspaceCandidate) {
     const candidate = error?.details?.workspace || configuredPath || null
-    const unavailable = makeError(error?.message || (candidate
+    const unavailable = new Error(error?.message || (candidate
       ? `上次工作空间当前不可访问：${candidate}`
-      : '工作空间尚未就绪，请重试或选择新的工作目录'), error?.code || 'WORKSPACE_UNAVAILABLE')
+      : '工作空间尚未就绪，请重试或选择新的工作目录'))
+    unavailable.code = error?.code || 'WORKSPACE_UNAVAILABLE'
     unavailable.details = {
       ...(error?.details || {}),
       ...(candidate ? { workspace: candidate } : {}),
@@ -340,7 +399,8 @@ export function createBackend(options = {}) {
   }
 
   function wrapConfigSaveError(error) {
-    const failure = makeError(`无法保存工作空间配置：${error?.message || '未知错误'}`, 'WORKSPACE_CONFIG_SAVE_FAILED')
+    const failure = new Error(`无法保存工作空间配置：${error?.message || '未知错误'}`)
+    failure.code = 'WORKSPACE_CONFIG_SAVE_FAILED'
     failure.details = { configFile: CONFIG_FILE, causeCode: error?.code }
     return failure
   }
@@ -429,9 +489,10 @@ export function createBackend(options = {}) {
       const config = await loadWorkspaceConfig(CONFIG_FILE)
       if (config.kind === 'configured') {
         if (workspaceCandidate && config.workspace !== workspaceCandidate) {
-          const error = makeError(
+          const error = new Error(
             `工作空间配置已指向其他目录：${config.workspace}。请显式选择工作目录后继续。`,
-            'WORKSPACE_CONFIG_CHANGED')
+          )
+          error.code = 'WORKSPACE_CONFIG_CHANGED'
           error.details = {
             configFile: CONFIG_FILE,
             workspace: workspaceCandidate,
@@ -444,7 +505,8 @@ export function createBackend(options = {}) {
         return
       }
       if (!configWasMissingAtStartup) {
-        const error = makeError('工作空间配置文件已不存在；为避免切换到其他目录，请选择新的工作目录', 'WORKSPACE_CONFIG_MISSING')
+        const error = new Error('工作空间配置文件已不存在；为避免切换到其他目录，请选择新的工作目录')
+        error.code = 'WORKSPACE_CONFIG_MISSING'
         error.details = { configFile: CONFIG_FILE }
         throw error
       }
@@ -473,7 +535,8 @@ export function createBackend(options = {}) {
   async function ensureCurrentWorkspaceAccessible(previous = workspace) {
     if (!previous) throw workspaceStartupError || asWorkspaceUnavailable(null)
     const changedError = () => {
-      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
+      const error = new Error('工作空间已变化，请刷新后重新打开')
+      error.code = 'WORKSPACE_MISMATCH'
       const info = currentWorkspaceInfo()
       error.details = info ? { ...info } : {}
       return error
@@ -482,14 +545,17 @@ export function createBackend(options = {}) {
     try {
       const resolved = await canonicalDirectory(previous)
       if (resolved !== previous) {
-        throw makeError('工作空间路径解析已变化', 'WORKSPACE_PATH_CHANGED')
+        const error = new Error('工作空间路径解析已变化')
+        error.code = 'WORKSPACE_PATH_CHANGED'
+        throw error
       }
       await fs.readdir(resolved)
     } catch (error) {
       if (workspace !== previous) throw changedError()
       workspaceCandidate = previous
       workspace = null
-      const unavailable = makeError(`上次工作空间当前不可访问：${previous}`, 'SAVED_WORKSPACE_UNAVAILABLE')
+      const unavailable = new Error(`上次工作空间当前不可访问：${previous}`)
+      unavailable.code = 'SAVED_WORKSPACE_UNAVAILABLE'
       unavailable.details = { workspace: previous, causeCode: error?.code }
       workspaceStartupError = asWorkspaceUnavailable(unavailable, previous)
       throw workspaceStartupError
@@ -505,26 +571,11 @@ export function createBackend(options = {}) {
   function initializeBackend() {
     if (!workspaceInitialization) workspaceInitialization = initializeWorkspace().then(async () => {
       if (workspace) await reconcileWorkspaceRecovery(workspace)
-    }).then(async () => {
-      // An explicit EDITOR_PASSWORD always (re)writes the auth file. A missing
-      // file runs without password protection and prints a startup warning; a
-      // corrupted file is a startup error to avoid silently unauthenticated runs.
-      const loaded = await loadPasswordRecord(AUTH_FILE, { password: env.EDITOR_PASSWORD })
-      authState.record = loaded.record
-      authState.enabled = loaded.enabled
-      if (!loaded.enabled) {
-        console.warn('认证未启用：未配置访问密码。仅在 127.0.0.1 或可信网络中运行是安全的；' +
-          '通过 `node src/index.js --set-password` 或环境变量 EDITOR_PASSWORD 开启。')
-      }
     })
     return workspaceInitialization
   }
 
   const app = express()
-  // Honor X-Forwarded-* only when the operator explicitly declares a proxy, so
-  // a Secure cookie is set while the deployment retains full control.
-  if (options.trustProxy || env.EDITOR_TRUST_PROXY === '1') app.set('trust proxy', true)
-
   const configuredOrigins = new Set((env.CORS_ORIGINS || env.EDITOR_CORS_ORIGINS || '')
     .split(',').map(item => item.trim()).filter(Boolean))
   const defaultOrigins = new Set([
@@ -580,14 +631,6 @@ export function createBackend(options = {}) {
       : defaultJsonParser
     parser(req, res, next)
   })
-  // Auth routes self-exempt their own paths; the guard below protects every
-  // later-registered API route and leaves static hosting public.
-  const authInstance = registerAuthRoutes(app, {
-    state: authState,
-    sendError,
-    secure: req => /** @type {import('express').Request} */ (req)?.secure,
-  })
-  app.use(authInstance.authGuard)
 
   // Uploads contain one file and at most the path and documentPath text fields.
   // Keep the 100 MiB file ceiling used by ZIP import, while bounding every
@@ -636,7 +679,8 @@ export function createBackend(options = {}) {
     const current = currentWorkspaceInfo()
     if (!current || current.workspace !== info.workspace || current.workspaceVersion !== info.workspaceVersion) {
       if (current) setWorkspaceHeaders(res, current)
-      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
+      const error = new Error('工作空间已变化，请刷新后重新打开')
+      error.code = 'WORKSPACE_MISMATCH'
       res.status(409).json({ error: error.message, code: error.code, ...(current || {}) })
       return
     }
@@ -652,7 +696,8 @@ export function createBackend(options = {}) {
       ?? (allowQueryIdentity ? req.query.workspaceVersion : null)
     const requestVersion = versionHeader == null || versionHeader === '' ? null : Number(versionHeader)
     if (!requestId || requestId !== info.workspaceId || (requestVersion != null && requestVersion !== info.workspaceVersion)) {
-      const error = makeError('工作空间已变化，请刷新后重新打开', 'WORKSPACE_MISMATCH')
+      const error = new Error('工作空间已变化，请刷新后重新打开')
+      error.code = 'WORKSPACE_MISMATCH'
       res.status(409).json({ error: error.message, code: error.code, ...info })
       return
     }
@@ -710,41 +755,408 @@ export function createBackend(options = {}) {
     directoryPickerLocations,
   })
 
-  // ---------- 文件与恢复 API ----------
+  // ---------- 文件 API ----------
 
-  registerDocumentRoutes(app, {
-    workspaceGuard,
-    parseUpload,
-    workspaceFor,
-    withWorkspaceMutation,
-    recoveryOptions,
-    recordHistoryCleanup,
-    setWorkspaceHeaders,
-    workspaceInfoFor,
-    sendData,
-    sendError,
+  app.get('/api/workspace', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      const files = req.query.recursive === '1' || req.query.recursive === 'true'
+        ? await listTree(ws)
+        : await listDir(ws, req.query.path || '')
+      sendData(res, files, req)
+    } catch (error) { sendError(res, error, req) }
   })
 
-  registerRecoveryRoutes(app, {
-    workspaceGuard,
-    workspaceFor,
-    withWorkspaceMutation,
-    workspaceTrashService,
-    recoveryOptions,
-    workspaceRecoveryStats,
-    recordHistoryCleanup,
-    reconcileWorkspaceRecovery,
-    sendData,
-    sendError,
+  app.get('/api/workspace/file', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      sendData(res, await readFile(workspaceFor(req), reqPath), req)
+    } catch (error) { sendError(res, error, req) }
   })
 
-  registerMediaRoutes(app, {
-    workspaceGuard,
-    workspaceFor,
-    workspaceInfoFor,
-    setWorkspaceHeaders,
-    sendError,
+  app.get('/api/workspace/file/history', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      sendData(res, await listFileHistory(workspaceFor(req), reqPath, recoveryOptions()), req)
+    } catch (error) { sendError(res, error, req) }
   })
+
+  app.delete('/api/workspace/file/history', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      const historyId = req.query.id
+      if (!reqPath || !historyId) throw new Error('缺少 path 或 id 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const deleted = await deleteFileHistory(ws, reqPath, historyId, recoveryOptions())
+        const stats = await workspaceRecoveryStats(ws)
+        return { ...deleted, stats }
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.get('/api/workspace/recovery/history', workspaceGuard, async (req, res) => {
+    try {
+      sendData(res, await listOrphanFileHistory(workspaceFor(req), recoveryOptions()), req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.get('/api/workspace/recovery/history/content', workspaceGuard, async (req, res) => {
+    try {
+      const { orphanId, historyId } = req.query
+      if (!orphanId || !historyId) throw new Error('缺少 orphanId 或 historyId 参数')
+      const { manifest, entry, content } = await readOrphanFileHistory(
+        workspaceFor(req), orphanId, historyId, recoveryOptions(),
+      )
+      sendData(res, {
+        content,
+        revision: entry.revision,
+        savedAt: entry.savedAt,
+        sourcePath: manifest.path,
+      }, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.delete('/api/workspace/recovery/history', workspaceGuard, async (req, res) => {
+    try {
+      const { id } = req.query
+      if (!id) throw new Error('缺少 id 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const deleted = await deleteOrphanFileHistory(ws, id, recoveryOptions())
+        const stats = await workspaceRecoveryStats(ws)
+        return { ...deleted, stats }
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/recovery/history/restore', workspaceGuard, async (req, res) => {
+    try {
+      const { orphanId, historyId, path: reqPath, expectedRevision } = req.body || {}
+      if (!orphanId || !historyId) throw new Error('缺少 orphanId 或 historyId 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const restored = await restoreOrphanFileHistory(ws, orphanId, historyId, reqPath, expectedRevision, recoveryOptions())
+        return recordHistoryCleanup(ws, restored.path, restored, expectedRevision)
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.get('/api/workspace/trash', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      const items = await workspaceTrashService(ws).list()
+      sendData(res, { items }, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.get('/api/workspace/recovery/stats', workspaceGuard, async (req, res) => {
+    try {
+      sendData(res, await workspaceRecoveryStats(workspaceFor(req)), req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/recovery/reconcile', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      const result = await reconcileWorkspaceRecovery(ws)
+      sendData(res, { ...result, stats: await workspaceRecoveryStats(ws) }, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/trash/purge-expired', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const purged = await workspaceTrashService(ws).purgeExpired()
+        const stats = await workspaceRecoveryStats(ws)
+        return { ...purged, stats }
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.delete('/api/workspace/trash', workspaceGuard, async (req, res) => {
+    try {
+      const { id } = req.query
+      if (!id) throw new Error('缺少 id 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const deleted = await workspaceTrashService(ws).remove(id)
+        const stats = await workspaceRecoveryStats(ws)
+        return { ...deleted, stats }
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/trash/restore', workspaceGuard, async (req, res) => {
+    try {
+      const { id } = req.body || {}
+      if (!id) throw new Error('缺少 id 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const restored = await workspaceTrashService(ws).restore(id)
+        const history = await reattachTrashFileHistory(ws, id, recoveryOptions())
+        return { ...restored, historyReattached: history.reattached, historyOrphaned: history.retained }
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/file/restore', workspaceGuard, async (req, res) => {
+    try {
+      const { path: reqPath, historyId, expectedRevision } = req.body || {}
+      if (!reqPath || !historyId) throw new Error('缺少 path 或 historyId 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => recordHistoryCleanup(ws, reqPath,
+        await restoreFileHistory(ws, reqPath, historyId, expectedRevision, recoveryOptions()), expectedRevision))
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  async function streamWorkspaceImage(req, res, reqPath) {
+    const file = await openBinaryFile(workspaceFor(req), reqPath, { imagesOnly: true })
+    setWorkspaceHeaders(res, workspaceInfoFor(req))
+    res.setHeader('Content-Type', file.mime)
+    res.setHeader('Content-Length', String(file.size))
+    res.setHeader('X-Content-Type-Options', 'nosniff')
+    res.setHeader('Cache-Control', 'private, no-store')
+    if (file.mime === 'image/svg+xml') {
+      // SVG can contain active content when opened as a document. Serve it with
+      // a restrictive policy while still allowing it to render as an image.
+      res.setHeader('Content-Security-Policy', "default-src 'none'; base-uri 'none'; form-action 'none'; img-src data:; style-src 'unsafe-inline'; sandbox")
+    }
+    await pipeline(file.stream, res)
+  }
+
+  app.get('/api/workspace/image', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      sendData(res, await readFileBase64(workspaceFor(req), reqPath), req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace', workspaceGuard, async (req, res) => {
+    try {
+      const { path: reqPath, name, type } = req.body || {}
+      if (!name || !type) throw new Error('缺少 name 或 type')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, () => createItem(ws, reqPath || '', type, name, recoveryOptions()))
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.put('/api/workspace', workspaceGuard, async (req, res) => {
+    try {
+      const { path: reqPath, content, expectedRevision } = req.body || {}
+      if (!reqPath) throw new Error('缺少 path 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => recordHistoryCleanup(ws, reqPath,
+        await writeFile(ws, reqPath, content ?? '', expectedRevision, recoveryOptions()), expectedRevision))
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.delete('/api/workspace', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, async () => {
+        const trash = workspaceTrashService(ws)
+        const deleted = await trash.trash(reqPath)
+        try {
+          await archiveFileHistory(ws, deleted.path, {
+            ...recoveryOptions(),
+            reason: 'trash',
+            trashEntryId: deleted.id,
+            includeDescendants: deleted.type === 'directory',
+          })
+        } catch (error) {
+          try {
+            await trash.restore(deleted.id)
+            await reattachTrashFileHistory(ws, deleted.id, recoveryOptions())
+          } catch (rollbackError) {
+            const failure = new Error(`文件已移入回收站；历史归档失败且恢复原路径也失败。回收站 ID：${deleted.id}`)
+            failure.code = 'TRASH_ROLLBACK_FAILED'
+            failure.cause = error
+            failure.details = { trashEntryId: deleted.id, rollbackError: rollbackError.message }
+            throw failure
+          }
+          throw error
+        }
+        return deleted
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/move/preflight', workspaceGuard, async (req, res) => {
+    try {
+      const { old_path: oldPath, new_path: newPath } = req.body || {}
+      if (!oldPath || !newPath) throw new Error('缺少 old_path 或 new_path')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, () => getMoveReferenceImpacts(ws, oldPath, newPath))
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  app.post('/api/workspace/move', workspaceGuard, async (req, res) => {
+    try {
+      const { old_path: oldPath, new_path: newPath } = req.body || {}
+      if (!oldPath || !newPath) throw new Error('缺少 old_path 或 new_path')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, () => moveItem(ws, oldPath, newPath, recoveryOptions()))
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  async function handleWorkspaceUpload(req, res, { assetsOnly = false } = {}) {
+    try {
+      if (!req.file) throw new Error('缺少文件')
+      const file = { ...req.file, originalname: normalizeMultipartFilename(req.file.originalname) }
+      const extension = path.extname(file.originalname).toLowerCase().slice(1)
+      if (assetsOnly && !IMAGE_EXTENSIONS.has(extension)) throw new Error('只允许上传图片文件')
+      const ws = workspaceFor(req)
+      const documentPath = assetsOnly ? '' : req.body?.documentPath
+      if (documentPath && !IMAGE_EXTENSIONS.has(extension)) throw new Error('文档同级 assets 只允许上传图片')
+      const targetPath = assetsOnly ? 'assets' : (req.body?.path || '')
+      const result = await withWorkspaceMutation(ws, async () => {
+        const destination = documentPath
+          ? await ensureAdjacentAssetsDirectory(ws, documentPath)
+          : targetPath
+        if (!documentPath && (assetsOnly || targetPath === 'assets')) await fs.mkdir(path.join(ws, 'assets'), { recursive: true })
+        return uploadFile(ws, destination, file, recoveryOptions())
+      })
+      sendData(res, result, req)
+    } catch (error) { sendError(res, error, req) }
+  }
+
+  // The workspace upload route is canonical. Keep the short assets alias for
+  // existing clients while both routes share the same implementation.
+  app.post('/api/workspace/upload', workspaceGuard, parseUpload, (req, res) => handleWorkspaceUpload(req, res))
+  app.post('/api/upload/assets', workspaceGuard, parseUpload, (req, res) => handleWorkspaceUpload(req, res, { assetsOnly: true }))
+
+  app.get('/api/workspace/assets/:filename', workspaceGuard, async (req, res) => {
+    try {
+      const filename = req.params.filename
+      if (!filename || path.basename(filename) !== filename || filename.includes('\\')) {
+        return res.status(404).send('Not found')
+      }
+      await streamWorkspaceImage(req, res, `assets/${filename}`)
+    } catch (error) {
+      if (error?.code === 'WORKSPACE_MISMATCH') return sendError(res, error, req)
+      if (res.headersSent || res.destroyed) {
+        if (!res.destroyed) res.destroy()
+      } else res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
+    }
+  })
+
+  // Relative Markdown image references can point anywhere inside the workspace.
+  // Reuse the file service's image MIME allowlist, workspace boundary checks and
+  // symlink rejection rather than serving arbitrary workspace files.
+  app.get('/api/workspace/media/*', workspaceGuard, async (req, res) => {
+    try {
+      const workspacePath = req.params[0]
+      if (!workspacePath) return res.status(404).send('Not found')
+      await streamWorkspaceImage(req, res, workspacePath)
+    } catch (error) {
+      if (error?.code === 'WORKSPACE_MISMATCH') return sendError(res, error, req)
+      if (res.headersSent || res.destroyed) {
+        if (!res.destroyed) res.destroy()
+      } else res.status(errorStatus(error) === 409 ? 409 : 404).send('Not found')
+    }
+  })
+
+  // 递归搜索文件名和 Markdown 文本。
+  app.get('/api/workspace/search', workspaceGuard, async (req, res) => {
+    try {
+      const ws = workspaceFor(req)
+      sendData(res, await searchWorkspace(ws, req.query.q), req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  function contentDispositionFilename(filename) {
+    // Node's HTTP header implementation only accepts latin-1 in the fallback
+    // filename. RFC 5987 filename* carries the original UTF-8 name safely.
+    const fallback = filename.normalize('NFKD').replace(/[^\x20-\x7e]/g, '_').replace(/[\\"\r\n]/g, '_') || 'download'
+    const encoded = encodeURIComponent(filename).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`)
+    return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`
+  }
+
+  // 导出当前文件为下载响应。
+  app.get('/api/workspace/export', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      const file = await openBinaryFile(workspaceFor(req), reqPath)
+      res.setHeader('Content-Type', 'text/markdown; charset=utf-8')
+      res.setHeader('Content-Length', String(file.size))
+      res.setHeader('Content-Disposition', contentDispositionFilename(file.name))
+      setWorkspaceHeaders(res, workspaceInfoFor(req))
+      await pipeline(file.stream, res)
+    } catch (error) {
+      if (res.headersSent || res.destroyed) {
+        if (!res.destroyed) res.destroy()
+      } else sendError(res, error, req)
+    }
+  })
+
+  // Attachments are streamed as their original bytes. This route deliberately
+  // does not pass through the UTF-8 Markdown reader used by /export.
+  app.get('/api/workspace/download', workspaceGuard, async (req, res) => {
+    try {
+      const reqPath = req.query.path
+      if (!reqPath) throw new Error('缺少 path 参数')
+      const file = await openBinaryFile(workspaceFor(req), reqPath)
+      setWorkspaceHeaders(res, workspaceInfoFor(req))
+      res.setHeader('Content-Type', 'application/octet-stream')
+      res.setHeader('Content-Length', String(file.size))
+      res.setHeader('Content-Disposition', contentDispositionFilename(file.name))
+      await pipeline(file.stream, res)
+    } catch (error) {
+      if (res.headersSent || res.destroyed) res.destroy(error)
+      else sendError(res, error, req)
+    }
+  })
+
+  // 从 ZIP 导入 Markdown 和图片。服务会先验证并暂存全部内容，再排他写入；
+  // 路径、父目录和目标冲突都在工作空间变更锁内检查。
+  app.post('/api/workspace/import', workspaceGuard, parseUpload, async (req, res) => {
+    try {
+      if (!req.file) throw new Error('缺少导入文件')
+      if (path.extname(req.file.originalname).toLowerCase() !== '.zip') throw new Error('只允许导入 .zip 文件')
+      const ws = workspaceFor(req)
+      const result = await withWorkspaceMutation(ws, () => importZip(ws, req.file.buffer, {
+        // ZIP import is another path-creation entry point. Detach any surviving
+        // history for a previously deleted path before publishing the new file.
+        // If a later ZIP entry fails, importZip rolls back published files while
+        // these records remain available in the orphan history manager.
+        async beforeCommitFile(entryName) {
+          const extension = path.extname(entryName).toLowerCase()
+          if (extension === '.md' || extension === '.markdown') {
+            await archiveFileHistory(ws, entryName, { ...recoveryOptions(), reason: 'path-reused' })
+          }
+        },
+      }))
+      sendData(res, {
+        success: true,
+        imported: result.imported,
+        files: result.files,
+        cleanupWarnings: result.cleanupWarnings,
+        message: `已导入 ${result.imported} 个文件`,
+      }, req)
+    } catch (error) { sendError(res, error, req) }
+  })
+
+  // ---------- 静态资源 ----------
 
   app.use(express.static(path.join(__dirname, '../../frontend/dist')))
 
@@ -763,17 +1175,7 @@ export function createBackend(options = {}) {
 // Preserve `node src/index.js` as a supported development and production
 // entrypoint while imports used by tests only construct an app on demand.
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const argv = process.argv.slice(2)
-  const authCommand = argv.includes('--set-password')
-    ? 'set'
-    : argv.includes('--clear-password') ? 'clear' : null
-  if (authCommand) {
-    const authCommandModule = await import('./authCommands.js')
-    process.exitCode = await authCommandModule.handleAuthCommand(authCommand, {
-      env: process.env,
-      write: process.stderr.write.bind(process.stderr),
-    })
-  } else if (!isSupportedNodeVersion(process.versions.node)) {
+  if (!isSupportedNodeVersion(process.versions.node)) {
     console.error(`❌ 需要 Node.js 22.17.0 或更新的 22.x 版本（当前：v${process.versions.node}）`)
     process.exitCode = 1
   } else {

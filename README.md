@@ -150,11 +150,7 @@ notes/
 
 ## 部署与数据边界
 
-默认监听 `127.0.0.1`，适用于个人本机或由使用者管理访问边界的可信网络。
-
-**访问密码（可选）**：设置访问密码后，所有 API 与工作台都需要先登录。未设置时服务保持免登录，启动日志会给出提示。密码以 scrypt 加盐哈希保存，会话使用 HttpOnly Cookie，7 天内无操作自动续期，写请求校验 CSRF，连续失败会被限速。设置方式见下方配置表。它是单一密码，不是多用户账号；会话保存在内存中，重启后需要重新登录。HTTP 不加密，公网部署需在 HTTPS 反向代理之后运行。
-
-可访问服务的客户端具有应用操作权限。不要将当前版本作为公网或多用户服务部署。
+默认监听 `127.0.0.1`，适用于个人本机或由使用者管理访问边界的可信网络。**当前没有登录认证**，认证方案保留在 [维护 TODO](docs/maintenance-todo.md)；可访问服务的客户端具有应用操作权限。不要将当前版本作为公网或多用户服务部署。
 
 一个后端实例共享一个工作区，浏览器窗口之间不能独立选择不同工作区。工作区标识和文件 revision 用于状态一致性，不是认证凭据。恢复目录必须位于工作区外，路径选择会提前校验此约束。
 
@@ -164,11 +160,6 @@ notes/
 | `EDITOR_HOST` / `EDITOR_PORT` | `start.sh` 的监听地址与后端端口，默认 `127.0.0.1:5557`；直接启动 Node 时使用 `HOST` / `PORT`。 |
 | `EDITOR_RECOVERY_DIR` | 历史版本与回收站的存储位置。 |
 | `EDITOR_DIRECTORY_ROOTS` | 可选目录范围限制；POSIX 用 `:` 分隔，Windows 用 `;` 分隔。 |
-| `EDITOR_PASSWORD` | 设置访问密码；每次启动时写入认证文件（环境变量优先）。 |
-| `EDITOR_AUTH_FILE` | 认证文件位置；默认与 `workspace.json` 同目录的 `auth.json`。 |
-| `EDITOR_TRUST_PROXY` | 设为 `1` 时信任反向代理的 `X-Forwarded-*`，HTTPS 代理后 Cookie 会带 `Secure`。 |
-
-设置或清除密码的命令：`node src/index.js --set-password`（交互输入，两次确认）和 `node src/index.js --clear-password`。修改后需要重启服务才会生效。
 
 文件操作包含路径、文件类型和符号链接检查，文档保存采用临时文件替换并检查 revision。对任意外部程序的并发写入、真实存储设备故障和突然断电，不提供绝对原子或无损保证。部署配置、更新备份与已接受边界见 [运行指南](docs/release-runtime.md) 和 [技术参考](docs/reference.md)。
 
@@ -187,11 +178,10 @@ flowchart LR
 | --- | --- |
 | [运行指南](docs/release-runtime.md) | 正式构建、服务监督、更新、回退与数据保全。 |
 | [技术参考](docs/reference.md) | API、目录策略、恢复规则、ZIP 限制与环境变量。 |
-| [符号兼容性](docs/markdown-symbol-compatibility.md) | Markdown 转换链的符号排查、最小转义规则与修复记录。 |
 | [编辑历史验收](docs/reviews/2026-10-08-editor-history.md) | 撤销与重做的实现、会话边界和验证记录。 |
 | [N01–N03 保真修复验收](docs/reviews/2026-10-09-release-fidelity-fixes.md) | 链接保真、源码换行与安全上传修复及本地验收记录。 |
 | [依赖维护](docs/dependency-maintenance.md) | 支持的 Node.js 版本、依赖升级、审计和离线约束。 |
-| [维护 TODO](docs/maintenance-todo.md) | 后续维护事项。 |
+| [维护 TODO](docs/maintenance-todo.md) | 登录认证与后续维护事项。 |
 | [产品方向](PRODUCT.md) · [设计原则](DESIGN.md) | 产品范围、交互与视觉约定。 |
 
 ## 开发与验证

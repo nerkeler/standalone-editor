@@ -1,6 +1,5 @@
-import { marked } from './markedSetup.js'
+import { marked } from 'marked'
 import { isAllowedUri } from '@tiptap/extension-link'
-import { detectListStyle } from './listStyle.js'
 
 const MESSAGES = {
   frontMatter: 'YAML 元数据不能无损进入富文本；请在源码模式编辑。',
@@ -392,7 +391,6 @@ function hasUnsupportedTableAlignment(token, nested = false) {
 
 export function analyzeMarkdownSource(markdown) {
   const source = String(markdown || '')
-  const listStyle = detectListStyle(source)
   const items = []
   const deterministicTextEscapeOffsets = []
   const add = (reason, from, to) => {
@@ -511,9 +509,7 @@ export function analyzeMarkdownSource(markdown) {
     const list = logical.match(/^(\s*)(?:[-+*]|\d+[.)])\s/)
     if (list) {
       if (listIndent !== null && list[1].length > listIndent) {
-        // Uniform indentation is reproduced exactly by the serializer (the
-        // editor passes the detected unit), so it no longer needs protection.
-        if (!listStyle.safe) add('nestedLists', logicalStart + list[1].length, offset + raw.length)
+        add('nestedLists', logicalStart + list[1].length, offset + raw.length)
       }
       if (listIndent === null || list[1].length < listIndent) listIndentByQuoteDepth.set(quote.depth, list[1].length)
     } else if (logical.trim() && !/^\s/.test(logical)) {

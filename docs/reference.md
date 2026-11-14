@@ -68,19 +68,9 @@ ZIP 导入会保留压缩包中的相对目录结构，并只导入 `.md` 和支
 
 ### 本地运行边界
 
-后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用提供可选的单一访问密码，但不提供多用户账号或云端同步。设置密码后，除 `/api/auth/*` 与静态页面外的所有 `/api` 路由都要求登录会话；写请求还需携带 `X-CSRF-Token`。未设置密码时保持免登录，只适用于本机使用。如需在可信局域网使用，必须由使用者控制网络边界和服务生命周期。不要向非可信网络或公网开放，也不要把它当作多用户服务部署。
+后端默认只监听 `127.0.0.1`，直接读写用户选择的工作区；版本历史和回收站默认保存在本机 `~/.standalone-editor/recovery`（可用 `EDITOR_RECOVERY_DIR` 改变）。应用不提供账号认证或云端同步。当前适用于本机使用；如需在可信局域网临时使用，必须由使用者控制网络边界和服务生命周期。不要向非可信网络或公网开放，也不要把它当作多用户服务部署。
 
-前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。Vite 默认接受 IP 和 localhost；使用自定义域名运行 Vite 时，以 `FRONTEND_ALLOWED_HOSTS=editor.example.com` 配置允许的主机名（多个名称用逗号分隔）。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未设置访问密码时，仅应在可信网络内开放服务。
-
-### 访问密码与会话接口
-
-| 方法与路径 | 说明 |
-| --- | --- |
-| `GET /api/auth/session` | 探测状态。未启用密码时返回 `200 {"success":false,"enabled":false}`；已登录返回 `200` 与 `csrfToken`；未登录返回 `401 AUTH_REQUIRED`。 |
-| `POST /api/auth/login` | 请求体 `{"password":"..."}`。成功返回 `csrfToken` 并设置 `editor_session` Cookie（HttpOnly，SameSite=Lax，7 天滑动）。密码错误返回 `401 AUTH_FAILED`；连续失败返回 `429 RATE_LIMITED` 与 `Retry-After`。 |
-| `POST /api/auth/logout` | 撤销当前会话并清除 Cookie。 |
-
-所有其他 `/api` 路由在启用密码后，未登录返回 `401 AUTH_REQUIRED`；写请求缺少或错误的 `X-CSRF-Token` 返回 `403 CSRF_FAILED`。会话只保存在内存中，重启服务后需要重新登录。
+前端经 Vite 或反向代理以同一访问地址调用 `/api` 时，代理须保留浏览器请求的完整 `Host`（包括非标准端口）；后端会将 `Origin` 与该主机匹配，无需写死某个 IP 或域名。Vite 默认接受 IP 和 localhost；使用自定义域名运行 Vite 时，以 `FRONTEND_ALLOWED_HOSTS=editor.example.com` 配置允许的主机名（多个名称用逗号分隔）。前后端分属不同来源时，可用 `CORS_ORIGINS`（或 `EDITOR_CORS_ORIGINS`）配置逗号分隔的完整来源，例如 `https://editor.example.com`。CORS 只约束浏览器请求，不是身份认证。未经认证时，仅应在可信网络内开放服务。
 
 ### 跨平台目录选择
 

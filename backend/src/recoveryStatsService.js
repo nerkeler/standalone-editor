@@ -1,22 +1,25 @@
-// @ts-check
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { sha256 } from './hashing.js'
-import { makeError } from './errors.js'
-import { isWithin, projectCanonicalPath } from './workspacePathGuard.js'
+import { createHash } from 'node:crypto'
 
 const DEFAULT_RECOVERY_DIRECTORY = path.join(os.homedir(), '.standalone-editor', 'recovery')
 const UUID_PATTERN = /^[0-9a-f-]{36}$/i
 const HASH_PATTERN = /^[0-9a-f]{64}$/i
 
-// Service-specific default code differs from the shared factory default.
 function serviceError(message, code = 'RECOVERY_STORAGE_ERROR') {
-  return makeError(message, code)
+  const error = new Error(message)
+  error.code = code
+  return error
 }
 
 function hash(value) {
-  return sha256(value)
+  return createHash('sha256').update(value).digest('hex')
+}
+
+function isWithin(base, target) {
+  const relative = path.relative(base, target)
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
 }
 
 function resolveHistoryRoot(options) {
@@ -28,6 +31,23 @@ function resolveTrashRoot(options) {
     options.trashRoot || options.recoveryRoot || process.env.EDITOR_RECOVERY_DIR ||
     process.env.EDITOR_RECOVERY_ROOT || process.env.STANDALONE_EDITOR_RECOVERY_ROOT || DEFAULT_RECOVERY_DIRECTORY,
   )
+}
+
+async function projectCanonicalPath(target) {
+  let current = path.resolve(target)
+  const missingParts = []
+  while (true) {
+    try {
+      const canonical = await fs.realpath(current)
+      return path.resolve(canonical, ...missingParts)
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error
+      const parent = path.dirname(current)
+      if (parent === current) throw error
+      missingParts.unshift(path.basename(current))
+      current = parent
+    }
+  }
 }
 
 async function lstatOrNull(target) {

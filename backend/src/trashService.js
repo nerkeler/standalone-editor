@@ -1,12 +1,9 @@
-// @ts-check
 import fs from 'node:fs/promises'
-import { constants as fsConstants } from 'node:fs'
+import { constants as fsConstants, createReadStream } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { randomUUID } from 'node:crypto'
-import { sha256, sha256File } from './hashing.js'
-import { makeError } from './errors.js'
-import { assertSameEntry, isWithin, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
+import { createHash, randomUUID } from 'node:crypto'
+import { assertSameEntry, moveEntryNoReplace, openWorkspaceParent } from './workspacePathGuard.js'
 
 const MANIFEST_NAME = 'entry.json'
 const PAYLOAD_NAME = 'payload'
@@ -15,8 +12,16 @@ const DEFAULT_RETENTION_DAYS = 30
 const PENDING_SOURCE_PHASES = new Set(['prepared', 'quarantined', 'cleanup'])
 const entryLocks = new Map()
 
-// Service-specific alias keeps the historical default code at call sites.
-const serviceError = makeError
+function serviceError(message, code = 'INVALID_PATH') {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
+
+function isWithin(base, target) {
+  const relative = path.relative(base, target)
+  return relative === '' || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`))
+}
 
 function assertNotWithin(base, target) {
   if (isWithin(base, target)) throw serviceError('回收站必须位于工作空间之外', 'INVALID_RECOVERY_ROOT')
@@ -36,7 +41,7 @@ function slashPath(value) {
 }
 
 function hashWorkspace(realWorkspace) {
-  return sha256(realWorkspace)
+  return createHash('sha256').update(realWorkspace).digest('hex')
 }
 
 async function canonicalDirectory(value, label, { create = true } = {}) {
@@ -130,11 +135,21 @@ async function assertTreeCopyable(rootPath) {
       type: 'file',
       size: stat.size,
       mode: stat.mode & 0o777,
-      sha256: await sha256File(fullPath),
+      sha256: await sha256(fullPath),
     })
   }
   await walk(rootPath)
   return entries
+}
+
+function sha256(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(filePath)
+    stream.on('data', chunk => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
 }
 
 function snapshotsEqual(left, right) {
@@ -199,21 +214,18 @@ async function writeJsonAtomic(filePath, value) {
 }
 
 function treeFingerprint(snapshot) {
-  // Byte-identical to the previous streaming accumulation: every JSON row is
-  // followed by a newline, and an empty snapshot hashes zero bytes.
-  let fingerprint = sha256('')
-  if (snapshot.length > 0) {
-    fingerprint = sha256(
-      snapshot.map(entry => JSON.stringify([
-        entry.path,
-        entry.type,
-        entry.size ?? null,
-        entry.mode,
-        entry.sha256 ?? null,
-      ])).join('\n') + '\n',
-    )
+  const hash = createHash('sha256')
+  for (const entry of snapshot) {
+    hash.update(JSON.stringify([
+      entry.path,
+      entry.type,
+      entry.size ?? null,
+      entry.mode,
+      entry.sha256 ?? null,
+    ]))
+    hash.update('\n')
   }
-  return { entries: snapshot.length, sha256: fingerprint }
+  return { entries: snapshot.length, sha256: hash.digest('hex') }
 }
 
 function serializeIdentity(stat) {

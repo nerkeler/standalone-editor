@@ -25,7 +25,6 @@ Footnote use[^note].
 
 - Parent
   - Nested child
-   - Misaligned sibling
 
 ## Raw HTML and comment
 

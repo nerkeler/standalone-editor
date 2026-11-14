@@ -1,5 +1,5 @@
 import { markdownLanguage } from '@codemirror/lang-markdown'
-import { marked } from './markedSetup.js'
+import { marked } from 'marked'
 
 function inlineText(tokens) {
   return tokens.map(token => {

@@ -1,4 +1,3 @@
-// @ts-check
 const FILESYSTEM_PERMISSION_CODES = new Set(['EACCES', 'EPERM', 'EROFS'])
 
 export const PERMISSION_DENIED_MESSAGE = '无权限访问或修改该路径'

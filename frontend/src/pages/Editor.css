@@ -154,8 +154,8 @@
 }
 
 .sidebar-header {
-  min-height: 44px;
-  padding: 9px 14px !important;
+  min-height: 56px;
+  padding: 12px 14px 10px !important;
   border-bottom: 1px solid var(--color-border) !important;
   background: var(--color-bg-sidebar) !important;
 }
@@ -501,11 +501,11 @@
   z-index: 31;
   min-width: 0;
   max-width: 100%;
-  min-height: 44px;
+  min-height: 42px;
   border: 0 !important;
   border-bottom: 1px solid var(--color-border) !important;
-  background: var(--color-bg-sidebar) !important;
-  padding-inline: 0 10px;
+  background: var(--color-bg) !important;
+  padding-inline: 2px 8px;
   gap: 3px;
   flex-wrap: nowrap;
   overflow-x: auto !important;
@@ -529,7 +529,8 @@
   min-width: 112px;
   max-width: min(260px, 34vw);
   border: 0 !important;
-  border-bottom: 2px solid transparent !important;
+  border-bottom: 2px solid transparent;
+  height: 42px !important;
   min-height: 0;
   gap: 7px;
   padding-inline: 6px 11px !important;
@@ -583,23 +584,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.document-tab-tooltip {
-  display: grid;
-  gap: 2px;
-  max-width: 340px;
-}
-
-.document-tab-tooltip-name {
-  font-weight: 600;
-  overflow-wrap: anywhere;
-}
-
-.document-tab-tooltip-path {
-  font-size: 11px;
-  opacity: 0.72;
-  overflow-wrap: anywhere;
 }
 
 .document-tabs .anticon-file {
@@ -657,7 +641,7 @@
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 8px 10px 8px 0 !important;
+  padding: 8px 16px !important;
   border-bottom: 1px solid var(--color-border) !important;
   background: var(--color-bg-card);
   color: var(--color-text);
@@ -1168,7 +1152,7 @@
   .editor-toolbar {
     align-content: center;
     gap: 3px;
-    padding: 6px 10px 6px 0 !important;
+    padding: 6px 10px !important;
   }
   .editor-toolbar .toolbar-spacer { display: none; }
 }

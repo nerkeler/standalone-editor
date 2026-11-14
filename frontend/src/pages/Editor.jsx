@@ -28,10 +28,6 @@ import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import useEditorDrafts, { isImageFile, isMarkdownFile } from './useEditorDrafts'
 import useDocumentHistory from './useDocumentHistory.js'
 import { requiresSourceMode } from './markdownSourcePolicy'
-import { detectListStyle } from './listStyle.js'
-import { detectEmphasisStyle } from './emphasisStyle.js'
-import { MarkdownBulletList, MarkdownOrderedList } from './markdownLists.js'
-import { MarkdownHardBreak } from './markdownHardBreak.js'
 import { analyzeMarkdownSource } from './markdownDiagnostics.js'
 import { getMarkdownSourceOutline } from './markdownSourceOutline.js'
 import { proposeSafeMarkdownRepair } from './safeMarkdownNormalization.js'
@@ -345,7 +341,7 @@ function menuAnchorPosition(event, fallbackElement) {
 
 // ========== 主组件 ==========
 
-export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePicker, themeToggle, authSlot }) {
+export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePicker, themeToggle }) {
   const [tree, setTree] = useState([])
   const [selectedKey, setSelectedKey] = useState('')
   const selectedTreeKeys = useMemo(() => [selectedKey], [selectedKey])
@@ -503,11 +499,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   // contains the previous tab, so capturing it as the new tab would corrupt
   // that tab's draft.
   const renderedFileRef = useRef('')
-  // Per-file Markdown list style (indent unit) detected at load so the
-  // serializer can reproduce the author's list indentation.
-  const listStylesRef = useRef({})
-  // Per-file emphasis delimiters (`_x_` vs `*x*`) detected at load.
-  const emphasisStylesRef = useRef({})
   const readOnlyMarkdownRef = useRef(false)
   const loadingRef = useRef(false)
   const openRequestRef = useRef(0)
@@ -586,16 +577,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
   const editor = useEditor({
     editorProps,
     extensions: [
-      StarterKit.configure({
-        heading: false,
-        strike: false,
-        codeBlock: false,
-        link: false,
-        underline: false,
-        bulletList: false,
-        orderedList: false,
-        hardBreak: false,
-      }),
+      StarterKit.configure({ heading: false, strike: false, codeBlock: false, link: false, underline: false }),
       ...(isApplePlatform ? [MacControlYRedo] : []),
       MarkdownHeading.configure({ levels: [1, 2, 3, 4, 5, 6] }),
       CodeBlockLowlight.configure({ lowlight, defaultLanguage: 'plaintext' }),
@@ -608,9 +590,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
       TableRow,
       MarkdownTableCell,
       MarkdownTableHeader,
-      MarkdownBulletList,
-      MarkdownOrderedList,
-      MarkdownHardBreak,
       Strike,
     ],
   }, [])
@@ -824,11 +803,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
 
   const serializeCurrentEditor = useCallback(() => {
     if (!editor) return ''
-    const path = activeFileRef.current
-    return markdownCodec.fromEditorHtml(editor.getHTML(), {
-      listStyle: listStylesRef.current[path],
-      emphasisStyle: emphasisStylesRef.current[path],
-    })
+    return markdownCodec.fromEditorHtml(editor.getHTML())
   }, [editor])
 
   const captureCurrentDraft = useCallback(() => {
@@ -911,8 +886,6 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
         ? restoredSnapshot.baseRevision
         : (fileRevisionsRef.current[path] ?? null)
       cleanContentsRef.current[path] = fetched
-      listStylesRef.current[path] = detectListStyle(fetched)
-      emphasisStylesRef.current[path] = detectEmphasisStyle(fetched)
       if (!hasDirtyDraft) {
         if (diskRevision) setFileRevision(path, diskRevision)
         setDraft(path, fetched, false)
@@ -2900,7 +2873,7 @@ export default function Editor({ workspace, workspaceInfo, onRequestWorkspacePic
             </div>
           )}
           <div className={`editor-statusbar${isMobile || editorFullscreen ? ' editor-statusbar-theme-slot' : ''}`} aria-label="文档状态栏">
-            <div className="editor-theme-slot">{authSlot}{themeToggle}</div>
+            <div className="editor-theme-slot">{themeToggle}</div>
             <div className="editor-file-location" title={activeFile || '尚未选择文件'}>
               <FileOutlined aria-hidden="true" />
               <span>{activeFile ? activeFile.split('/').pop() : '选择文件开始编辑'}</span>

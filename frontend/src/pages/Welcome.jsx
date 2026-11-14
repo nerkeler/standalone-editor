@@ -19,14 +19,13 @@ function errorMessage(error, fallback) {
     || fallback
 }
 
-export default function Welcome({ diagnostic, onRetry, onChooseWorkspace, authSlot }) {
+export default function Welcome({ diagnostic, onRetry, onChooseWorkspace }) {
   return (
     <div style={{
       display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
       minHeight: '100dvh', gap: 32,
       padding: 'max(clamp(16px, 4vw, 32px), env(safe-area-inset-top)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-right)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-bottom)) max(clamp(16px, 4vw, 32px), env(safe-area-inset-left))',
     }}>
-      {authSlot && <div style={{ position: 'absolute', top: 16, right: 16, display: 'flex', gap: 8 }}>{authSlot}</div>}
       <h1 style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 28, fontWeight: 700 }}>
         <FolderOpenOutlined aria-hidden="true" style={{ color: 'var(--color-primary)' }} />
         <span>在线编辑器</span>
